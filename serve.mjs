@@ -133,7 +133,11 @@ async function feeBump() {
   const gasPrice = BigInt(await rpcCall('eth_gasPrice', []));
   const fh = await rpcCall('eth_feeHistory', ['0x1', 'latest', [50]]).catch(() => null);
   const reward = fh && fh.reward && fh.reward[0] && fh.reward[0][0] ? BigInt(fh.reward[0][0]) : 1500000000n;
-  return { maxFeePerGas: gasPrice * 2n, maxPriorityFeePerGas: reward * 2n };
+  // gasPrice and reward may come from DIFFERENT endpoints (random rotation), so the
+  // priority fee can exceed the max fee. Base both on the larger value and clamp.
+  const maxFee = (gasPrice > reward ? gasPrice : reward) * 2n;
+  const priority = reward * 2n;
+  return { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority < maxFee ? priority : maxFee };
 }
 async function estimateGas(from, tx) {
   const call = { from, to: tx.to, data: tx.data || '0x' };
