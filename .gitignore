@@ -6,3 +6,5 @@ sweep-destination.json
 artifact.json
 *.log
 .DS_Store
+runners.local.json
+deploy-commands.txt

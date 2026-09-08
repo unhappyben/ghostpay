@@ -32,6 +32,33 @@ Without `RUNNER_PK` the app still serves and the announce falls back to the conn
 window.GHOSTPAY_RPC = 'https://your-rpc';
 ```
 
+## Relayer privacy
+
+The relayer is the one party that sees your IP, your timing, and your runner address. Three knobs shrink that footprint.
+
+**Fund the runner from Privacy Pools.** Create one fresh EOA, withdraw to it from the app (step 5), and use its key as `RUNNER_PK`. One 0.01 ETH withdrawal funds dozens of sweeps (a sweep costs roughly 0.0005 ETH at 2x fee bump). Rotate any time: withdraw again to a new address, swap the key, restart. The runner then has no funding link to you onchain.
+
+**Tor + endpoint rotation for all RPC.** Every JSON-RPC call (nonce, balance, fees, broadcast) goes through a random endpoint per call from `RPC_URLS` (comma-separated, defaults to flashbots/drpc/merkle). With `TOR_PROXY` set, all of it routes over Tor, so no single RPC provider sees both your IP and the broadcasts:
+
+```sh
+brew install tor && tor &
+TOR_PROXY=socks5://127.0.0.1:9050 RPC_URLS=https://rpc.flashbots.net,https://eth.drpc.org node serve.mjs
+```
+
+Broadcasts also wait a random jitter before sending (announce 2-15s, sweep 5-45s) so the browser request and the onchain transaction are not trivially time-correlated.
+
+**Serve the app itself as an onion service** so the browser-to-relayer hop is Tor too. In your torrc:
+
+```
+HiddenServiceDir /var/lib/tor/ghostpay/
+HiddenServicePort 80 127.0.0.1:8791
+```
+
+Restart tor, read the hostname from `/var/lib/tor/ghostpay/hostname`, and open that .onion address in Tor Browser. The relayer then never sees your IP at all.
+
+For a pool of runners instead of one, drop `runners.local.json` (gitignored) next to serve.mjs: `[{"address":"0x…","key":"0x…"}, …]`. Each request picks a runner at random, preferring a different one than the previous request.
+
+
 The withdrawal also works as a CLI: `node pp-withdraw.mjs <pp-secret.json> <recipient> [--broadcast]`. Circuit artifacts (`artifacts/withdraw.wasm`, `withdraw.zkey`) are gitignored; download from `https://privacypools.com/artifacts/` or let pp-withdraw fetch them.
 
 ## Files

@@ -404,7 +404,7 @@ $('b-annrecv').onclick = async () => {
   const { stealth, ephPub, viewTag } = W.recv;
   // primary path: the local relayer announces (runner wallet pays gas).
   try {
-    st('announcing via relayer…');
+    st('announcing via relayer… (deliberate 2–15s privacy delay before broadcast — hold on)');
     const r = await fetch('/announce', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stealth, ephPub, viewTag }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
@@ -599,7 +599,7 @@ async function relaySweep(artifact) {
   const txLink = h => /^0x[0-9a-fA-F]{64}$/.test(h) ? ' · <a href="https://etherscan.io/tx/' + h + '" target="_blank" rel="noopener">etherscan</a>' : '';
   const stHtml = m => $('st-broadcast').innerHTML = m;
   try {
-    st('sending to relayer…');
+    st('sending to relayer… (deliberate 5–45s privacy delay before broadcast — hold on)');
     const r = await fetch('/sweep', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(artifact) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
