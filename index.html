@@ -470,6 +470,14 @@ async function pollStatus() {
       + (runners != null ? ' · ' + runners + ' runner' + (runners === 1 ? '' : 's') : '')
       + ' · sweeperV2 ' + (h.sweeperV2 ? 'configured' : 'NOT configured')
       + ' · tor ' + (h.tor ? 'on' : 'off'));
+    // runner gas, the "will my tx land" answer at a glance: show the balance and warn
+    // loudly when it is low (an unfunded runner is accepted by Protect but never included)
+    if (h.runnerBalances && h.runners && h.runners.length) {
+      const bal = h.runnerBalances[h.runners[0]];
+      if (bal === 0) parts.push('RUNNER UNFUNDED: broadcasts will not land · fund ' + h.runners[0].slice(0, 10) + '…');
+      else if (bal != null && bal < 0.001) parts.push('RUNNER GAS LOW: ' + bal + ' ETH · fund it or nothing lands');
+      else if (bal != null) parts.push('runner gas ' + bal.toFixed(5) + ' ETH');
+    }
   } catch { parts.push('relayer: offline (static serving only)'); }
   try {
     const r = await fetch('./fee');

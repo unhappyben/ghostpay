@@ -229,6 +229,18 @@ async function broadcastRawTx(signed) {
 }
 const getNonce = addr => rpcCall('eth_getTransactionCount', [addr, 'pending']).then(x => parseInt(x, 16));
 const getBalance = addr => rpcCall('eth_getBalance', [addr, 'latest']).then(BigInt);
+// /health runner balances: 30s cache, best-effort per runner (an RPC failure yields null
+// for that runner, never a failed health check).
+let balCache = { ts: 0, map: {} };
+async function runnerBalances() {
+  if (Date.now() - balCache.ts < 30000) return balCache.map;
+  const map = {};
+  for (const w of runners) {
+    map[w.address] = await getBalance(w.address).then(b => Number(b) / 1e18).catch(() => null);
+  }
+  balCache = { ts: Date.now(), map };
+  return map;
+}
 // 2x fee bump, same as relay.mjs: sweeps must land even in a fee spike.
 // priority fee floor (MIN_PRIORITY_WEI, default 0.1 gwei): at ultra-low gas prices a 2x
 // bump produces a priority fee so small that builders skip the tx entirely (Protect dropped
@@ -760,6 +772,7 @@ const server = createServer(async (req, res) => {
         return sendJson(res, 200, {
           ok: true, chainId: CHAIN_ID,
           runners: runners.map(w => w.address), runnerCount: runners.length,
+          runnerBalances: await runnerBalances(),
           sweeperV2: SWEEPER_V2, batchRelayer: BATCH_RELAYER, minFeeBps: MIN_FEE_BPS,
           ppRelay: PP_RELAY, ...(PP_RELAY ? { ppFeeBps: PP_FEE_BPS } : {}),
           feeOwner: FEE_OWNER,
