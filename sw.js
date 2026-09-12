@@ -1,6 +1,9 @@
 // sw.js · GHOSTPAY service worker: cache-first static shell.
 // Relayer endpoints and all non-GET traffic always go to the network.
-const CACHE = 'ghostpay-v5';
+const CACHE = 'ghostpay-v6';
+// single-page reality: index.html is the whole tabbed app (GET PAID · PAY · FUNDS ·
+// INVOICES); app.html / invoices.html are tiny redirect stubs, precached so they still
+// redirect offline. All gp-*.mjs modules, frags, and vendor files stay as before.
 const PRECACHE = [
   './',
   './index.html',

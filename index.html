@@ -27,6 +27,7 @@
   input, select, textarea { width:100%; background:#000; color:#fff; border:1px solid #333; padding:12px 14px;
     font-family:inherit; font-size:13px; margin-top:8px; }
   input:focus, select:focus, textarea:focus { outline:1px solid #fff; }
+  textarea { resize:vertical; }
   .card { background:#fff; color:#000; padding:18px; margin-top:14px; word-break:break-all; font-size:12.5px; }
   .card b { font-weight:700; }
   .card .lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:6px; }
@@ -35,7 +36,7 @@
   .ok { color:#fff; }
   a { color:#fff; }
   #payghost { display:none; }
-  /* the three doors: big plain blocks */
+  /* the PAY door: big plain block */
   .door { display:block; border:1px solid #fff; padding:26px 22px; margin-top:22px; color:#fff; text-decoration:none; }
   a.door:hover { background:#fff; color:#000; }
   a.door:hover .door-d { color:#333; }
@@ -67,130 +68,202 @@
     font-size:11px; max-height:150px; overflow:auto; white-space:pre-wrap; }
   .gp-pulse { display:inline-block; animation:gpPulse 1.2s ease-in-out infinite; }
   @keyframes gpPulse { 0%,100% { opacity:.25 } 50% { opacity:1 } }
-  /* status strip + toast (same as the app) */
+  /* status strip + toast (owned by app-core.mjs) */
   #gp-status { border:1px solid #333; padding:8px 12px; font-size:11px; color:#888; margin-bottom:22px;
     word-break:break-word; }
   #gp-toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#fff; color:#000;
     padding:12px 20px; font-size:12px; font-weight:700; letter-spacing:.08em; z-index:99; display:none;
     max-width:90vw; text-align:center; }
+  /* FUNDS tab: returning-user dashboard + app-core payment cards (from app.html, index palette) */
+  #gp-dash { border:1px solid #fff; padding:22px; margin-bottom:8px; }
+  #gp-dash .dashaddr { font-size:12px; word-break:break-all; }
+  #gp-dash .dashmode { color:#888; font-size:10px; letter-spacing:.2em; }
+  #gp-dash .dashbtns { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  #gp-dash .dashbtns button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  .pay { border:1px solid #333; padding:16px; margin-top:12px; }
+  .pay.armed { border-color:#fff; }
+  .pay.swept { opacity:.35; }
+  .pay.swept .addr { text-decoration:line-through; }
+  .pay .addr { font-weight:700; }
+  .pay .meta { color:#555; font-size:11px; margin:6px 0 10px; }
   /* mobile: full-width steps, 44px touch targets, 16px inputs (stops iOS auto-zoom) */
   @media (max-width:700px) {
     .wrap { padding:24px 12px 80px; }
     .step { padding:16px; width:100%; }
     button { min-height:44px; }
     input, select, textarea { font-size:16px; }
+    #gp-dash .dashbtns { flex-direction:column; }
+    #gp-dash .dashbtns button { width:100%; }
   }
 </style>
 </head>
 <body>
 <nav class="gp-nav">
-  <a class="gp-nav-logo" href="./">GHOSTPAY</a>
+  <a class="gp-nav-logo" href="#/get-paid">GHOSTPAY</a>
   <div class="gp-nav-links">
-    <a class="gp-nav-link on" href="./">HOME</a>
-    <a class="gp-nav-link" href="./app.html">APP</a>
-    <a class="gp-nav-link" href="./invoices.html">INVOICING</a>
+    <a class="gp-nav-link on" data-route="get-paid" href="#/get-paid">GET PAID</a>
+    <a class="gp-nav-link" data-route="pay" href="#/pay">PAY</a>
+    <a class="gp-nav-link" data-route="funds" href="#/funds">FUNDS</a>
+    <a class="gp-nav-link" data-route="invoices" href="#/invoices">INVOICES</a>
   </div>
 </nav>
 <div class="wrap">
+  <!-- the status strip lives outside the tab sections: visible on every tab -->
   <div id="gp-status">relayer: checking…</div>
   <div class="logo">GHOST<span>PAY</span></div>
-  <div class="sub">RECEIVE-ONLY STEALTH · ERC-5564 · KEYS DERIVED FROM YOUR WALLET SIGNATURE · v1.3</div>
-  <div class="sub" style="color:#bbb">get paid to one-time stealth addresses, sweep into Privacy Pools, withdraw to an unlinked wallet: your wallet never appears onchain. the invoice suite adds tracked invoices with private payment links and encrypted memos.</div>
 
-  <div class="step on" id="getpaid">
-    <h2>GET PAID</h2>
-    <div class="r-tabs">
-      <button class="r-tab on" id="r-tab-0">1 · CONNECT</button>
-      <button class="r-tab" id="r-tab-1">2 · GENERATE</button>
-      <button class="r-tab" id="r-tab-2">3 · AMOUNT</button>
-      <button class="r-tab" id="r-tab-3">4 · SHARE</button>
-    </div>
+  <!-- ══ GET PAID (default tab) ══ the homepage receive journey, unchanged -->
+  <section class="gp-route" id="route-get-paid">
+    <div class="sub">RECEIVE-ONLY STEALTH · ERC-5564 · KEYS DERIVED FROM YOUR WALLET SIGNATURE · v1.3</div>
+    <div class="sub" style="color:#bbb">get paid to one-time stealth addresses, sweep into Privacy Pools, withdraw to an unlinked wallet: your wallet never appears onchain. the invoice suite adds tracked invoices with private payment links and encrypted memos.</div>
 
-    <div class="r-panel on" id="r-p0">
-      <button id="r-b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
-      <div class="status" id="r-st-connect"></div>
-      <div id="r-qrwrap" style="display:none;margin-top:16px;text-align:center">
-        <canvas id="r-qr" style="background:#fff;padding:14px;image-rendering:pixelated"></canvas>
-        <div class="status">scan with your wallet</div>
-        <a id="r-wc-link" href="#" style="display:inline-block;margin-top:12px;background:#fff;color:#000;padding:14px 28px;font-weight:700;letter-spacing:.12em;text-decoration:none">OPEN WALLET</a>
-        <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="r-wc-raw" style="word-break:break-all;color:#fff"></span></div>
+    <div class="step on" id="getpaid">
+      <h2>GET PAID</h2>
+      <div class="r-tabs">
+        <button class="r-tab on" id="r-tab-0">1 · CONNECT</button>
+        <button class="r-tab" id="r-tab-1">2 · GENERATE</button>
+        <button class="r-tab" id="r-tab-2">3 · AMOUNT</button>
+        <button class="r-tab" id="r-tab-3">4 · SHARE</button>
       </div>
-      <button class="ghost" id="r-b-injected" style="display:none">USE INJECTED WALLET INSTEAD</button>
-      <div class="status" style="margin-top:10px"><a href="#" id="r-b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
-    </div>
 
-    <div class="r-panel" id="r-p1">
-      <div class="status" id="r-acct"></div>
-      <div class="status">one wallet signature derives your stealth keys. it spends nothing and never leaves your wallet.</div>
-      <button id="r-b-gen" style="margin-top:12px">SIGN · GENERATE STEALTH KEYS</button>
-      <div class="status" id="r-st-gen"></div>
-    </div>
-
-    <div class="r-panel" id="r-p2">
-      <div class="status">optional: ask for a specific amount. the payer can always change it.</div>
-      <input id="r-i-amount" type="number" min="0" step="any" placeholder="amount (optional)">
-      <select id="r-i-token"><option>ETH</option><option>USDC</option></select>
-      <input id="r-i-note" placeholder="note (optional)">
-      <div style="display:flex;gap:10px;margin-top:12px">
-        <button class="ghost" id="r-b-skip" style="width:auto;flex:1">SKIP</button>
-        <button id="r-b-amtnext" style="width:auto;flex:1">NEXT</button>
+      <div class="r-panel on" id="r-p0">
+        <button id="r-b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
+        <div class="status" id="r-st-connect"></div>
+        <div id="r-qrwrap" style="display:none;margin-top:16px;text-align:center">
+          <canvas id="r-qr" style="background:#fff;padding:14px;image-rendering:pixelated"></canvas>
+          <div class="status">scan with your wallet</div>
+          <a id="r-wc-link" href="#" style="display:inline-block;margin-top:12px;background:#fff;color:#000;padding:14px 28px;font-weight:700;letter-spacing:.12em;text-decoration:none">OPEN WALLET</a>
+          <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="r-wc-raw" style="word-break:break-all;color:#fff"></span></div>
+        </div>
+        <button class="ghost" id="r-b-injected" style="display:none">USE INJECTED WALLET INSTEAD</button>
+        <div class="status" style="margin-top:10px"><a href="#" id="r-b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
       </div>
-    </div>
 
-    <div class="r-panel" id="r-p3">
-      <div class="card">
-        <div class="lbl">YOUR ONE-TIME STEALTH ADDRESS</div>
-        <b id="r-v-addr"></b>
-        <button id="r-b-copyaddr">COPY ADDRESS</button>
+      <div class="r-panel" id="r-p1">
+        <div class="status" id="r-acct"></div>
+        <div class="status">one wallet signature derives your stealth keys. it spends nothing and never leaves your wallet.</div>
+        <button id="r-b-gen" style="margin-top:12px">SIGN · GENERATE STEALTH KEYS</button>
+        <div class="status" id="r-st-gen"></div>
       </div>
-      <div class="card">
-        <div class="lbl">PAYMENT LINK · ANNOUNCES ITSELF WHEN THE PAYER PAYS</div>
-        <b id="r-v-link"></b>
-        <button id="r-b-copylink">COPY LINK</button>
-        <div id="r-qrlink-wrap" style="display:none;margin-top:16px;text-align:center">
-          <canvas id="r-qrlink" style="background:#fff;padding:16px;image-rendering:pixelated;max-width:100%"></canvas>
+
+      <div class="r-panel" id="r-p2">
+        <div class="status">optional: ask for a specific amount. the payer can always change it.</div>
+        <input id="r-i-amount" type="number" min="0" step="any" placeholder="amount (optional)">
+        <select id="r-i-token"><option>ETH</option><option>USDC</option></select>
+        <input id="r-i-note" placeholder="note (optional)">
+        <div style="display:flex;gap:10px;margin-top:12px">
+          <button class="ghost" id="r-b-skip" style="width:auto;flex:1">SKIP</button>
+          <button id="r-b-amtnext" style="width:auto;flex:1">NEXT</button>
         </div>
       </div>
-      <div class="status" style="margin-top:14px">payment links announce themselves when the payer pays. this announce is for raw-address payers:</div>
-      <div class="status" id="r-st-ann"></div>
-      <button class="ghost" id="r-b-ann" style="display:none">RETRY ANNOUNCE</button>
+
+      <div class="r-panel" id="r-p3">
+        <div class="card">
+          <div class="lbl">YOUR ONE-TIME STEALTH ADDRESS</div>
+          <b id="r-v-addr"></b>
+          <button id="r-b-copyaddr">COPY ADDRESS</button>
+        </div>
+        <div class="card">
+          <div class="lbl">PAYMENT LINK · ANNOUNCES ITSELF WHEN THE PAYER PAYS</div>
+          <b id="r-v-link"></b>
+          <button id="r-b-copylink">COPY LINK</button>
+          <div id="r-qrlink-wrap" style="display:none;margin-top:16px;text-align:center">
+            <canvas id="r-qrlink" style="background:#fff;padding:16px;image-rendering:pixelated;max-width:100%"></canvas>
+          </div>
+        </div>
+        <div class="status" style="margin-top:14px">payment links announce themselves when the payer pays. this announce is for raw-address payers:</div>
+        <div class="status" id="r-st-ann"></div>
+        <button class="ghost" id="r-b-ann" style="display:none">RETRY ANNOUNCE</button>
+      </div>
+
+      <div id="r-remember-row" style="display:none;margin-top:14px">
+        <label style="font-size:12px;color:#888;display:flex;gap:8px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="r-i-remember" style="width:auto;margin:0"> remember this device (watch-only: viewing key + meta-address, never the spend key)
+        </label>
+      </div>
+
+      <div id="r-payments" style="display:none;margin-top:26px">
+        <h2 style="margin-bottom:10px">PAYMENTS</h2>
+        <div class="status" id="r-watch-note" style="display:none;margin-top:0">watch-only session restored: scanning works, but the spend key is never stored on this device. connect above and SIGN · GENERATE STEALTH KEYS again (same wallet, same keys) to sweep.</div>
+        <div class="status" id="r-scan-st" style="margin-top:4px"></div>
+        <div id="r-rows"></div>
+      </div>
+    </div>
+    <div id="r-recovery" style="display:none;border:1px solid #fff;padding:14px;margin-top:14px;font-size:12px;line-height:1.7"></div>
+  </section>
+
+  <!-- ══ PAY ══ the payer side. #doors keeps its id (enterPayMode hides it); the old
+       APP / INVOICING link doors are gone: the nav tabs do that job now. -->
+  <section class="gp-route" id="route-pay" style="display:none">
+    <div id="doors">
+      <div class="door" id="paydoor">
+        <div class="door-t">PAY A LINK</div>
+        <div class="door-d">paste a payment link, an invoice link, or a stealth meta-address. you pay from your own wallet; the announcement goes with it so the recipient's scanner finds the payment.</div>
+        <input id="i-paylink" placeholder="https://…#st:eth:0x… or st:eth:0x…">
+        <button id="b-paylink" style="margin-top:12px">OPEN PAYMENT</button>
+        <div class="status" id="st-paylink"></div>
+      </div>
     </div>
 
-    <div id="r-remember-row" style="display:none;margin-top:14px">
-      <label style="font-size:12px;color:#888;display:flex;gap:8px;align-items:center;cursor:pointer">
-        <input type="checkbox" id="r-i-remember" style="width:auto;margin:0"> remember this device (watch-only: viewing key + meta-address, never the spend key)
-      </label>
+    <!-- payer flow: shown when the page is opened with a payment hash, or a link is pasted
+         above. The connect step's ids are p-* namespaced: app-core.mjs owns b-connect,
+         st-connect, qrwrap, qr, wc-link, wc-raw, b-injected, b-forcelatrine and i-wcpid
+         in the FUNDS tab, and duplicate ids would bind the wrong elements. The #payghost
+         block keeps its ids byte-identical: gp-invoices.mjs enhancePayghost depends on
+         them (v-payaddr, b-copyaddr, v-ann, b-announce, st-invoice). -->
+    <div id="payflow" style="display:none">
+      <div class="step on" id="p-s1">
+        <h2>1 · CONNECT WALLET</h2>
+        <button id="p-b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
+        <div class="status" id="p-st-connect"></div>
+        <div id="p-qrwrap" style="display:none;margin-top:16px;text-align:center">
+          <canvas id="p-qr" style="background:#fff;padding:14px;image-rendering:pixelated"></canvas>
+          <div class="status">scan with your wallet</div>
+          <a id="p-wc-link" href="#" style="display:inline-block;margin-top:12px;background:#fff;color:#000;padding:14px 28px;font-weight:700;letter-spacing:.12em;text-decoration:none">OPEN WALLET</a>
+          <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="p-wc-raw" style="word-break:break-all;color:#fff"></span></div>
+        </div>
+        <button class="ghost" id="p-b-injected" style="display:none">USE INJECTED WALLET INSTEAD</button>
+        <div class="status" style="margin-top:10px"><a href="#" id="p-b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
+        <input id="p-i-wcpid" type="hidden" value="c6c9bacd35afa3eb9e6cccf6d8464395">
+      </div>
+
+      <!-- pay-a-ghost mode (opened via someone's link) -->
+      <div class="step on" id="payghost">
+        <h2>PAY A GHOST</h2>
+        <div class="status" id="st-invoice"></div>
+        <div class="card">
+          <div class="lbl">PAY THIS ONE-TIME ADDRESS</div>
+          <b id="v-payaddr"></b>
+          <button id="b-copyaddr">COPY</button>
+          <div class="status" style="color:#666">then announce it so their scanner finds it: <span id="v-ann"></span></div>
+          <button id="b-announce" class="ghost" style="background:#000;color:#fff">SEND + ANNOUNCE WITH MY WALLET</button>
+        </div>
+      </div>
+
+      <div class="status" style="margin-top:16px"><a href="#/get-paid" style="color:#888">← back to GET PAID</a></div>
+    </div>
+  </section>
+
+  <!-- ══ FUNDS ══ the full app (was app.html): returning-user dashboard, the
+       connect/generate wizard, sweep, withdraw. Every id is byte-identical with the old
+       app.html: app-core.mjs binds them all. -->
+  <section class="gp-route" id="route-funds" style="display:none">
+    <div class="sub">RECEIVE-ONLY STEALTH · ERC-5564 · KEYS DERIVED FROM YOUR WALLET SIGNATURE · v1.3</div>
+    <div class="sub" id="bootline" style="color:#fff">booting…</div>
+
+    <!-- returning-user dashboard: replaces steps 1-2 when a gp-session exists on this device -->
+    <div id="gp-dash" style="display:none">
+      <div class="dashmode" id="gp-dash-mode">WATCH-ONLY SESSION</div>
+      <div class="dashaddr" id="gp-dash-addr"></div>
+      <div class="status" style="margin-top:6px">steps 1-2 are collapsed: your keys are restored from this device's stored session. sweeping still needs a fresh wallet signature (RE-CONNECT, then GENERATE).</div>
+      <div class="dashbtns">
+        <button id="b-reconnect">RE-CONNECT</button>
+        <button class="ghost" id="b-notify">ENABLE NOTIFICATIONS</button>
+        <button class="ghost" id="b-forget">FORGET THIS DEVICE</button>
+      </div>
     </div>
 
-    <div id="r-payments" style="display:none;margin-top:26px">
-      <h2 style="margin-bottom:10px">PAYMENTS</h2>
-      <div class="status" id="r-watch-note" style="display:none;margin-top:0">watch-only session restored: scanning works, but the spend key is never stored on this device. connect above and SIGN · GENERATE STEALTH KEYS again (same wallet, same keys) to sweep.</div>
-      <div class="status" id="r-scan-st" style="margin-top:4px"></div>
-      <div id="r-rows"></div>
-    </div>
-  </div>
-  <div id="r-recovery" style="display:none;border:1px solid #fff;padding:14px;margin-top:14px;font-size:12px;line-height:1.7"></div>
-
-  <div id="doors">
-    <a class="door" href="./app.html">
-      <div class="door-t">APP</div>
-      <div class="door-d">connect, generate your stealth keys, receive, sweep into Privacy Pools, withdraw unlinked.</div>
-    </a>
-    <a class="door" href="./invoices.html">
-      <div class="door-t">INVOICING</div>
-      <div class="door-d">tracked invoices, clients, private payment links, encrypted memos.</div>
-    </a>
-    <div class="door" id="paydoor">
-      <div class="door-t">PAY A LINK</div>
-      <div class="door-d">paste a payment link, an invoice link, or a stealth meta-address. you pay from your own wallet; the announcement goes with it so the recipient's scanner finds the payment.</div>
-      <input id="i-paylink" placeholder="https://…#st:eth:0x… or st:eth:0x…">
-      <button id="b-paylink" style="margin-top:12px">OPEN PAYMENT</button>
-      <div class="status" id="st-paylink"></div>
-    </div>
-  </div>
-
-  <!-- payer flow: shown when the page is opened with a payment hash, or a link is pasted above -->
-  <div id="payflow" style="display:none">
+    <!-- 1 -->
     <div class="step on" id="s1">
       <h2>1 · CONNECT WALLET</h2>
       <button id="b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
@@ -206,26 +279,181 @@
       <input id="i-wcpid" type="hidden" value="c6c9bacd35afa3eb9e6cccf6d8464395">
     </div>
 
-    <!-- pay-a-ghost mode (opened via someone's link) -->
-    <div class="step on" id="payghost">
-      <h2>PAY A GHOST</h2>
-      <div class="status" id="st-invoice"></div>
-      <div class="card">
-        <div class="lbl">PAY THIS ONE-TIME ADDRESS</div>
-        <b id="v-payaddr"></b>
-        <button id="b-copyaddr">COPY</button>
-        <div class="status" style="color:#666">then announce it so their scanner finds it: <span id="v-ann"></span></div>
-        <button id="b-announce" class="ghost" style="background:#000;color:#fff">SEND + ANNOUNCE WITH MY WALLET</button>
+    <!-- 2 -->
+    <div class="step" id="s2">
+      <h2>2 · GENERATE ADDRESS</h2>
+      <button id="b-gen" disabled>GENERATE MY STEALTH KEYS</button>
+      <div class="status" id="st-gen">sign one message · your keys are derived from the signature. same wallet, same signature, same keys. nothing to back up.</div>
+      <div id="remember-row" style="display:none;margin-top:14px">
+        <label style="display:block;font-size:12px;color:#fff;cursor:pointer"><input type="checkbox" id="i-remember" style="width:auto;margin-right:6px">remember this device (watch-only)</label>
+        <div class="status" style="color:#555;margin-top:4px">warning: watch-only persistence reveals your payment history to anyone with access to this browser profile. the spend key is NEVER stored: sweeping always requires a fresh wallet signature.</div>
       </div>
+      <div class="card" id="c-recv" style="display:none">
+        <div class="lbl">YOUR ONE-TIME RECEIVING ADDRESS · SHARE THIS TO GET PAID</div>
+        <b id="v-recv"></b>
+        <button id="b-copyrecv">COPY ADDRESS</button>
+        <div style="margin-top:14px;border-top:1px solid #cec9be;padding-top:10px">
+          <div style="font-size:11px;color:#5c5953;margin-bottom:8px">only needed if the payer pays the raw address outside a payment link: payment links announce automatically when the payer pays.</div>
+          <button id="b-annrecv" class="ghost" style="background:#fff;color:#000;border:1px solid #000;width:auto;padding:8px 14px;font-size:10px;margin-top:0">ANNOUNCE IT</button>
+          <div class="status" id="st-announce" style="color:#4e4b46"></div>
+        </div>
+      </div>
+      <details id="d-meta" style="display:none;margin-top:12px">
+        <summary style="cursor:pointer;color:#888;font-size:11px">advanced: stealth meta-address + pay-me link</summary>
+        <div class="card">
+          <div class="lbl">YOUR STEALTH META-ADDRESS</div>
+          <b id="v-meta"></b>
+          <button id="b-copymeta">COPY META-ADDRESS</button>
+          <button id="b-copylink" class="ghost" style="background:#000;color:#fff;border:0">COPY PAY-ME LINK</button>
+        </div>
+      </details>
     </div>
 
-    <div class="status" style="margin-top:16px"><a href="./" style="color:#888">← back to the doors</a></div>
-  </div>
+    <!-- 3 -->
+    <div class="step" id="s3">
+      <h2>3 · SWEEP</h2>
+      <div class="status" id="st-scan">connect + generate first.</div>
+      <button class="ghost" id="b-rescan" style="margin-bottom:10px">RESCAN</button>
+      <input id="i-fromblock" type="number" min="0" placeholder="from block (optional · default: latest − 50000)">
+      <label style="display:block;margin:6px 0;font-size:12px;color:#888"><input type="checkbox" id="i-legacy" style="width:auto;margin-right:6px">legacy scheme (sha256) · needed to find + sweep announcements made before 2026-09-08</label>
+      <div id="payments"></div>
+      <div id="sweeper-ui" style="display:none">
+        <div class="status" id="st-armed" style="color:#fff"></div>
+        <div class="status" style="margin-top:4px">door: PRIVACY POOLS · any amount (the only door now)</div>
+        <button id="b-sweep" style="margin-top:8px">SIGN SWEEP</button>
+        <div class="card" id="c-secret" style="display:none;border:4px solid #000">
+          <div class="lbl" id="v-secret-lbl">WITHDRAWAL SECRET</div>
+          <b id="v-secret"></b>
+          <button id="b-dlsecret">DOWNLOAD SECRET FILE AGAIN</button>
+        </div>
+        <div class="card" id="c-artifact" style="display:none">
+          <div class="lbl">SIGNED</div>
+          <b id="v-artifact"></b>
+          <button class="ghost" id="b-copyart">COPY ARTIFACT</button>
+          <div class="status" id="st-broadcast" style="color:#4e4b46"></div>
+        </div>
+      </div>
+      <div id="gp-sweep"></div>
+      <div id="gp-inbox"></div>
+    </div>
+
+    <!-- 4 -->
+    <div class="step on" id="s4">
+      <h2>4 · WITHDRAW FROM PRIVACY POOLS</h2>
+      <div class="status">once the ASP has approved your sweep deposit, withdraw here with the pp-secret file you downloaded at sweep time. no wallet needed: a relayer pays gas.</div>
+      <input type="file" id="i-secretfile" accept=".json,application/json">
+      <textarea id="i-secretjson" rows="5" placeholder="…or paste the pp-secret JSON here"></textarea>
+      <input id="i-recipient" placeholder="recipient address (0x…)">
+      <input id="i-wamount" placeholder="amount in ETH (optional · default: full balance)">
+      <button id="b-withdraw" style="margin-top:8px">WITHDRAW</button>
+      <div class="status" id="st-withdraw"></div>
+      <div id="gp-withdraw"></div>
+    </div>
+  </section>
+
+  <!-- ══ INVOICES ══ the invoice suite (was invoices.html): the #gp-invoices mount with
+       its sub-tab shell (tab bar + seven mount divs). gp-invoices.mjs fills tab-invoices /
+       tab-customers / tab-items / tab-recurring / tab-settings (frag-invoices.html);
+       gp-reports.mjs fills tab-dashboard / tab-reports (frag-reports.html). Renderers
+       tolerate any mount being absent.
+       The old page's hidden scanner stubs (payments / st-scan / i-fromblock / c-secret …)
+       are DROPPED: the FUNDS tab carries the real elements and app-core drives both.
+       Consequence (v1 accepted): app-core's showSecret writes the withdrawal secret into
+       the c-secret group in the FUNDS tab even while the user is looking at INVOICES. -->
+  <section class="gp-route" id="route-invoices" style="display:none">
+    <div class="sub">INVOICE SUITE · TRACKED INVOICES · CLIENTS · PRIVATE PAYMENT LINKS · ENCRYPTED MEMOS</div>
+    <div class="step on">
+      <h2>INVOICE SUITE</h2>
+      <div id="gp-invoices">
+        <div class="gp-tabs" id="gp-tabs">
+          <button type="button" class="gp-tab on" data-tab="tab-dashboard">DASHBOARD</button>
+          <button type="button" class="gp-tab" data-tab="tab-invoices">INVOICES</button>
+          <button type="button" class="gp-tab" data-tab="tab-customers">CUSTOMERS</button>
+          <button type="button" class="gp-tab" data-tab="tab-items">ITEMS</button>
+          <button type="button" class="gp-tab" data-tab="tab-recurring">RECURRING</button>
+          <button type="button" class="gp-tab" data-tab="tab-reports">REPORTS</button>
+          <button type="button" class="gp-tab" data-tab="tab-settings">SETTINGS</button>
+        </div>
+        <div id="tab-dashboard" class="gp-tabpane"></div>
+        <div id="tab-invoices" class="gp-tabpane" style="display:none"></div>
+        <div id="tab-customers" class="gp-tabpane" style="display:none"></div>
+        <div id="tab-items" class="gp-tabpane" style="display:none"></div>
+        <div id="tab-recurring" class="gp-tabpane" style="display:none"></div>
+        <div id="tab-reports" class="gp-tabpane" style="display:none"></div>
+        <div id="tab-settings" class="gp-tabpane" style="display:none"></div>
+      </div>
+    </div>
+  </section>
+
 </div>
 <div id="gp-toast"></div>
 
+<script>
+// top-level tab router: one app, four hash routes (#/get-paid · #/pay · #/funds ·
+// #/invoices). Sections toggle by display only, never by innerHTML, so modules can
+// render into hidden tabs at any time. Unknown or missing hash → GET PAID.
+// A payment-link hash (…#st:eth:0x…, no '#/') is NOT a route: it forces the PAY tab and
+// reveals the payflow HERE, before any module evaluates, because gp-invoices.mjs
+// enhances #payghost only if it is visible at its boot.
+(function () {
+  const ROUTES = ['get-paid', 'pay', 'funds', 'invoices'];
+  const links = Array.from(document.querySelectorAll('.gp-nav-link[data-route]'));
+  const isPayLink = () => /st:eth:0x[0-9a-fA-F]{132}/.test(location.hash);
+  function route() {
+    if (isPayLink()) return 'pay';
+    const m = location.hash.match(/^#\/([a-z-]+)/);
+    return m && ROUTES.indexOf(m[1]) !== -1 ? m[1] : 'get-paid';
+  }
+  function apply() {
+    const r = route();
+    ROUTES.forEach(n => {
+      const sec = document.getElementById('route-' + n);
+      if (sec) sec.style.display = n === r ? '' : 'none';
+    });
+    links.forEach(a => a.classList.toggle('on', a.dataset.route === r));
+    const $ = id => document.getElementById(id);
+    if (isPayLink()) {
+      // payer chrome: the receive journey steps aside (the homepage inline module's
+      // enterPayMode repeats this and fills in the address + handlers).
+      ['getpaid', 'r-recovery', 'doors'].forEach(id => { const el = $(id); if (el) el.style.display = 'none'; });
+      ['payflow', 'payghost'].forEach(id => { const el = $(id); if (el) el.style.display = 'block'; });
+    } else {
+      // back to receiver chrome: restore what pay mode hid (r-recovery re-renders from
+      // the inline module's own hashchange listener).
+      ['getpaid', 'doors'].forEach(id => { const el = $(id); if (el) el.style.display = ''; });
+      const pf = $('payflow'); if (pf) pf.style.display = 'none';
+    }
+  }
+  window.addEventListener('hashchange', apply);
+  apply();
+})();
+</script>
+<script>
+// suite tab shell: switch visibility of the seven mount divs only. Renderers fill the mounts
+// independently, so this never touches their content and works with dynamically rendered trees.
+(function () {
+  const bar = document.getElementById('gp-tabs');
+  if (!bar) return;
+  const panes = document.querySelectorAll('#gp-invoices .gp-tabpane');
+  bar.addEventListener('click', e => {
+    const b = e.target.closest('[data-tab]');
+    if (!b) return;
+    bar.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x === b));
+    panes.forEach(p => { p.style.display = p.id === b.dataset.tab ? '' : 'none'; });
+  });
+})();
+</script>
+
 <script src="./config.local.js" onerror="this.remove()"></script>
+<script type="module" src="./app-core.mjs"></script>
+<script type="module" src="./gp-inbox.mjs"></script>
+<script type="module" src="./gp-money.mjs"></script>
+<script type="module" src="./gp-invoices.mjs"></script>
+<script type="module" src="./gp-reports.mjs"></script>
 <script type="module">
+// ══ homepage inline module: the GET PAID journey + the PAY tab's payer flow ══
+// Loads LAST, after app-core.mjs and the feature modules, so it can reconcile window.GP
+// (see the merge block below) instead of being overwritten by app-core.
 import { secp256k1 } from './vendor/noble-curves-secp256k1.mjs';
 import { keccak_256 } from './vendor/noble-hashes-sha3.mjs';
 import * as ethers from './vendor/ethers.mjs';
@@ -255,7 +483,7 @@ function derive(metaHex) {
 }
 
 // receiver side of scheme 1, ported from app-core.mjs (keccak shared-secret hash; the
-// legacy sha256 scheme lives in the full app, not on the homepage).
+// legacy sha256 scheme lives in the FUNDS tab's app-core, not in this module).
 function check(viewPriv, spendPub, ephPub, addr) {
   const sh = keccak_256(secp256k1.getSharedSecret(buf(viewPriv), buf(ephPub), true));
   const stealthPub = secp256k1.ProjectivePoint.fromHex(buf(spendPub)).add(secp256k1.ProjectivePoint.BASE.multiply(mod(bint(sh))));
@@ -282,9 +510,10 @@ function sign7702(priv, chainId, sweeper, nonce) {
 
 // state
 let W = null; // { account, prov, eip1193 } or { account, session }
-// connect UI sink: the pay-a-ghost panel by default. The GET PAID card points the same
-// connect machinery at its own elements while its connect step is active.
-const PAY_CTX = { st: 'st-connect', qr: 'qr', qrwrap: 'qrwrap', wclink: 'wc-link', wcraw: 'wc-raw', binj: 'b-injected' };
+// connect UI sink: the PAY tab's connect step by default (p-* ids: app-core owns the
+// unprefixed ones in FUNDS). The GET PAID card points the same connect machinery at its
+// own r-* elements while its connect step is active.
+const PAY_CTX = { st: 'p-st-connect', qr: 'p-qr', qrwrap: 'p-qrwrap', wclink: 'p-wc-link', wcraw: 'p-wc-raw', binj: 'p-b-injected' };
 const RECV_CTX = { st: 'r-st-connect', qr: 'r-qr', qrwrap: 'r-qrwrap', wclink: 'r-wc-link', wcraw: 'r-wc-raw', binj: 'r-b-injected' };
 let CTX = PAY_CTX;
 const ANNOUNCER = '0x55649E01B5Df198D18D95b5cc5051630cfD45564';
@@ -356,7 +585,8 @@ function showQr(text) {
 }
 async function connectLatrine() {
   const st = m => $(CTX.st).textContent = m;
-  const pid = $('i-wcpid').value.trim();
+  // the PAY tab's own hidden project-id input (same value as FUNDS' i-wcpid, which app-core reads)
+  const pid = $('p-i-wcpid').value.trim();
   st('signing relay identity…');
   const jwk = crypto.getRandomValues(new Uint8Array(32));
   const jwt = await Jwt.sign(jwk, WalletConnect.RELAY);
@@ -403,7 +633,7 @@ async function connectLatrine() {
   const account = stl.namespaces.eip155.accounts[0].split(':')[2];
   return { session, account };
 }
-$('b-connect').onclick = async () => {
+$('p-b-connect').onclick = async () => {
   CTX = PAY_CTX;
   // 6963/injected wallet (Ambire extension, …) pops instantly; latrine/WC when nothing is injected.
   if (PROVIDERS.length || window.ethereum) return connectInjected();
@@ -417,8 +647,8 @@ $('b-connect').onclick = async () => {
     $(CTX.binj).style.display = 'block';
   }
 };
-$('b-injected').onclick = () => { CTX = PAY_CTX; connectInjected(); };
-$('b-forcelatrine').onclick = async e => {
+$('p-b-injected').onclick = () => { CTX = PAY_CTX; connectInjected(); };
+$('p-b-forcelatrine').onclick = async e => {
   e.preventDefault();
   CTX = PAY_CTX;
   try {
@@ -448,107 +678,101 @@ async function jrpc(method, params) {
   throw lastErr;
 }
 
-// status strip (#gp-status): relayer health + min fee + ETH price, refreshed every 60s.
-// every endpoint is optional: static-only serving shows "relayer: offline", a failed
-// /price simply hides the price.
+// ── price feed (ETH/USD) for the GET PAID rows' usd line ──
+// The #gp-status strip itself is owned by app-core.mjs on this page: it polls
+// health/fee/price and writes the strip. This poll only keeps ethPriceUsd fresh for
+// formatUsd and never touches the DOM.
 const formatEth = wei => { const s = ethers.formatEther(BigInt(wei)); return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s; };
 let ethPriceUsd = null;
 const formatUsd = (eth, usd) => {
   const p = usd ?? ethPriceUsd;
   return p == null ? null : '$' + (Number(eth) * p).toLocaleString(undefined, { maximumFractionDigits: 2 });
 };
-async function pollStatus() {
-  const el = $('gp-status'); if (!el) return;
-  const parts = [];
-  try {
-    const r = await fetch('./health');
-    if (!r.ok) throw new Error('http ' + r.status);
-    const h = await r.json();
-    const runners = h.runnerCount ?? (Array.isArray(h.runners) ? h.runners.length
-      : (typeof h.runners === 'number' ? h.runners : null));
-    parts.push('relayer: online'
-      + (runners != null ? ' · ' + runners + ' runner' + (runners === 1 ? '' : 's') : '')
-      + ' · sweeperV2 ' + (h.sweeperV2 ? 'configured' : 'NOT configured')
-      + ' · tor ' + (h.tor ? 'on' : 'off'));
-    // runner gas, the "will my tx land" answer at a glance: show the balance and warn
-    // loudly when it is low (an unfunded runner is accepted by Protect but never included)
-    if (h.runnerBalances && h.runners && h.runners.length) {
-      const bal = h.runnerBalances[h.runners[0]];
-      if (bal === 0) parts.push('RUNNER UNFUNDED: broadcasts will not land · fund ' + h.runners[0].slice(0, 10) + '…');
-      else if (bal != null && bal < 0.001) parts.push('RUNNER GAS LOW: ' + bal + ' ETH · fund it or nothing lands');
-      else if (bal != null) parts.push('runner gas ' + bal.toFixed(5) + ' ETH');
-    }
-  } catch { parts.push('relayer: offline (static serving only)'); }
-  try {
-    const r = await fetch('./fee');
-    if (r.ok) {
-      const f = await r.json();
-      if (f.minFeeBps != null) parts.push('min fee ' + (f.minFeeBps / 100) + '%');
-      else {
-        const g = f.minFeeGwei ?? f.gwei ?? f.minFee;
-        if (g != null) parts.push('min fee ' + g + ' gwei');
-      }
-    }
-  } catch { /* fee endpoint optional */ }
+async function pollPrice() {
   try {
     const r = await fetch('./price');
     if (r.ok) {
       const p = await r.json();
       const usd = p.usd ?? p.ethUsd ?? p.price ?? (p.ethereum && p.ethereum.usd);
-      if (usd != null && isFinite(Number(usd))) { ethPriceUsd = Number(usd); parts.push('ETH $' + ethPriceUsd.toLocaleString()); }
+      if (usd != null && isFinite(Number(usd))) ethPriceUsd = Number(usd);
     }
   } catch { /* price hidden on failure, by design */ }
-  el.textContent = parts.join(' · ');
 }
-pollStatus();
-setInterval(pollStatus, 60000);
+pollPrice();
+setInterval(pollPrice, 60000);
 
-// ── window.GP: just enough of the module API (docs/GP-API.md) for gp-invoices.mjs to run
-// its pay-a-ghost enhancement (pinned invoice addresses + encrypted memo field) here. ──
-window.GP = {
-  version: '1.0-homepay',
-  state: {
-    get connected() { return !!(W && (W.prov || W.session)); },
-    get unlocked() { return !!(W && W.viewPriv); },
-    get watchOnly() { return !!(W && W.viewPriv && !W.spendPriv); },
-    get address() { return (W && W.account) || null; },
-    get keys() {
-      return W && W.viewPriv
-        ? { viewPriv: W.viewPriv, viewPub: W.viewPub, spendPub: W.spendPub, spendPriv: W.spendPriv || null, meta: W.meta }
-        : null;
-    },
-    get meta() { return (W && W.meta) || null; },
-    get recv() { return (W && W.recv) || null; },
-    get ethPriceUsd() { return ethPriceUsd; },
-    get payments() { return payments; },
-    walletRequest(method, params) {
+// ── window.GP: the merge (resolving the two-GP conflict) ──
+// app-core.mjs evaluated earlier on this page and installed the full module API
+// (docs/GP-API.md, version 1.0-ui-core). The old homepage shim (version 1.0-homepay)
+// must NOT replace it: gp-inbox / gp-money / gp-invoices / gp-reports captured
+// app-core's object. So the shim's extras merge INTO it:
+//   · GP.const.PAY_AND_ANNOUNCE: the one-transaction pay + announce contract the PAY tab
+//     (and gp-invoices' enhancePayghost) needs. app-core does not define it.
+//   · GP.state.walletRequest: wrapped so app-core's wallet session is tried first and
+//     this module's own W (the PAY tab's wallet) is the fallback.
+// The two sessions stay separate by design: the same wallet signature regenerates the
+// same keys in both, and nothing here attempts to unify them.
+if (window.GP && window.GP.const && window.GP.state) {
+  window.GP.const.PAY_AND_ANNOUNCE = PAY_AND_ANNOUNCE;
+  const coreWalletRequest = window.GP.state.walletRequest.bind(window.GP.state);
+  window.GP.state.walletRequest = (method, params) => {
+    try { return coreWalletRequest(method, params); }
+    catch (e) {
       if (W && W.session) return W.session.request({ chainId: 'eip155:1', request: { method, params } });
       if (W && W.eip1193) return W.eip1193.request({ method, params });
-      if (window.ethereum) return window.ethereum.request({ method, params });
-      throw new Error('no wallet connected');
+      throw e;
+    }
+  };
+} else {
+  // defensive: app-core never landed (its script tag failed). The old standalone shim,
+  // enough of the module API for gp-invoices.mjs' payghost enhancement on the PAY tab.
+  window.GP = {
+    version: '1.0-homepay',
+    state: {
+      get connected() { return !!(W && (W.prov || W.session)); },
+      get unlocked() { return !!(W && W.viewPriv); },
+      get watchOnly() { return !!(W && W.viewPriv && !W.spendPriv); },
+      get address() { return (W && W.account) || null; },
+      get keys() {
+        return W && W.viewPriv
+          ? { viewPriv: W.viewPriv, viewPub: W.viewPub, spendPub: W.spendPub, spendPriv: W.spendPriv || null, meta: W.meta }
+          : null;
+      },
+      get meta() { return (W && W.meta) || null; },
+      get recv() { return (W && W.recv) || null; },
+      get ethPriceUsd() { return ethPriceUsd; },
+      get payments() { return payments; },
+      walletRequest(method, params) {
+        if (W && W.session) return W.session.request({ chainId: 'eip155:1', request: { method, params } });
+        if (W && W.eip1193) return W.eip1193.request({ method, params });
+        if (window.ethereum) return window.ethereum.request({ method, params });
+        throw new Error('no wallet connected');
+      },
     },
-  },
-  scan: opts => scan(opts || {}),
-  relayerCaps,
-  jrpc,
-  toast,
-  ethers,
-  fmt: { formatEth, formatUsd },
-  const: { ANNOUNCER, CHAIN_ID, PAY_AND_ANNOUNCE, SWEEPER_V2 },
-  crypto: { secp256k1, keccak_256, hex, buf, mod, N, derive, check, stealthKey, sign7702, intentDomain, INTENT_TYPES, poseidon2 },
-};
+    scan: opts => scan(opts || {}),
+    relayerCaps,
+    jrpc,
+    toast,
+    ethers,
+    fmt: { formatEth, formatUsd },
+    const: { ANNOUNCER, CHAIN_ID, PAY_AND_ANNOUNCE, SWEEPER_V2 },
+    crypto: { secp256k1, keccak_256, hex, buf, mod, N, derive, check, stealthKey, sign7702, intentDomain, INTENT_TYPES, poseidon2 },
+  };
+}
 
 // PWA: cache-first offline shell. http(s) only: file:// and weird schemes skip registration.
 if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
   navigator.serviceWorker.register('./sw.js').catch(() => { /* offline shell unavailable: the app still works */ });
 }
 
-// ── pay-a-ghost mode (the payer flow, moved from the old single-page app) ──
+// ── pay-a-ghost mode (the payer flow, PAY tab) ──
 
 // enters payer mode when the URL hash carries a meta-address. Returns false otherwise.
 function enterPayMode() {
   const metaMatch = location.hash.match(/st:eth:0x[0-9a-fA-F]{132}/);
   if (!metaMatch) return false;
+  // the tab router (classic script, before the modules) already revealed payflow +
+  // payghost and hid the receiver chrome; repeat it here, it is idempotent.
   $('getpaid').style.display = 'none';
   $('r-recovery').style.display = 'none';
   $('doors').style.display = 'none';
@@ -556,6 +780,11 @@ function enterPayMode() {
   $('payghost').style.display = 'block';
   const inv = location.hash.match(/\?pay=([^&]+)/);
   $('st-invoice').textContent = inv ? 'invoice: ' + decodeURIComponent(inv[1]) : 'they asked to be paid in stealth.';
+  // gp-invoices.mjs loads BEFORE this module now, so its enhancePayghost may have
+  // already pinned the invoice address, inserted the memo field (#gpinv-memo) and taken
+  // over the announce button. When it did, the core derivation + handlers below must
+  // NOT overwrite its work.
+  if (document.getElementById('gpinv-memo')) return true;
   const r = derive(metaMatch[0].slice(7));
   $('v-payaddr').textContent = r.stealth;
   $('b-copyaddr').onclick = e => copy(r.stealth, e.target);
@@ -657,7 +886,7 @@ $('i-paylink').onkeydown = e => { if (e.key === 'Enter') $('b-paylink').click();
 
 // ── GET PAID: the easy receive flow (CONNECT → GENERATE → AMOUNT → COPY) ──
 // Key derivation, record format, session format, and announce pruning are byte-identical
-// with app-core.mjs, so homepage-generated keys, sessions, and recovery interlock with app.html.
+// with app-core.mjs, so keys, sessions, and recovery interlock with the FUNDS tab.
 
 // gp-session: ONLY the viewing key + stealth meta-address (watch-only). The spend key is
 // never stored, so sweeping always needs a fresh wallet signature.
@@ -687,7 +916,7 @@ function dropRecvRecord(stealth) {
 
 // same signature scheme as app-core's ghostSign: hex-encoded personal_sign over
 // WalletConnect, signMessage on the injected path. The same signature must regenerate
-// the same keys on app.html, so this must not drift.
+// the same keys in the FUNDS tab, so this must not drift.
 async function ghostSign(message) {
   if (W.session) {
     const hexMsg = ethers.hexlify(new TextEncoder().encode(message));
@@ -728,7 +957,7 @@ function rGoto(n) {
 function rAdvance(i) { rDone[i] = true; rGoto(i < 3 ? i + 1 : i); }
 R_NAMES.forEach((_, i) => { $('r-tab-' + i).onclick = () => { if (i === rStep || rDone[i] || (i > 0 && rDone[i - 1])) rGoto(i); }; });
 
-// 1 · CONNECT: the homepage's existing connect machinery, pointed at this card's elements.
+// 1 · CONNECT: the PAY tab's connect machinery, pointed at this card's r-* elements.
 function rOnConnected() {
   $('r-acct').innerHTML = 'wallet: <span class="ok">' + W.account.slice(0, 6) + '…' + W.account.slice(-4) + '</span>';
   rAdvance(0);
@@ -1140,7 +1369,7 @@ async function openPoolSweep(row, bal) {
   try {
     const rec = row.rec, addr = rec.address;
     const caps = await relayerCaps();
-    if (!caps.sweeperV2) throw new Error('this relayer does not run intent sweeps (sweeperV2 not configured) · open the full app to sweep.');
+    if (!caps.sweeperV2) throw new Error('this relayer does not run intent sweeps (sweeperV2 not configured) · open the FUNDS tab to sweep.');
     const w = stealthWallet(rec); // throws on watch-only, with the re-connect + re-sign instructions
     st.textContent = 'signing the sweep intent…';
     // precommitment = poseidon2(nullifier, secret), 31-byte values, identical to
@@ -1162,8 +1391,8 @@ async function openPoolSweep(row, bal) {
       timestamp: new Date().toISOString(),
       pool: 'ETH mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
     };
-    // non-secret tracking record (nullifier only, it cannot withdraw) so the full app can
-    // show this deposit's lifecycle. The secret itself is NEVER stored anywhere.
+    // non-secret tracking record (nullifier only, it cannot withdraw) so the FUNDS tab
+    // can show this deposit's lifecycle. The secret itself is NEVER stored anywhere.
     try {
       localStorage.setItem('ghostpay:ppnote:' + addr.toLowerCase(), JSON.stringify({
         nullifier: hex(nullifier), precommitment: preHex, amount: bal.toString(), ts: Date.now()
@@ -1189,7 +1418,7 @@ async function openPoolSweep(row, bal) {
     st.textContent = '';
     previewAndBroadcast(row, panel, st, artifact,
       formatEth(bal) + ' ETH → Privacy Pools · fee ' + caps.minFeeBps + ' bps · valid 24h',
-      'swept into Privacy Pools · withdraw from the full app after ASP review');
+      'swept into Privacy Pools · withdraw from the FUNDS tab after ASP review');
   } catch (e) { st.textContent = 'error: ' + e.message; }
 }
 
@@ -1209,7 +1438,7 @@ function openDirectSweep(row, bal) {
       if (!ethers.isAddress(dest.value.trim())) throw new Error('bad destination address');
       const to = ethers.getAddress(dest.value.trim());
       const caps = await relayerCaps();
-      if (!caps.sweeperV2) throw new Error('this relayer does not run intent sweeps (sweeperV2 not configured) · open the full app to sweep.');
+      if (!caps.sweeperV2) throw new Error('this relayer does not run intent sweeps (sweeperV2 not configured) · open the FUNDS tab to sweep.');
       const w = stealthWallet(row.rec);
       const nonce = parseInt(await jrpc('eth_getTransactionCount', [row.rec.address, 'latest']), 16);
       const intent = {
@@ -1278,12 +1507,18 @@ function renderRecvRecovery() {
   el.appendChild(row);
 }
 renderRecvRecovery();
+// the router (classic script) hides r-recovery when a payment link opens; when the hash
+// goes back to a normal route, re-render the line from the records.
+window.addEventListener('hashchange', () => {
+  if (!/st:eth:0x[0-9a-fA-F]{132}/.test(location.hash)) renderRecvRecovery();
+});
 
 if (location.search.includes('gentest')) setTimeout(() => {
   // wallet-free test of the generate path: fake 65-byte sig in place of personal_sign output.
-  // Same fake signature as app-core.mjs gentest, so the meta-address must match app.html's.
+  // Same fake signature as app-core.mjs gentest, so the meta-address must match the FUNDS tab's.
+  // Own id ('gentest-line'): #bootline in the FUNDS tab belongs to app-core's gentest.
   const bl = document.createElement('div');
-  bl.id = 'bootline';
+  bl.id = 'gentest-line';
   bl.style.display = 'none';
   try {
     W = { account: '0x0000000000000000000000000000000000000001' };
@@ -1317,6 +1552,5 @@ enterPayMode();
   } catch { /* corrupt session: ignore, the stepper still works */ }
 })();
 </script>
-<script type="module" src="./gp-invoices.mjs"></script>
 </body>
 </html>
