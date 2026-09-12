@@ -3,7 +3,7 @@
 //   <script type="module" src="./gp-inbox.mjs"></script>
 // Markup comes from frag-inbox.html (pasted into #gp-inbox by the integrator, or fetched
 // and injected by this module, with an embedded copy as the offline fallback).
-// app-core's static esm.sh imports can delay window.GP assembly past this module's
+// app-core's module graph can delay window.GP assembly past this module's
 // evaluation (the same race gp-invoices/gp-reports handle): wait for it instead of dying.
 const GP = await (async () => {
   for (let i = 0; i < 60; i++) {

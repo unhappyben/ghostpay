@@ -200,13 +200,13 @@
 
 <script src="./config.local.js" onerror="this.remove()"></script>
 <script type="module">
-import { secp256k1 } from 'https://esm.sh/@noble/curves@1.6.0/secp256k1.js';
-import { keccak_256 } from 'https://esm.sh/@noble/hashes@1.5.0/sha3.js';
-import * as ethers from 'https://esm.sh/ethers@6.13.4';
-import { IrnClient } from 'https://esm.sh/@hazae41/latrine/out/mods/irn/mod.js';
-import { WalletConnect, WcPairing } from 'https://esm.sh/@hazae41/latrine/out/mods/wc/mod.js';
-import { Jwt } from 'https://esm.sh/@hazae41/latrine/out/libs/jwt/mod.js';
-import qrcode from 'https://esm.sh/qrcode-generator@1.4.4';
+import { secp256k1 } from './vendor/noble-curves-secp256k1.mjs';
+import { keccak_256 } from './vendor/noble-hashes-sha3.mjs';
+import * as ethers from './vendor/ethers.mjs';
+import { IrnClient } from './vendor/latrine-irn.mjs';
+import { WalletConnect, WcPairing } from './vendor/latrine-wc.mjs';
+import { Jwt } from './vendor/latrine-jwt.mjs';
+import qrcode from './vendor/qrcode-generator.mjs';
 
 const $ = id => document.getElementById(id);
 const hex = b => '0x' + [...b].map(x => x.toString(16).padStart(2, '0')).join('');
@@ -253,7 +253,7 @@ function toast(msg) {
 }
 
 // ── loud failure mode: any error, anywhere, lands in the status line ──
-window.addEventListener('error', e => { const s = $(CTX.st); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load · check network (esm.sh CDN) and reload'); });
+window.addEventListener('error', e => { const s = $(CTX.st); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load · reload the page'); });
 window.addEventListener('unhandledrejection', e => { const s = $(CTX.st); if (s) s.textContent = 'error: ' + ((e.reason && e.reason.message) || e.reason || 'unknown'); });
 
 // ── EIP-6963 wallet discovery: finds every installed wallet even when extensions fight over window.ethereum ──
@@ -713,13 +713,13 @@ function buildPayLink() {
   const note = $('r-i-note').value.trim();
   return location.origin + '/#' + W.meta + (amt ? '?pay=' + encodeURIComponent(amt + ' ' + token + (note ? ' · ' + note : '')) : '');
 }
-// qrcode-generator: same esm.sh import gp-invoices.mjs uses, loaded lazily. The QR is
+// qrcode-generator: same vendored module gp-invoices.mjs uses, loaded lazily. The QR is
 // optional and hides quietly if the import fails.
 let qrLinkLib = null;
 async function drawLinkQr(text) {
   const wrap = $('r-qrlink-wrap');
   try {
-    qrLinkLib ??= (await import('https://esm.sh/qrcode-generator@1.4.4')).default;
+    qrLinkLib ??= (await import('./vendor/qrcode-generator.mjs')).default;
     const q = qrLinkLib(0, 'M'); q.addData(text); q.make();
     const cv = $('r-qrlink'), ctx = cv.getContext('2d');
     const n = q.getModuleCount(), scale = 4;

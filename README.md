@@ -96,7 +96,7 @@ node notify.mjs /path/to/conf.json
 | `POST /announce` | `{stealth, ephPub, viewTag, metadata?}` → announce on the ERC-5564 announcer from a runner wallet. `metadata` is optional 0x-hex, 1-1024 bytes (view tag + encrypted memo); default is the 1-byte view tag. |
 | `POST /sweep` | Relay a signed sweep artifact: `eip3009`, `eip7702-sweep`, `eip7702-intent`, or `eip7702-intent-batch`. |
 | `POST /pp-withdraw` | Privacy Pools withdrawal relay (`PP_RELAY=1` only, else 503). Same payload shape the app sends fastrelay.xyz. The groth16 context signal binds the fee terms into the proof: the fee recipient must be one of this server's runners and `relayFeeBPS` must not exceed `PP_FEE_BPS`. The runner pays gas; the fee accrues to the runner inside the withdrawal itself. |
-| `GET /health` | Relayer status JSON: runners (addresses only, never keys), sweeperV2, batchRelayer, feeOwner, tor, endpoints. With `PP_RELAY=1` also `ppRelay: true` and `ppFeeBps`, so the app can discover the relay and price proofs. |
+| `GET /health` | Relayer status JSON: runners (addresses only, never keys), sweeperV2, batchRelayer, feeOwner, tor, endpoints. With `PP_RELAY=1` also `ppRelay: true` and `ppFeeBps`, so the app can discover the relay and price proofs. Also `rateLimited: true`, plus `authRequired: true` when `GHOSTPAY_API_TOKEN` is set (never the token itself). |
 | `GET /fee` | `{minFeeBps}`: the relayer fee floor for intent sweeps. |
 | `GET /price` | ETH + USDC USD prices, CoinGecko proxied with a 60s cache so the price fetch stays out of the browser. |
 | `GET /status/:hash` | Transaction receipt status: `confirmed`, `failed`, or `pending`. |
@@ -110,7 +110,9 @@ Environment variables:
 | `RPC_URLS` | flashbots/drpc/merkle | Comma-separated read endpoints, random per call. |
 | `BROADCAST_URLS` | `https://rpc.flashbots.net` | Comma-separated endpoints used only for `eth_sendRawTransaction`; every read stays on the `RPC_URLS` rotation. |
 | `TOR_PROXY` | unset | Route all JSON-RPC over Tor (`socks5://127.0.0.1:9050`). |
+| `GHOSTPAY_API_TOKEN` | unset | Shared-secret auth: when set, `POST /sweep` and `POST /pp-withdraw` require `Authorization: Bearer <token>` (constant-time compare, 401 otherwise). `/announce` and the GET endpoints stay open. |
 | `MIN_FEE_BPS` | `30` | Fee floor for intent sweeps, advertised at `GET /fee`. |
+| `MIN_PRIORITY_WEI` | `100000000` | Priority-fee floor in wei for the 2x fee bump: at ultra-low gas prices an unfloored bump produces a priority fee builders skip. |
 | `SWEEPER_V2` | unset | Deployed SweeperV2 address: gates `eip7702-intent` sweeps. |
 | `BATCH_RELAYER` | unset | Deployed BatchRelayer address: gates `eip7702-intent-batch` sweeps. |
 | `PP_RELAY` | unset | Set to `1` to enable `POST /pp-withdraw`. |
@@ -120,6 +122,8 @@ Environment variables:
 | `FEE_SWEEP_MINUTES` | `60` | Minutes between fee-forward sweeps (first sweep 5 min after boot). |
 
 Broadcasts wait a random jitter (announce 2-15s, sweep 5-45s) so the browser request and the onchain transaction are not trivially time-correlated.
+
+**Abuse protection.** The write endpoints cost the runner gas, so a public relayer rate limits per IP: `POST /announce` 10/min, `POST /sweep` and `POST /pp-withdraw` 5/min. Buckets are in-memory token buckets keyed by IP and refilled lazily; they reset on restart, which is fine for a brake rather than a quota. A limited request gets a clean 429 JSON error with a `Retry-After` header, logged as one line with the IP. With `GHOSTPAY_API_TOKEN` set, `POST /sweep` and `POST /pp-withdraw` additionally require `Authorization: Bearer <token>` (401 otherwise); `POST /announce`, `GET /health`, `GET /fee`, `GET /price`, and `GET /status` stay open. `GET /health` reports `rateLimited` and `authRequired` so clients can see the policy without ever seeing the token. Separately, intent sweeps (`eip7702-intent`, `eip7702-intent-batch`) hard-fail when gas estimation fails: the type-4 fixed-500k fallback applies only to the proven v1 `eip7702-sweep` flow, so a malformed intent can never burn runner gas on a reverting transaction.
 
 **Collecting fees.** Relayer fees accrue onchain to the runner: `tx.origin` on intent sweeps, `feeRecipient` inside Privacy Pools withdrawals. With `FEE_OWNER` set, a forwarder runs every `FEE_SWEEP_MINUTES` (default hourly): each runner keeps `FEE_RESERVE_ETH` for gas and sweeps the rest to `FEE_OWNER` as a plain type-2 transfer. Sweeps ride the same broadcast machinery as user transactions (endpoint rotation, fee bump, `BROADCAST_URLS`) but skip the jitter. Every forward is logged to `fees.jsonl` as `kind: "fee-forward"` so the ledger sees the outflow. `GET /health` shows the configured `feeOwner` (an address is public onchain anyway).
 

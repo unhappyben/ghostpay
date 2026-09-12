@@ -186,11 +186,11 @@ export function agingDetail(records, from, to, now = Date.now()) {
 
 // ── everything below runs only in the browser with window.GP present ──
 
-// qrcode-generator: same lazy esm.sh import gp-invoices.mjs uses, so this file stays
+// qrcode-generator: same lazy vendored import gp-invoices.mjs uses, so this file stays
 // importable under plain node (no DOM, no network) for the smoke test.
 let qrLib = null;
 async function getQr() {
-  qrLib ??= (await import('https://esm.sh/qrcode-generator@1.4.4')).default;
+  qrLib ??= (await import('./vendor/qrcode-generator.mjs')).default;
   return qrLib;
 }
 async function qrDataUrl(text) {
@@ -658,7 +658,7 @@ async function ensureStyles() {
 }
 
 async function boot() {
-  // app-core's static esm.sh imports can delay window.GP assembly past this module's
+  // app-core's module graph can delay window.GP assembly past this module's
   // evaluation (same race gp-invoices.mjs handles with lazy capture): retry before giving up.
   for (let i = 0; i < 30 && !GP; i++) {
     await new Promise(r => setTimeout(r, 500));

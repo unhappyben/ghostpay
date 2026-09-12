@@ -36,7 +36,9 @@
 // ghostpay:ppnote:*, gp-money:*). docs/GP-API.md marks gp-session + cursors as
 // read-only for modules; the restore flow is the deliberate, documented exception.
 
-const GP = (typeof window !== 'undefined' && window.GP) || null;
+// window.GP is captured lazily: app-core's module graph can evaluate after this module
+// (the race gp-inbox/gp-invoices/gp-reports all handle), so boot() retries before giving up.
+let GP = (typeof window !== 'undefined' && window.GP) || null;
 
 // ── backup crypto: pure WebCrypto, exported so it can be roundtrip-tested in node ──
 const te = new TextEncoder();
@@ -77,8 +79,14 @@ export async function backupDecrypt(fileText, passcode) {
 
 // ── everything below is browser-only ──
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
-  if (GP) boot().catch(e => console.error('gp-money boot failed:', e));
-  else console.error('gp-money: window.GP missing. load gp-money.mjs after the main inline script.');
+  (async () => {
+    for (let i = 0; i < 60 && !GP; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      GP = window.GP || null;
+    }
+    if (GP) boot().catch(e => console.error('gp-money boot failed:', e));
+    else console.error('gp-money: window.GP missing. load gp-money.mjs after the main inline script.');
+  })();
 }
 
 const GATE_KEY = 'gp-money:backup-gate';

@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: node --check root *.mjs and inline module scripts
+        run: npm run check
+
+  forge:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge build
+      - name: forge test (mainnet fork)
+        env:
+          MAINNET_RPC: https://eth.drpc.org
+          MAINNET_RPC_FALLBACK: https://rpc.flashbots.net
+        run: |
+          forge test || {
+            echo "::warning::primary RPC failed or rate limited, retrying with $MAINNET_RPC_FALLBACK"
+            MAINNET_RPC="$MAINNET_RPC_FALLBACK" forge test
+          }
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: boot serve.mjs and assert endpoints
+        run: PORT=8791 npm run smoke
+
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no hyphenated on-chain/off-chain in UI copy or markdown
+        run: |
+          if grep -rIn -E 'on-chain|off-chain' . \
+            --exclude-dir=.git --exclude-dir=node_modules \
+            --exclude-dir=lib --exclude-dir=out --exclude-dir=cache ; then
+            echo "::error::hyphenated on-chain/off-chain found: use onchain/offchain"
+            exit 1
+          fi
+      - name: no em dashes in README.md or docs/
+        run: |
+          if grep -rIn '—' README.md docs/ ; then
+            echo "::error::em dash found in markdown: use colons, periods, or ·"
+            exit 1
+          fi

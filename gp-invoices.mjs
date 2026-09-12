@@ -9,8 +9,8 @@
 // pay-a-ghost enhancement (memo format unchanged). Pure helpers are exported so a
 // node smoke test can exercise migration, totals math and recurrence without a DOM.
 
-// window.GP is captured lazily: app-core's own module graph fetches esm.sh imports
-// over the network, so on slow loads this module can evaluate before window.GP is
+// window.GP is captured lazily: app-core's own module graph takes time to evaluate,
+// so on slow loads this module can evaluate before window.GP is
 // assembled. boot() retries below instead of giving up.
 let GP = typeof window !== 'undefined' ? window.GP || null : null;
 
@@ -301,11 +301,11 @@ const monogram = name => {
   return (w.length ? w.slice(0, 2).map(x => x[0]).join('') : 'GP').toUpperCase();
 };
 
-// ── qrcode-generator: same esm.sh import the core uses, loaded lazily so this file
+// ── qrcode-generator: same vendored module the core uses, loaded lazily so this file
 // stays importable under plain node (no DOM, no network) for the smoke test.
 let qrLib = null;
 async function getQr() {
-  qrLib ??= (await import('https://esm.sh/qrcode-generator@1.4.4')).default;
+  qrLib ??= (await import('./vendor/qrcode-generator.mjs')).default;
   return qrLib;
 }
 async function drawQr(canvas, text) {

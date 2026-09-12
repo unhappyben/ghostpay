@@ -3,14 +3,14 @@
 // and invoices.html (invoice suite needs the same connect/generate/scan machinery).
 // The homepage (index.html) is self-contained: doors + the payer flow.
 // Sweep/withdraw-only controls exist on app.html alone, so those bindings are guarded.
-import { secp256k1 } from 'https://esm.sh/@noble/curves@1.6.0/secp256k1.js';
-import { sha256 } from 'https://esm.sh/@noble/hashes@1.5.0/sha256.js';
-import { keccak_256 } from 'https://esm.sh/@noble/hashes@1.5.0/sha3.js';
-import * as ethers from 'https://esm.sh/ethers@6.13.4';
-import { IrnClient } from 'https://esm.sh/@hazae41/latrine/out/mods/irn/mod.js';
-import { WalletConnect, WcPairing } from 'https://esm.sh/@hazae41/latrine/out/mods/wc/mod.js';
-import { Jwt } from 'https://esm.sh/@hazae41/latrine/out/libs/jwt/mod.js';
-import qrcode from 'https://esm.sh/qrcode-generator@1.4.4';
+import { secp256k1 } from './vendor/noble-curves-secp256k1.mjs';
+import { sha256 } from './vendor/noble-hashes-sha256.mjs';
+import { keccak_256 } from './vendor/noble-hashes-sha3.mjs';
+import * as ethers from './vendor/ethers.mjs';
+import { IrnClient } from './vendor/latrine-irn.mjs';
+import { WalletConnect, WcPairing } from './vendor/latrine-wc.mjs';
+import { Jwt } from './vendor/latrine-jwt.mjs';
+import qrcode from './vendor/qrcode-generator.mjs';
 import { poseidon2 } from './vendor/poseidon2.mjs';
 import { poseidon1, poseidon3 } from './vendor/poseidon13.mjs';
 
@@ -198,7 +198,7 @@ function showSecret(label, display, filename, fileText) {
 }
 
 // ── loud failure mode: any error, anywhere, lands in the status line ──
-window.addEventListener('error', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load · check network (esm.sh CDN) and reload'); });
+window.addEventListener('error', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load · reload the page'); });
 window.addEventListener('unhandledrejection', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + ((e.reason && e.reason.message) || e.reason || 'unknown'); });
 
 // ── EIP-6963 wallet discovery: finds every installed wallet even when extensions fight over window.ethereum ──
@@ -1052,9 +1052,9 @@ if ($('b-withdraw')) $('b-withdraw').onclick = async () => {
       ASPIndex: aspIndex.toString(),
     };
 
-    // 5. groth16 proof with same-origin artifacts, snarkjs from esm.sh (as ept-privacy-pools does)
-    say('loading snarkjs from esm.sh…');
-    const ns = await import('https://esm.sh/snarkjs@0.7.5');
+    // 5. groth16 proof with same-origin artifacts, snarkjs vendored locally (fully offline)
+    say('loading snarkjs (vendored)…');
+    const ns = await import('./vendor/snarkjs.mjs');
     const snarkjs = ns.groth16 ? ns : (ns.default || ns);
     say('proving (groth16, ~10-30s) with local artifacts ./artifacts/withdraw.wasm + withdraw.zkey…');
     const t0 = Date.now();

@@ -1,6 +1,6 @@
 // sw.js · GHOSTPAY service worker: cache-first static shell.
 // Relayer endpoints and all non-GET traffic always go to the network.
-const CACHE = 'ghostpay-v4';
+const CACHE = 'ghostpay-v5';
 const PRECACHE = [
   './',
   './index.html',
@@ -21,6 +21,19 @@ const PRECACHE = [
   './vendor/poseidon2.mjs',
   './vendor/poseidon13.mjs',
   './vendor/tc-pedersen.mjs',
+  './vendor/noble-curves-secp256k1.mjs',
+  './vendor/noble-hashes-sha256.mjs',
+  './vendor/noble-hashes-sha3.mjs',
+  './vendor/ethers.mjs',
+  './vendor/qrcode-generator.mjs',
+  './vendor/latrine-irn.mjs',
+  './vendor/latrine-wc.mjs',
+  './vendor/latrine-jwt.mjs',
+  './vendor/snarkjs.mjs',
+  './vendor/esm-node/process.mjs',
+  './vendor/esm-node/events.mjs',
+  './vendor/esm-node/tty.mjs',
+  './vendor/esm-node/async_hooks.mjs',
 ];
 const NETWORK_ONLY = /^\/(announce|sweep|health|fee|price)$/;
 

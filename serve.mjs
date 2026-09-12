@@ -45,6 +45,12 @@
 // stays on the RPC_URLS rotation), preceded by a random jitter (announce 2-15s, sweep 5-45s)
 // to break timing correlation between the browser request and the onchain broadcast.
 //
+// Abuse protection: per-IP token buckets on the write endpoints (/announce 10/min, /sweep
+// and /pp-withdraw 5/min; 429 with Retry-After, in-memory, reset on restart). With
+// GHOSTPAY_API_TOKEN set, /sweep and /pp-withdraw also require 'authorization: Bearer
+// <token>' (constant-time compare, 401 otherwise); /announce and the GET endpoints stay
+// open. GET /health reports rateLimited/authRequired, never the token itself.
+//
 // Runners: runners.local.json ([{"address","key"},…], random per request, preferring a
 // different runner than the previous one) if present, else RUNNER_PK, else the endpoints
 // return 503. Static serving works without a runner. Errors are clean JSON ({error}),
@@ -52,6 +58,7 @@
 import http from 'http';
 import https from 'https';
 import { createServer } from 'http';
+import { createHash, timingSafeEqual } from 'crypto';
 import { readFile, writeFile, appendFile, stat } from 'fs/promises';
 import { extname, join, normalize, sep } from 'path';
 import { fileURLToPath } from 'url';
@@ -94,6 +101,40 @@ const PP_FEE_BPS = Number.isFinite(parseInt(process.env.PP_FEE_BPS, 10)) ? parse
 const PP_ENTRYPOINT = '0x6818809EefCe719E480a7526D76bD3e561526b46'; // Privacy Pools entrypoint, mainnet
 const PP_SCOPE = 4916574638117198869413701114161172350986437430914933850166949084132905299523n; // mainnet ETH pool scope
 const SNARK_FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+// ── abuse protection: the write endpoints cost the runner gas, so a public relayer needs
+// a brake. Per-IP token buckets (Map keyed by endpoint + IP, refilled lazily, in-memory
+// so they reset on restart: a brake, not a quota). Limited requests get 429 + Retry-After.
+const RATE_LIMITS = { '/announce': 10, '/sweep': 5, '/pp-withdraw': 5 }; // requests per minute per IP
+const rateBuckets = new Map(); // '<path>|<ip>' -> { tokens, last }
+// returns 0 when the request may proceed, else seconds until a token refills (Retry-After)
+function rateLimit(path, ip) {
+  const cap = RATE_LIMITS[path];
+  const now = Date.now();
+  if (rateBuckets.size > 10000) { // bound memory against source-IP sprays
+    for (const [k, v] of rateBuckets) if (now - v.last > 10 * 60 * 1000) rateBuckets.delete(k);
+  }
+  const key = path + '|' + ip;
+  let b = rateBuckets.get(key);
+  if (!b) { b = { tokens: cap, last: now }; rateBuckets.set(key, b); }
+  b.tokens = Math.min(cap, b.tokens + (now - b.last) * cap / 60000);
+  b.last = now;
+  if (b.tokens < 1) return Math.ceil((1 - b.tokens) * 60000 / cap / 1000);
+  b.tokens -= 1;
+  return 0;
+}
+// optional shared-secret auth (GHOSTPAY_API_TOKEN): /sweep and /pp-withdraw require
+// 'authorization: Bearer <token>' when set; /announce and the GET endpoints stay open.
+const API_TOKEN = process.env.GHOSTPAY_API_TOKEN || null;
+function checkApiToken(req) {
+  const header = req.headers.authorization || '';
+  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+  // hash both sides so timingSafeEqual never leaks the length of either string
+  const a = createHash('sha256').update(presented).digest();
+  const b = createHash('sha256').update(API_TOKEN).digest();
+  return timingSafeEqual(a, b);
+}
+if (API_TOKEN) console.log('api auth on: /sweep and /pp-withdraw require Authorization: Bearer <GHOSTPAY_API_TOKEN> (the token itself is never logged)');
 
 // ── runners: runners.local.json (optional pool) or RUNNER_PK (single) ──
 async function loadRunners() {
@@ -206,7 +247,7 @@ async function feeBump() {
   if (maxFee < priority) maxFee = priority;
   return { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority };
 }
-async function estimateGas(from, tx) {
+async function estimateGas(from, tx, label) {
   const call = { from, to: tx.to, data: tx.data || '0x' };
   // geth (post-Pectra) accounts for the delegation when the authorization list is
   // included; nodes that reject the field fall through to the type-4 fixed limit below.
@@ -224,7 +265,9 @@ async function estimateGas(from, tx) {
   } catch (e) {
     // a call with data to a not-yet-delegated EOA estimates at plain-call cost, which
     // would brick a type-4 sweep out of gas; use a fixed limit instead (unused gas is refunded).
-    if (tx.type === 4) return 500000n;
+    // the fallback applies ONLY to the proven v1 eip7702-sweep flow: an intent sweep that
+    // fails estimation is malformed or would revert, and must never burn runner gas onchain.
+    if (tx.type === 4 && label !== 'sweep/7702-intent' && label !== 'sweep/7702-intent-batch') return 500000n;
     throw new Error('gas estimation failed (' + errMsg(e) + ') — the runner is likely unfunded or the tx would revert');
   }
 }
@@ -244,7 +287,7 @@ async function broadcast(runner, tx, jitterRange, label) {
   tx.chainId = CHAIN_ID;
   tx.nonce = await nextNonce(runner);
   Object.assign(tx, await feeBump());
-  if (!tx.gasLimit) tx.gasLimit = await estimateGas(runner.address, tx);
+  if (!tx.gasLimit) tx.gasLimit = await estimateGas(runner.address, tx, label);
   const signed = await runner.signTransaction(tx);
   const delayedSec = Math.round(jitterRange[0] + Math.random() * (jitterRange[1] - jitterRange[0]));
   await new Promise(r => setTimeout(r, delayedSec * 1000));
@@ -261,9 +304,9 @@ const MIME = {
   '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
 };
 
-function sendJson(res, code, obj) {
+function sendJson(res, code, obj, headers = {}) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...headers });
   res.end(body);
 }
 const errMsg = e => (e && (e.shortMessage || e.reason || e.message)) || String(e);
@@ -688,6 +731,15 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (req.method === 'POST' && (url.pathname === '/announce' || url.pathname === '/sweep' || url.pathname === '/pp-withdraw')) {
+      const ip = req.socket.remoteAddress || 'unknown';
+      const retryAfter = rateLimit(url.pathname, ip);
+      if (retryAfter > 0) {
+        console.log(`rate limit: 429 ${url.pathname} ip=${ip} retry-after=${retryAfter}s`);
+        return sendJson(res, 429, { error: `rate limit exceeded: ${url.pathname} allows ${RATE_LIMITS[url.pathname]} requests per minute per IP` }, { 'Retry-After': String(retryAfter) });
+      }
+      if (API_TOKEN && url.pathname !== '/announce' && !checkApiToken(req)) {
+        return sendJson(res, 401, { error: 'unauthorized: this relayer requires Authorization: Bearer <token> on ' + url.pathname });
+      }
       if (url.pathname === '/pp-withdraw' && !PP_RELAY) {
         return sendJson(res, 503, { error: 'pp withdrawal relay is disabled on this server: restart serve.mjs with PP_RELAY=1 to enable POST /pp-withdraw' });
       }
@@ -711,6 +763,7 @@ const server = createServer(async (req, res) => {
           sweeperV2: SWEEPER_V2, batchRelayer: BATCH_RELAYER, minFeeBps: MIN_FEE_BPS,
           ppRelay: PP_RELAY, ...(PP_RELAY ? { ppFeeBps: PP_FEE_BPS } : {}),
           feeOwner: FEE_OWNER,
+          rateLimited: true, ...(API_TOKEN ? { authRequired: true } : {}),
           tor: !!TOR_PROXY, endpoints: RPC_URLS.map(u => new URL(u).hostname),
         });
       }
