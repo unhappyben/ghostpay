@@ -1,0 +1,11 @@
+[profile.default]
+src = "."
+test = "test"
+out = "out"
+libs = ["lib"]
+solc = "0.8.28"
+
+# Fork tests only. Nothing here ever broadcasts: `forge test` runs against a local
+# anvil fork of mainnet via MAINNET_RPC (see test/SweeperV2.t.sol).
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC}"

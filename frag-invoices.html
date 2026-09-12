@@ -1,0 +1,35 @@
+<!-- GHOSTPAY invoice suite fragment.
+     Insert this block inside <div id="gp-invoices"></div> in index.html (step 3),
+     then add <script type="module" src="./gp-invoices.mjs"></script> after the main
+     inline module script. Inline styles only: reuses .status / button.ghost from the core. -->
+<div id="gpinv-root" style="border:1px solid #333;margin-top:16px;padding:16px">
+  <div style="font-size:11px;letter-spacing:.25em;color:#888;margin-bottom:14px">INVOICE SUITE</div>
+
+  <input id="gpinv-amt" placeholder="amount (e.g. 25)" />
+  <select id="gpinv-token"><option>USDC</option><option>ETH</option></select>
+  <input id="gpinv-note" placeholder="note (optional)" />
+  <input id="gpinv-exp" type="number" min="0" placeholder="expires in days (optional: blank = never)" />
+  <button id="gpinv-create" style="margin-top:12px">CREATE TRACKED INVOICE</button>
+  <div class="status" id="gpinv-create-st"></div>
+
+  <div id="gpinv-list"></div>
+
+  <div style="margin-top:18px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="ghost" id="gpinv-recvqr" style="flex:1 1 auto;width:auto;padding:10px 14px;font-size:11px">RECEIVE QR</button>
+    <button class="ghost" id="gpinv-export" style="flex:1 1 auto;width:auto;padding:10px 14px;font-size:11px">EXPORT CSV</button>
+  </div>
+  <div id="gpinv-qrwrap" style="display:none;margin-top:12px;text-align:center">
+    <canvas id="gpinv-qr" style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas>
+    <div class="status" id="gpinv-qr-cap"></div>
+  </div>
+
+  <div style="border-top:1px solid #333;margin-top:18px;padding-top:14px">
+    <div style="font-size:11px;letter-spacing:.25em;color:#888;margin-bottom:10px">PUBLISH TO ENS</div>
+    <div class="status" style="margin-top:0">writes a "stealth" text record on your ENS name so senders can resolve it to your stealth meta-address. the meta-address is public by design: anyone can derive fresh payment addresses from it, nobody can spend from it.</div>
+    <input id="gpinv-ensname" placeholder="yourname.eth" />
+    <input id="gpinv-ensresolver" value="0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63" placeholder="resolver address" />
+    <button class="ghost" id="gpinv-ens" style="margin-top:12px">PUBLISH TO ENS</button>
+    <div class="status" id="gpinv-ens-st"></div>
+    <div class="status">rather click through: <a id="gpinv-enslink" href="https://app.ens.domains" target="_blank" rel="noopener">open app.ens.domains</a> and set the "stealth" text record manually.</div>
+  </div>
+</div>

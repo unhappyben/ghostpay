@@ -3,8 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
 <title>GHOSTPAY</title>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon.svg" type="image/svg+xml">
 <style>
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:#000; color:#fff; font-family:'IBM Plex Mono',monospace; font-size:14px; line-height:1.6; }
@@ -38,18 +40,51 @@
   .ok { color:#fff; }
   a { color:#fff; }
   #payghost { display:none; }
+  /* status strip + returning-user dashboard (ui-core) */
+  #gp-status { border:1px solid #333; padding:8px 12px; font-size:11px; color:#888; margin-bottom:22px;
+    word-break:break-word; }
+  #gp-dash { border:1px solid #fff; padding:16px; margin-bottom:8px; }
+  #gp-dash .dashaddr { font-size:12px; word-break:break-all; }
+  #gp-dash .dashmode { color:#888; font-size:10px; letter-spacing:.2em; }
+  #gp-dash .dashbtns { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  #gp-dash .dashbtns button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  #gp-toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#fff; color:#000;
+    padding:12px 20px; font-size:12px; font-weight:700; letter-spacing:.08em; z-index:99; display:none;
+    max-width:90vw; text-align:center; }
+  /* mobile: full-width steps, 44px touch targets, 16px inputs (stops iOS auto-zoom) */
+  @media (max-width:700px) {
+    .wrap { padding:24px 12px 80px; }
+    .step { padding:16px; width:100%; }
+    button { min-height:44px; }
+    input, select, textarea { font-size:16px; }
+    #gp-dash .dashbtns { flex-direction:column; }
+    #gp-dash .dashbtns button { width:100%; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <div id="gp-status">relayer: checking…</div>
   <div class="logo">GHOST<span>PAY</span></div>
   <div class="sub">RECEIVE-ONLY STEALTH · ERC-5564 · KEYS DERIVED FROM YOUR WALLET SIGNATURE · v1.3</div>
   <div class="sub" id="bootline" style="color:#fff">booting…</div>
 
+  <!-- returning-user dashboard: replaces steps 1-2 when a gp-session exists on this device -->
+  <div id="gp-dash" style="display:none">
+    <div class="dashmode" id="gp-dash-mode">WATCH-ONLY SESSION</div>
+    <div class="dashaddr" id="gp-dash-addr"></div>
+    <div class="status" style="margin-top:6px">steps 1-2 are collapsed: your keys are restored from this device's stored session. sweeping still needs a fresh wallet signature (RE-CONNECT, then GENERATE).</div>
+    <div class="dashbtns">
+      <button id="b-reconnect">RE-CONNECT</button>
+      <button class="ghost" id="b-notify">ENABLE NOTIFICATIONS</button>
+      <button class="ghost" id="b-forget">FORGET THIS DEVICE</button>
+    </div>
+  </div>
+
   <!-- 1 -->
   <div class="step on" id="s1">
     <h2>1 · CONNECT WALLET</h2>
-    <button id="b-connect">CONNECT — WALLETCONNECT VIA LATRINE</button>
+    <button id="b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
     <div class="status" id="st-connect"></div>
     <div id="qrwrap" style="display:none;margin-top:16px;text-align:center">
       <canvas id="qr" style="background:#fff;padding:14px;image-rendering:pixelated"></canvas>
@@ -58,7 +93,7 @@
       <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="wc-raw" style="word-break:break-all;color:#fff"></span></div>
     </div>
     <button class="ghost" id="b-injected" style="display:none">USE INJECTED WALLET INSTEAD</button>
-    <div class="status" style="margin-top:10px"><a href="#" id="b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> — used automatically when no wallet extension is present.</div>
+    <div class="status" style="margin-top:10px"><a href="#" id="b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
     <input id="i-wcpid" type="hidden" value="c6c9bacd35afa3eb9e6cccf6d8464395">
   </div>
 
@@ -66,9 +101,13 @@
   <div class="step" id="s2">
     <h2>2 · GENERATE ADDRESS</h2>
     <button id="b-gen" disabled>GENERATE MY STEALTH KEYS</button>
-    <div class="status" id="st-gen">sign one message — your keys are derived from the signature. same wallet, same signature, same keys. nothing to back up.</div>
+    <div class="status" id="st-gen">sign one message · your keys are derived from the signature. same wallet, same signature, same keys. nothing to back up.</div>
+    <div id="remember-row" style="display:none;margin-top:14px">
+      <label style="display:block;font-size:12px;color:#fff;cursor:pointer"><input type="checkbox" id="i-remember" style="width:auto;margin-right:6px">remember this device (watch-only)</label>
+      <div class="status" style="color:#666;margin-top:4px">warning: watch-only persistence reveals your payment history to anyone with access to this browser profile. the spend key is NEVER stored: sweeping always requires a fresh wallet signature.</div>
+    </div>
     <div class="card" id="c-recv" style="display:none">
-      <div class="lbl">YOUR ONE-TIME RECEIVING ADDRESS — SHARE THIS TO GET PAID</div>
+      <div class="lbl">YOUR ONE-TIME RECEIVING ADDRESS · SHARE THIS TO GET PAID</div>
       <b id="v-recv"></b>
       <button id="b-copyrecv">COPY ADDRESS</button>
       <button id="b-annrecv" class="ghost" style="background:#000;color:#fff;border:0">ANNOUNCE IT</button>
@@ -97,6 +136,39 @@
       <b id="v-invoice"></b>
       <button id="b-copyinv">COPY INVOICE</button>
     </div>
+    <div id="gp-invoices">
+<div id="gpinv-root" style="border:1px solid #333;margin-top:16px;padding:16px">
+  <div style="font-size:11px;letter-spacing:.25em;color:#888;margin-bottom:14px">INVOICE SUITE</div>
+
+  <input id="gpinv-amt" placeholder="amount (e.g. 25)" />
+  <select id="gpinv-token"><option>USDC</option><option>ETH</option></select>
+  <input id="gpinv-note" placeholder="note (optional)" />
+  <input id="gpinv-exp" type="number" min="0" placeholder="expires in days (optional: blank = never)" />
+  <button id="gpinv-create" style="margin-top:12px">CREATE TRACKED INVOICE</button>
+  <div class="status" id="gpinv-create-st"></div>
+
+  <div id="gpinv-list"></div>
+
+  <div style="margin-top:18px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="ghost" id="gpinv-recvqr" style="flex:1 1 auto;width:auto;padding:10px 14px;font-size:11px">RECEIVE QR</button>
+    <button class="ghost" id="gpinv-export" style="flex:1 1 auto;width:auto;padding:10px 14px;font-size:11px">EXPORT CSV</button>
+  </div>
+  <div id="gpinv-qrwrap" style="display:none;margin-top:12px;text-align:center">
+    <canvas id="gpinv-qr" style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas>
+    <div class="status" id="gpinv-qr-cap"></div>
+  </div>
+
+  <div style="border-top:1px solid #333;margin-top:18px;padding-top:14px">
+    <div style="font-size:11px;letter-spacing:.25em;color:#888;margin-bottom:10px">PUBLISH TO ENS</div>
+    <div class="status" style="margin-top:0">writes a "stealth" text record on your ENS name so senders can resolve it to your stealth meta-address. the meta-address is public by design: anyone can derive fresh payment addresses from it, nobody can spend from it.</div>
+    <input id="gpinv-ensname" placeholder="yourname.eth" />
+    <input id="gpinv-ensresolver" value="0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63" placeholder="resolver address" />
+    <button class="ghost" id="gpinv-ens" style="margin-top:12px">PUBLISH TO ENS</button>
+    <div class="status" id="gpinv-ens-st"></div>
+    <div class="status">rather click through: <a id="gpinv-enslink" href="https://app.ens.domains" target="_blank" rel="noopener">open app.ens.domains</a> and set the "stealth" text record manually.</div>
+  </div>
+</div>
+    </div>
   </div>
 
   <!-- 4 -->
@@ -104,12 +176,12 @@
     <h2>4 · SWEEP</h2>
     <div class="status" id="st-scan">connect + generate first.</div>
     <button class="ghost" id="b-rescan" style="margin-bottom:10px">RESCAN</button>
-    <input id="i-fromblock" type="number" min="0" placeholder="from block (optional — default: latest − 50000)">
-    <label style="display:block;margin:6px 0;font-size:12px;color:#888"><input type="checkbox" id="i-legacy" style="width:auto;margin-right:6px">legacy scheme (sha256) — needed to find + sweep announcements made before 2026-09-08</label>
+    <input id="i-fromblock" type="number" min="0" placeholder="from block (optional · default: latest − 50000)">
+    <label style="display:block;margin:6px 0;font-size:12px;color:#888"><input type="checkbox" id="i-legacy" style="width:auto;margin-right:6px">legacy scheme (sha256) · needed to find + sweep announcements made before 2026-09-08</label>
     <div id="payments"></div>
     <div id="sweeper-ui" style="display:none">
       <div class="status" id="st-armed" style="color:#fff"></div>
-      <div class="status" style="margin-top:4px">door: PRIVACY POOLS — any amount (the only door now)</div>
+      <div class="status" style="margin-top:4px">door: PRIVACY POOLS · any amount (the only door now)</div>
       <button id="b-sweep" style="margin-top:8px">SIGN SWEEP</button>
       <div class="card" id="c-secret" style="display:none;border:4px solid #000">
         <div class="lbl" id="v-secret-lbl">WITHDRAWAL SECRET</div>
@@ -123,6 +195,8 @@
         <div class="status" id="st-broadcast" style="color:#444"></div>
       </div>
     </div>
+    <div id="gp-sweep"></div>
+    <div id="gp-inbox"></div>
   </div>
 
   <!-- 5 -->
@@ -132,9 +206,10 @@
     <input type="file" id="i-secretfile" accept=".json,application/json">
     <textarea id="i-secretjson" rows="5" placeholder="…or paste the pp-secret JSON here"></textarea>
     <input id="i-recipient" placeholder="recipient address (0x…)">
-    <input id="i-wamount" placeholder="amount in ETH (optional — default: full balance)">
+    <input id="i-wamount" placeholder="amount in ETH (optional · default: full balance)">
     <button id="b-withdraw" style="margin-top:8px">WITHDRAW</button>
     <div class="status" id="st-withdraw"></div>
+    <div id="gp-withdraw"></div>
   </div>
 
   <!-- pay-a-ghost mode (opened via someone's link) -->
@@ -150,6 +225,7 @@
     </div>
   </div>
 </div>
+<div id="gp-toast"></div>
 
 <script src="./config.local.js" onerror="this.remove()"></script>
 <script type="module">
@@ -222,6 +298,52 @@ const SWEEPER_IFACE = new ethers.Interface([
 const copy = (txt, btn) => { navigator.clipboard.writeText(txt); btn.textContent = 'COPIED ✓'; setTimeout(()=>btn.textContent=btn.dataset.t, 1200); };
 document.querySelectorAll('button').forEach(b => b.dataset.t = b.textContent);
 
+// ── ui-core: event hub, toast, session persistence ──
+// GP.on/GP.emit are the module bus (see docs/GP-API.md). Events: "payment", "swept", "session".
+const GP_EVENTS = {};
+const gpOn = (ev, cb) => { (GP_EVENTS[ev] ??= []).push(cb); };
+const gpEmit = (ev, data) => { (GP_EVENTS[ev] || []).forEach(cb => { try { cb(data); } catch (e) { console.error('GP listener failed (' + ev + '):', e); } }); };
+let toastTimer = null;
+function toast(msg) {
+  const t = $('gp-toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, 4000);
+}
+// gp-session: ONLY the viewing key + stealth meta-address (watch-only). The spend key is
+// never stored, so sweeping always needs a fresh wallet signature.
+const SESSION_KEY = 'gp-session';
+const loadGpSession = () => { try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch { return null; } };
+function saveGpSession() {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ v: 1, viewPriv: W.viewPriv, meta: W.meta, ts: Date.now() }));
+  } catch { /* storage blocked/full: persistence is best-effort, the session still works */ }
+}
+// wizard collapse/expand: a stored session hides steps 1-2 into the #gp-dash header.
+// the receive card (c-recv) and meta details (d-meta) inside s2 stay visible either way.
+function collapseWizard() {
+  $('s1').style.display = 'none';
+  $('s2').querySelector('h2').style.display = 'none';
+  $('b-gen').style.display = 'none';
+  $('st-gen').style.display = 'none';
+  $('remember-row').style.display = 'none';
+  $('s2').classList.add('on');
+}
+function expandWizard() {
+  $('s1').style.display = 'block';
+  $('s2').querySelector('h2').style.display = '';
+  $('b-gen').style.display = '';
+  $('st-gen').style.display = '';
+}
+function refreshDash() {
+  const sess = loadGpSession();
+  if (!sess || !W || !W.viewPriv) { $('gp-dash').style.display = 'none'; return; }
+  $('gp-dash').style.display = 'block';
+  $('gp-dash-addr').textContent = W.account ? 'wallet: ' + W.account : 'meta: ' + (W.meta || sess.meta);
+  $('gp-dash-mode').textContent = W.spendPriv ? 'FULL SESSION · SWEEP ENABLED' : 'WATCH-ONLY SESSION';
+}
+
 // withdrawal-secret download: auto-saves once, button re-saves. The secret is generated and
 // displayed BEFORE the signed artifact is shown, so a sweep can never exist without its secret.
 function download(filename, text) {
@@ -240,7 +362,7 @@ function showSecret(label, display, filename, fileText) {
 }
 
 // ── loud failure mode: any error, anywhere, lands in the status line ──
-window.addEventListener('error', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load — check network (esm.sh CDN) and reload'); });
+window.addEventListener('error', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load · check network (esm.sh CDN) and reload'); });
 window.addEventListener('unhandledrejection', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + ((e.reason && e.reason.message) || e.reason || 'unknown'); });
 
 // ── EIP-6963 wallet discovery: finds every installed wallet even when extensions fight over window.ethereum ──
@@ -255,7 +377,7 @@ setTimeout(() => {
   if (!boot) return;
   if (names.length) boot.textContent = 'wallets detected: ' + names.join(' · ');
   else if (window.ethereum) boot.textContent = 'wallets detected: an injected provider (unnamed)';
-  else boot.textContent = 'no injected wallet detected — CONNECT will use WalletConnect (latrine): QR / link / paste.';
+  else boot.textContent = 'no injected wallet detected · CONNECT will use WalletConnect (latrine): QR / link / paste.';
 }, 400);
 
 async function connectInjected() {
@@ -267,7 +389,7 @@ async function connectInjected() {
   } else if (window.ethereum) {
     provider = window.ethereum;
   }
-  if (!provider) { $('st-connect').textContent = 'no injected wallet found — use the WalletConnect path below.'; return; }
+  if (!provider) { $('st-connect').textContent = 'no injected wallet found · use the WalletConnect path below.'; return; }
   const prov = new ethers.BrowserProvider(provider);
   const accounts = await prov.send('eth_requestAccounts', []);
   W = { account: accounts[0], prov, eip1193: provider };
@@ -303,7 +425,7 @@ async function connectLatrine() {
   showQr(url);
   $('wc-link').href = url;
   $('wc-raw').textContent = url;
-  st('pairing ready — open your wallet and approve. (on mobile your wallet opens by itself)');
+  st('pairing ready · open your wallet and approve. (on mobile your wallet opens by itself)');
   // mobile: auto-open wallet app via the wc: uri (WalletConnect-recommended); desktop: user clicks OPEN WALLET
   if (/Android|iPhone|iPad/i.test(navigator.userAgent)) window.location.href = url;
   // relay handshake in the background, with real error surfacing (IrnClient.open can't do this)
@@ -314,9 +436,9 @@ async function connectLatrine() {
       socket.addEventListener('error', () => rej(new Error('relay rejected the connection')));
       socket.addEventListener('close', e => rej(new Error('relay closed the handshake (' + e.code + ')')));
     }),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('relay handshake timed out — try again')), 25000))
+    new Promise((_, rej) => setTimeout(() => rej(new Error('relay handshake timed out · try again')), 25000))
   ]);
-  st('relay connected — waiting for wallet approval…');
+  st('relay connected · waiting for wallet approval…');
   const upgraded = new Promise((res, rej) => {
     pairing.addEventListener('upgrade', e => res(e.data));
     pairing.addEventListener('close', () => rej(new Error('pairing closed')));
@@ -388,30 +510,53 @@ $('b-gen').onclick = async () => {
   W.recv = derive(W.meta.slice(7));
   $('c-recv').style.display = 'block';
   $('v-recv').textContent = W.recv.stealth;
-  $('st-announce').textContent = 'share this 0x address to get paid. hit ANNOUNCE IT once — the announcement is what lets your scanner find the payment.';
+  $('st-announce').textContent = 'share this 0x address to get paid. hit ANNOUNCE IT once · the announcement is what lets your scanner find the payment.';
   $('d-meta').style.display = 'block';
   $('v-meta').textContent = W.meta;
   $('st-gen').textContent = 'done. your keys regenerate from the same signature any time, any device.';
   $('b-invoice').disabled = false;
   $('s3').classList.add('on'); $('s4').classList.add('on');
+  // watch-only persistence offer: storing the viewing key + meta-address only, never the spend key
+  $('remember-row').style.display = 'block';
+  $('i-remember').checked = !!loadGpSession();
+  if ($('i-remember').checked) { saveGpSession(); collapseWizard(); }
+  refreshDash();
+  gpEmit('session', { type: 'unlocked', watchOnly: false, address: W.account || null });
   scan();
+};
+$('i-remember').onchange = e => {
+  if (e.target.checked) {
+    if (W && W.viewPriv && W.meta) {
+      saveGpSession();
+      collapseWizard();
+      toast('session saved on this device (watch-only)');
+      gpEmit('session', { type: 'saved', watchOnly: !W.spendPriv, address: W.account || null });
+    }
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+    expandWizard();
+    toast('session removed from this device');
+    gpEmit('session', { type: 'forgotten' });
+  }
+  refreshDash();
 };
 $('b-copyrecv').onclick = e => copy(W.recv.stealth, e.target);
 $('b-copymeta').onclick = e => copy(W.meta, e.target);
 $('b-copylink').onclick = e => copy(location.origin + location.pathname + '#' + W.meta, e.target);
-$('b-annrecv').onclick = async () => {
+async function announceRecv() {
   const st = m => $('st-announce').textContent = m;
+  if (!W || !W.recv) { st('generate your stealth keys first (or restore a session).'); return null; }
   const { stealth, ephPub, viewTag } = W.recv;
   // primary path: the local relayer announces (runner wallet pays gas).
   try {
-    st('announcing via relayer… (deliberate 2–15s privacy delay before broadcast — hold on)');
+    st('announcing via relayer… (deliberate 2–15s privacy delay before broadcast · hold on)');
     const r = await fetch('/announce', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stealth, ephPub, viewTag }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
-    st('announced: ' + j.hash + ' — your scanner will now find payments to this address. share it and get paid.');
-    return;
+    st('announced: ' + j.hash + ' · your scanner will now find payments to this address. share it and get paid.');
+    return { hash: j.hash, via: 'relayer' };
   } catch (e) {
-    st('relayer unreachable (' + e.message + ') — falling back to announcing from your wallet…');
+    st('relayer unreachable (' + e.message + ') · falling back to announcing from your wallet…');
   }
   // fallback: wallet-self-announce (same contract call pattern as pay-a-ghost mode).
   try {
@@ -420,16 +565,19 @@ $('b-annrecv').onclick = async () => {
     const signer = await new ethers.BrowserProvider(eip1193).getSigner();
     const ann = new ethers.Contract(ANNOUNCER, ['function announce(uint256,address,bytes,bytes)'], signer);
     const tx = await ann.announce(1, stealth, ephPub, Uint8Array.from([viewTag]));
-    st('announced from your wallet: ' + tx.hash + ' — your scanner will now find payments to this address.');
+    st('announced from your wallet: ' + tx.hash + ' · your scanner will now find payments to this address.');
+    return { hash: tx.hash, via: 'wallet' };
   } catch (e) {
-    st('announce failed: ' + (e.shortMessage || e.message) + ' — retry. without an announcement your scanner cannot find payments to this address.');
+    st('announce failed: ' + (e.shortMessage || e.message) + ' · retry. without an announcement your scanner cannot find payments to this address.');
+    return null;
   }
-};
+}
+$('b-annrecv').onclick = announceRecv;
 
 // ── 3 · invoice ──
 $('b-invoice').onclick = () => {
   const amt = $('i-amt').value.trim(), tok = $('i-token').value, note = $('i-note').value.trim();
-  const url = location.origin + location.pathname + '#' + W.meta + (amt ? '?pay=' + encodeURIComponent(amt + ' ' + tok + (note ? ' — ' + note : '')) : '');
+  const url = location.origin + location.pathname + '#' + W.meta + (amt ? '?pay=' + encodeURIComponent(amt + ' ' + tok + (note ? ' · ' + note : '')) : '');
   $('c-invoice').style.display = 'block';
   $('v-invoice').textContent = url;
 };
@@ -452,6 +600,9 @@ async function jrpc(method, params) {
   throw lastErr;
 }
 let scanSeq = 0;
+let scanBusy = false;
+const payments = [];      // GP.state.payments: one record per rendered payment card
+const seenPays = new Set(); // dedupe tx:addr across incremental scans; cleared on full scans
 // per-card lifecycle state, best-effort and async: balance → swept → PP deposit →
 // ASP → withdrawn. Any RPC/ASP failure leaves the balance-only state; the mySeq
 // guard stops a superseded scan from writing into freshly rendered cards.
@@ -513,15 +664,22 @@ async function cardState(div, btn, addr, payBlock, mySeq, getAsp) {
     } catch { /* no tracking record or RPC failed: skip */ }
   } catch { /* balance check failed: leave the card enabled, no state line */ }
 }
-async function scan() {
+// scan(opts): full rescan by default (wipes + re-renders #payments). {append:true} keeps the
+// existing cards and only appends newly discovered payments (the 60s background poll uses
+// this, resuming from the stored cursor). {quiet:true} leaves the status line alone unless
+// something new was found or the scan failed. {from:N} overrides the from-block.
+async function scan(opts = {}) {
+  const append = !!opts.append, quiet = !!opts.quiet;
+  if (scanBusy && append) return payments; // a scan is in flight: skip this background tick
+  scanBusy = true;
   const mySeq = ++scanSeq;
-  $('st-scan').textContent = 'scanning announcements…';
-  $('payments').innerHTML = '';
+  if (!append) { $('payments').innerHTML = ''; seenPays.clear(); payments.length = 0; }
+  if (!quiet) $('st-scan').textContent = 'scanning announcements…';
   try {
     const topic0 = ethers.id('Announcement(uint256,address,address,bytes,bytes)');
     const t1 = ethers.zeroPadValue('0x01', 32);
     const latest = parseInt(await jrpc('eth_blockNumber', []), 16);
-    const ov = parseInt($('i-fromblock').value, 10);
+    const ov = Number.isFinite(opts.from) ? opts.from : parseInt($('i-fromblock').value, 10);
     // scan cursor: after a clean scan we remember `latest` per wallet and resume from there.
     // an explicit from-block in the input always wins; clearing localStorage forces a full rescan.
     const cursorKey = 'ghostpay:lastScanned:' + (W.viewPub || W.account || '');
@@ -538,7 +696,7 @@ async function scan() {
         try {
           const res = await jrpc('eth_getLogs', [{ address: ANNOUNCER, topics: [topic0, t1], fromBlock: '0x' + f.toString(16), toBlock: '0x' + t.toString(16) }]);
           logs.push(...res); done++;
-          $('st-scan').textContent = 'scanning blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ' · ' + logs.length + ' announcements found so far…';
+          if (!quiet) $('st-scan').textContent = 'scanning blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ' · ' + logs.length + ' announcements found so far…';
         } catch (e) {
           if (t - f + 1 > 10000) { for (let g = f; g <= t; g += 10000) ranges.push([g, Math.min(g + 9999, t), 0]); }
           else if (r[2] < 3) { r[2]++; ranges.push(r); await new Promise(x => setTimeout(x, 600)); }
@@ -547,8 +705,8 @@ async function scan() {
       }
     }
     await Promise.all(Array.from({ length: 6 }, worker));
-    if (mySeq !== scanSeq) return;
-    $('st-scan').textContent = logs.length + ' announcements. filtering…';
+    if (mySeq !== scanSeq) return payments;
+    if (!quiet) $('st-scan').textContent = logs.length + ' announcements. filtering…';
     // ASP snapshot: fetched at most once per scan (live SCOPE() call + mt-leaves),
     // shared by every card that finds a PP deposit.
     let aspPromise = null;
@@ -566,6 +724,9 @@ async function scan() {
       const r = check(W.viewPriv, W.spendPub, ephPub, addr);
       if (metadata.length >= 3 && parseInt(metadata.slice(2,4),16) !== r.viewTag) continue;
       if (!r.match) continue;
+      const dedupeKey = l.transactionHash + ':' + addr.toLowerCase();
+      if (seenPays.has(dedupeKey)) continue;
+      seenPays.add(dedupeKey);
       found++;
       const div = document.createElement('div');
       div.className = 'pay';
@@ -575,16 +736,23 @@ async function scan() {
       b.onclick = () => sweepUI(addr, ephPub, div);
       div.appendChild(b);
       $('payments').appendChild(div);
+      const rec = { address: addr, ephPub, block: parseInt(l.blockNumber, 16), tx: l.transactionHash, swept: false, fresh: append };
+      payments.push(rec);
+      gpEmit('payment', rec);
       // lifecycle state line: LIVE / SWEPT / PP deposit / ASP / WITHDRAWN (async, best-effort)
       cardState(div, b, addr, parseInt(l.blockNumber, 16), mySeq, getAsp);
     }
     // advance the cursor only on a fully clean scan, so unreachable ranges are never skipped for good
     if (!failed) localStorage.setItem(cursorKey, String(latest));
-    $('st-scan').textContent = (found ? found + ' payment(s) found. sweep when ready.' : 'nothing yet. share your address, get paid, come back.')
-      + ' (blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ')'
-      + (failed ? ' (' + failed + ' block range(s) unreachable — rescan to retry)' : '')
-      + (failed ? '' : ' · cursor saved — next scan resumes from block ' + latest.toLocaleString() + '. type a from-block above to rescan earlier.');
-  } catch (e) { $('st-scan').textContent = 'scan failed: ' + e.message; }
+    if (!quiet || found) {
+      $('st-scan').textContent = (found ? found + (append ? ' new ' : ' ') + 'payment(s) found. sweep when ready.' : 'nothing yet. share your address, get paid, come back.')
+        + ' (blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ')'
+        + (failed ? ' (' + failed + ' block range(s) unreachable · rescan to retry)' : '')
+        + (failed ? '' : ' · cursor saved · next scan resumes from block ' + latest.toLocaleString() + '. type a from-block above to rescan earlier.');
+    }
+    return payments;
+  } catch (e) { $('st-scan').textContent = 'scan failed: ' + e.message; return payments; }
+  finally { scanBusy = false; }
 }
 
 $('b-rescan').onclick = () => { if (W && W.viewPriv) scan(); };
@@ -592,34 +760,37 @@ $('i-legacy').onchange = e => { LEGACY = e.target.checked; if (W && W.viewPriv) 
 
 // broadcast a signed artifact via the local relayer (serve.mjs POST /sweep). The runner wallet
 // pays gas; the stealth EOA stays unfunded. MetaMask strips authorizationList from type-4 txs,
-// so in-page wallet broadcast is dead — the relayer is the only broadcast path.
+// so in-page wallet broadcast is dead · the relayer is the only broadcast path.
 async function relaySweep(artifact) {
   const st = m => $('st-broadcast').textContent = m;
   // hash-bearing lines get a clickable etherscan link; the regex guard keeps innerHTML safe
   const txLink = h => /^0x[0-9a-fA-F]{64}$/.test(h) ? ' · <a href="https://etherscan.io/tx/' + h + '" target="_blank" rel="noopener">etherscan</a>' : '';
   const stHtml = m => $('st-broadcast').innerHTML = m;
   try {
-    st('sending to relayer… (deliberate 5–45s privacy delay before broadcast — hold on)');
+    st('sending to relayer… (deliberate 5–45s privacy delay before broadcast · hold on)');
     const r = await fetch('/sweep', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(artifact) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
-    stHtml('pending: ' + j.hash + txLink(j.hash) + ' — waiting for confirmation…');
+    stHtml('pending: ' + j.hash + txLink(j.hash) + ' · waiting for confirmation…');
     for (let i = 0; i < 120; i++) {
       await new Promise(x => setTimeout(x, 5000));
       const rcpt = await jrpc('eth_getTransactionReceipt', [j.hash]);
       if (rcpt) {
         if (rcpt.status === '0x1') {
           stHtml('CONFIRMED in block ' + parseInt(rcpt.blockNumber, 16) + ' · ' + j.hash + txLink(j.hash)
-            + (artifact.precommitment ? ' · PP deposit sent — withdrawal after ASP review, using your downloaded secret file.' : ''));
+            + (artifact.precommitment ? ' · PP deposit sent · withdrawal after ASP review, using your downloaded secret file.' : ''));
+          const rec = payments.find(p => p.address.toLowerCase() === String(artifact.stealthAddress || '').toLowerCase());
+          if (rec) rec.swept = true;
+          gpEmit('swept', { hash: j.hash, block: parseInt(rcpt.blockNumber, 16), artifact, payment: rec || null });
         } else {
-          stHtml('tx REVERTED onchain · ' + j.hash + txLink(j.hash) + ' — copy the artifact and retry via relay.mjs if the failure was transient.');
+          stHtml('tx REVERTED onchain · ' + j.hash + txLink(j.hash) + ' · copy the artifact and retry via relay.mjs if the failure was transient.');
         }
         return;
       }
     }
-    stHtml('still pending after 10 minutes · ' + j.hash + txLink(j.hash) + ' — check a block explorer.');
+    stHtml('still pending after 10 minutes · ' + j.hash + txLink(j.hash) + ' · check a block explorer.');
   } catch (e) {
-    st('relayer broadcast failed: ' + e.message + ' — artifact is still valid, COPY ARTIFACT and use relay.mjs.');
+    st('relayer broadcast failed: ' + e.message + ' · artifact is still valid, COPY ARTIFACT and use relay.mjs.');
   }
 }
 
@@ -634,6 +805,7 @@ function sweepUI(addr, ephPub, card) {
   $('b-sweep').onclick = async () => {
     try {
       $('c-secret').style.display = 'none';
+      if (!W.spendPriv) throw new Error('watch-only session: your spend key is never stored on this device, so sweeping needs a fresh wallet signature. hit RE-CONNECT above, connect, GENERATE MY STEALTH KEYS (same wallet, same keys), then retry.');
       const { sh } = check(W.viewPriv, W.spendPub, ephPub, addr);
       const sPriv = stealthKey(W.spendPriv, sh);
       const wallet = new ethers.Wallet(sPriv);
@@ -670,7 +842,7 @@ function sweepUI(addr, ephPub, card) {
       } catch { /* storage blocked/full: tracking is best-effort, the sweep is unaffected */ }
       showSecret(
         'PRIVACY POOLS WITHDRAWAL SECRET · KEEP this file: it is your withdrawal secret. lose it and the deposit is gone forever.'
-          + ' the app keeps a local tracking key (nullifier only — it cannot withdraw) so the scanner can show this deposit\'s state.',
+          + ' the app keeps a local tracking key (nullifier only · it cannot withdraw) so the scanner can show this deposit\'s state.',
         JSON.stringify(secretFile, null, 2),
         'pp-secret-' + addr.slice(2, 10) + '.json',
         JSON.stringify(secretFile, null, 2)
@@ -692,7 +864,7 @@ function sweepUI(addr, ephPub, card) {
   };
 }
 
-// ── 5 · withdraw from Privacy Pools (in-browser port of pp-withdraw.mjs — same flow,
+// ── 5 · withdraw from Privacy Pools (in-browser port of pp-withdraw.mjs · same flow,
 // same constructions, no wallet needed: the relayer pays gas) ──
 const PP_POOL = '0xf241d57c6debae225c0f2e6ea1529373c9a9c9fb'; // ETH mainnet Privacy Pools pool
 const PP_ENTRYPOINT = '0x6818809EefCe719E480a7526D76bD3e561526b46';
@@ -764,7 +936,7 @@ async function ppFindDeposit(precommitmentHash, timestamp, say) {
     }
     say('locating deposit… scanned blocks ' + start.toLocaleString() + '–' + end.toLocaleString() + ' (' + logs.length + ' Deposited events), no match yet');
   }
-  throw new Error('no matching deposit found in blocks ' + windowStart.toLocaleString() + '–' + windowEnd.toLocaleString() + ' — the sweep may not have confirmed yet, or the secret file is for a different deposit.');
+  throw new Error('no matching deposit found in blocks ' + windowStart.toLocaleString() + '–' + windowEnd.toLocaleString() + ' · the sweep may not have confirmed yet, or the secret file is for a different deposit.');
 }
 
 $('i-secretfile').onchange = async e => {
@@ -784,7 +956,7 @@ $('b-withdraw').onclick = async () => {
   try {
     let note;
     try { note = JSON.parse($('i-secretjson').value); }
-    catch { throw new Error('no valid secret JSON — pick the pp-secret file or paste its contents above'); }
+    catch { throw new Error('no valid secret JSON · pick the pp-secret file or paste its contents above'); }
     if (!note.nullifier || !note.secret || !note.precommitment)
       throw new Error('secret file must contain nullifier, secret and precommitment.');
     const recipient = $('i-recipient').value.trim();
@@ -794,7 +966,7 @@ $('b-withdraw').onclick = async () => {
     const secret = BigInt(note.secret);
     const precomFile = BigInt(note.precommitment);
     if (poseidon2([nullifier, secret]) !== precomFile)
-      throw new Error("precommitment mismatch: poseidon2(nullifier, secret) does not equal the file's precommitment. the secret file is corrupt or mistyped — refusing to continue.");
+      throw new Error("precommitment mismatch: poseidon2(nullifier, secret) does not equal the file's precommitment. the secret file is corrupt or mistyped · refusing to continue.");
     say('secret file OK: precommitment matches poseidon2(nullifier, secret).');
 
     // 1. locate the deposit onchain
@@ -816,7 +988,7 @@ $('b-withdraw').onclick = async () => {
     const aspLeaves = aspRaw.map(BigInt), stateLeaves = stateRaw.map(BigInt);
     say('ASP snapshot: ' + aspLeaves.length + ' asp leaves, ' + stateLeaves.length + ' state leaves.');
     const aspIndex = aspLeaves.indexOf(dep.label);
-    if (aspIndex < 0) throw new Error('deposit label is not in the approved ASP set yet (still screening, or rejected). cannot withdraw via ASP — retry later.');
+    if (aspIndex < 0) throw new Error('deposit label is not in the approved ASP set yet (still screening, or rejected). cannot withdraw via ASP · retry later.');
     const stateIndex = stateLeaves.indexOf(dep.commitment);
     if (stateIndex < 0) throw new Error('deposit commitment not in the state-tree snapshot yet. retry shortly.');
     say('membership confirmed: ASP index ' + aspIndex + ', state index ' + stateIndex + '.');
@@ -834,18 +1006,32 @@ $('b-withdraw').onclick = async () => {
     const changeValue = dep.value - withdrawnValue;
     say('amount: withdrawing ' + ethers.formatEther(withdrawnValue) + ' ETH' + (changeValue > 0n ? ' (change ' + ethers.formatEther(changeValue) + ' ETH stays in the pool).' : ' (full balance, no change).'));
 
-    // 3. relayer fee commitment
-    say('getting relayer quote…');
-    const quoteRes = await fetch(PP_RELAYER + '/quote', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chainId: CHAIN_ID, amount: withdrawnValue.toString(), asset: PP_ETH_ASSET, recipient: recipientCk, extraGas: false })
-    });
-    if (!quoteRes.ok) throw new Error('relayer quote failed (' + quoteRes.status + '): ' + (await quoteRes.text().catch(() => '')).slice(0, 300));
-    const quote = await quoteRes.json();
-    const feeCommitment = quote.feeCommitment ?? quote;
-    const withdrawalData = feeCommitment.withdrawalData;
-    if (!withdrawalData) throw new Error('relayer did not return withdrawalData in the fee commitment.');
-    say('relayer quote received.');
+    // 3. relayer fee terms: prefer the local self-hosted relay (serve.mjs with PP_RELAY=1,
+    // advertised via GET ./health). Otherwise the fastrelay.xyz path is exactly as before.
+    let withdrawalData, feeCommitment = null, localRelay = false;
+    let health = null;
+    try {
+      const hr = await fetch('./health');
+      if (hr.ok) health = await hr.json();
+    } catch { /* no same-origin relayer reachable: fall back to the public relayer below */ }
+    if (health && health.ppRelay === true && Array.isArray(health.runners) && health.runners.length && Number.isFinite(health.ppFeeBps)) {
+      localRelay = true;
+      withdrawalData = ethers.AbiCoder.defaultAbiCoder().encode(['address', 'address', 'uint256'], [recipientCk, health.runners[0], health.ppFeeBps]);
+      say('relay: local self-hosted relayer (./pp-withdraw), fee ' + health.ppFeeBps + ' bps.');
+    } else {
+      say('relay: fastrelay.xyz public relayer, fee per quote.');
+      say('getting relayer quote…');
+      const quoteRes = await fetch(PP_RELAYER + '/quote', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chainId: CHAIN_ID, amount: withdrawnValue.toString(), asset: PP_ETH_ASSET, recipient: recipientCk, extraGas: false })
+      });
+      if (!quoteRes.ok) throw new Error('relayer quote failed (' + quoteRes.status + '): ' + (await quoteRes.text().catch(() => '')).slice(0, 300));
+      const quote = await quoteRes.json();
+      feeCommitment = quote.feeCommitment ?? quote;
+      withdrawalData = feeCommitment.withdrawalData;
+      if (!withdrawalData) throw new Error('relayer did not return withdrawalData in the fee commitment.');
+      say('relayer quote received.');
+    }
 
     // 4. circuit inputs (existingValue = NET onchain value)
     const { newNullifier, newSecret } = deriveChangeKeys(nullifier, secret);
@@ -887,15 +1073,16 @@ $('b-withdraw').onclick = async () => {
       withdrawal: { processooor: PP_ENTRYPOINT, data: withdrawalData },
       proof: { pi_a: proof.pi_a, pi_b: proof.pi_b, pi_c: proof.pi_c, protocol: proof.protocol, curve: proof.curve },
       publicSignals,
-      feeCommitment,
+      ...(localRelay ? {} : { feeCommitment }),
     };
-    say('submitting to relayer…');
-    const relayRes = await fetch(PP_RELAYER + '/request', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+    const relayUrl = localRelay ? './pp-withdraw' : PP_RELAYER + '/request';
+    say('submitting to ' + (localRelay ? 'local relayer ./pp-withdraw…' : 'fastrelay.xyz…'));
+    const relayRes = await fetch(relayUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     if (!relayRes.ok) throw new Error('relayer rejected the withdrawal (' + relayRes.status + '): ' + (await relayRes.text().catch(() => '')).slice(0, 300));
     const out = await relayRes.json();
     const hash = out.txHash ?? out.hash ?? out.transactionHash ?? out.tx;
     if (!hash) throw new Error('relayer accepted the withdrawal but returned no tx hash: ' + JSON.stringify(out).slice(0, 300));
-    say('SUBMITTED. tx hash: ' + hash + ' — the relayer broadcasts it; watch it land at the recipient.');
+    say('SUBMITTED. tx hash: ' + hash + ' · the relayer broadcasts it; watch it land at the recipient.');
     if (/^0x[0-9a-fA-F]{64}$/.test(hash)) {
       const a = document.createElement('a');
       a.href = 'https://etherscan.io/tx/' + hash;
@@ -911,7 +1098,182 @@ $('b-withdraw').onclick = async () => {
   }
 };
 
+// ── ui-core: formatting helpers, status strip, dashboard, notifications, GP namespace ──
+const formatEth = wei => { const s = ethers.formatEther(BigInt(wei)); return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s; };
+let ethPriceUsd = null;
+const formatUsd = (eth, usd) => {
+  const p = usd ?? ethPriceUsd;
+  return p == null ? null : '$' + (Number(eth) * p).toLocaleString(undefined, { maximumFractionDigits: 2 });
+};
+
+// status strip (#gp-status): relayer health + min fee + ETH price, refreshed every 60s.
+// every endpoint is optional: static-only serving shows "relayer: offline", a failed
+// /price simply hides the price.
+async function pollStatus() {
+  const el = $('gp-status'); if (!el) return;
+  const parts = [];
+  try {
+    const r = await fetch('./health');
+    if (!r.ok) throw new Error('http ' + r.status);
+    const h = await r.json();
+    const runners = h.runnerCount ?? (Array.isArray(h.runners) ? h.runners.length
+      : (typeof h.runners === 'number' ? h.runners : null));
+    parts.push('relayer: online'
+      + (runners != null ? ' · ' + runners + ' runner' + (runners === 1 ? '' : 's') : '')
+      + ' · sweeperV2 ' + (h.sweeperV2 ? 'configured' : 'NOT configured')
+      + ' · tor ' + (h.tor ? 'on' : 'off'));
+  } catch { parts.push('relayer: offline (static serving only)'); }
+  try {
+    const r = await fetch('./fee');
+    if (r.ok) {
+      const f = await r.json();
+      if (f.minFeeBps != null) parts.push('min fee ' + (f.minFeeBps / 100) + '%');
+      else {
+        const g = f.minFeeGwei ?? f.gwei ?? f.minFee;
+        if (g != null) parts.push('min fee ' + g + ' gwei');
+      }
+    }
+  } catch { /* fee endpoint optional */ }
+  try {
+    const r = await fetch('./price');
+    if (r.ok) {
+      const p = await r.json();
+      const usd = p.usd ?? p.ethUsd ?? p.price ?? (p.ethereum && p.ethereum.usd);
+      if (usd != null && isFinite(Number(usd))) { ethPriceUsd = Number(usd); parts.push('ETH $' + ethPriceUsd.toLocaleString()); }
+    }
+  } catch { /* price hidden on failure, by design */ }
+  el.textContent = parts.join(' · ');
+}
+pollStatus();
+setInterval(pollStatus, 60000);
+
+// returning-user dashboard: restore a watch-only session from gp-session (viewing key +
+// meta-address only). Steps 1-2 collapse into the #gp-dash header; scanning works
+// immediately, sweeping waits for a fresh signature.
+function enterDashboard(sess) {
+  try {
+    const m = buf(sess.meta.slice(7));
+    W = {
+      account: null, watchOnly: true,
+      viewPriv: sess.viewPriv,
+      viewPub: hex(secp256k1.getPublicKey(buf(sess.viewPriv), true)),
+      spendPriv: null,
+      spendPub: hex(m.slice(0, 33)),
+      meta: sess.meta,
+    };
+    if (W.viewPub.toLowerCase() !== hex(m.slice(33, 66)).toLowerCase()) throw new Error('stored session is inconsistent');
+  } catch (e) {
+    localStorage.removeItem(SESSION_KEY);
+    return;
+  }
+  W.recv = derive(W.meta.slice(7));
+  $('c-recv').style.display = 'block';
+  $('v-recv').textContent = W.recv.stealth;
+  $('st-announce').textContent = 'share this 0x address to get paid. hit ANNOUNCE IT once · the announcement is what lets your scanner find the payment.';
+  $('d-meta').style.display = 'block';
+  $('v-meta').textContent = W.meta;
+  $('b-invoice').disabled = false;
+  $('s3').classList.add('on'); $('s4').classList.add('on');
+  collapseWizard();
+  $('i-remember').checked = true;
+  refreshDash();
+  gpEmit('session', { type: 'restored', watchOnly: true, address: null });
+  scan();
+}
+$('b-reconnect').onclick = () => {
+  expandWizard();
+  $('s1').scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
+$('b-forget').onclick = () => {
+  localStorage.removeItem(SESSION_KEY);
+  gpEmit('session', { type: 'forgotten' });
+  toast('session wiped from this device');
+  setTimeout(() => location.reload(), 600);
+};
+// browser notifications: opt-in only, from this button. denied/unsupported degrades silently.
+$('b-notify').onclick = async () => {
+  if (!('Notification' in window)) { toast('notifications are not supported in this browser'); return; }
+  if (Notification.permission === 'granted') { toast('notifications already enabled'); return; }
+  if (Notification.permission === 'denied') { toast('notifications are blocked in your browser settings'); return; }
+  try { await Notification.requestPermission(); } catch { /* user dismissed or unsupported: stay silent */ }
+};
+// one Notification per newly detected payment (fresh = found by the background poll, so a
+// full rescan of old history never spam-notifies).
+gpOn('payment', async p => {
+  if (p.fresh !== true) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  let amt = '';
+  try { amt = formatEth(await jrpc('eth_getBalance', [p.address, 'latest'])) + ' ETH · '; } catch { /* balance unknown: notify with the address only */ }
+  try { new Notification('GHOSTPAY payment received', { body: amt + p.address.slice(0, 10) + '…' + p.address.slice(-6) }); } catch { /* some browsers require a service worker for notifications */ }
+});
+
+// background scanning: incremental poll every 60s while unlocked, resuming from the
+// stored cursor and appending new payments (never a full rescan). RESCAN stays manual.
+setInterval(() => {
+  if (!W || !W.viewPriv) return;
+  if (document.visibilityState === 'hidden') return;
+  scan({ append: true, quiet: true });
+}, 60000);
+
+// ── window.GP: the module API. Everything a follow-up module needs, documented in
+// docs/GP-API.md. Modules load as separate <script type="module"> files after this one. ──
+window.GP = {
+  version: '1.0-ui-core',
+  state: {
+    get connected() { return !!(W && (W.prov || W.session)); },
+    get unlocked() { return !!(W && W.viewPriv); },
+    get watchOnly() { return !!(W && W.viewPriv && !W.spendPriv); },
+    get address() { return (W && W.account) || null; },
+    get keys() {
+      return W && W.viewPriv
+        ? { viewPriv: W.viewPriv, viewPub: W.viewPub, spendPub: W.spendPub, spendPriv: W.spendPriv || null, meta: W.meta }
+        : null;
+    },
+    get meta() { return (W && W.meta) || null; },
+    get recv() { return (W && W.recv) || null; },
+    get ethPriceUsd() { return ethPriceUsd; },
+    payments,
+    signer() {
+      if (W && W.prov) return W.prov.getSigner();
+      throw new Error('no injected-wallet signer (WalletConnect session or watch-only): use GP.state.walletRequest instead');
+    },
+    walletRequest(method, params) {
+      if (W && W.session) return W.session.request({ chainId: 'eip155:1', request: { method, params } });
+      if (W && W.eip1193) return W.eip1193.request({ method, params });
+      if (window.ethereum) return window.ethereum.request({ method, params });
+      throw new Error('no wallet connected');
+    },
+  },
+  scan: fromBlock => scan(Number.isFinite(fromBlock) ? { from: fromBlock } : {}),
+  scanIncremental: () => scan({ append: true, quiet: true }),
+  announce: () => announceRecv(),
+  relaySweep: artifact => relaySweep(artifact),
+  fmt: { formatEth, formatUsd },
+  toast,
+  on: gpOn,
+  emit: gpEmit,
+  jrpc,
+  ethers,
+  const: { ANNOUNCER, CHAIN_ID, SWEEPER, RPC },
+  crypto: {
+    secp256k1, keccak_256, sha256, hex, buf, mod, N,
+    derive, check, stealthKey, sign7702,
+    poseidon1, poseidon2, poseidon3,
+    ppCommitment, spentNullifierHash, deriveChangeKeys, computeContext,
+    leanIMTBuild, leanIMTProof,
+    getLegacy: () => LEGACY,
+    setLegacy: b => { LEGACY = !!b; },
+  },
+  pp: { PP_POOL, PP_ENTRYPOINT, PP_ETH_ASSET, PP_ASP, PP_RELAYER, SNARK_FIELD, PP_IFACE, SWEEPER_IFACE, ppCall, ppFindDeposit },
+};
+
+// PWA: cache-first offline shell. http(s) only: file:// and weird schemes skip registration.
+if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+  navigator.serviceWorker.register('./sw.js').catch(() => { /* offline shell unavailable: the app still works */ });
+}
+
 // ── pay-a-ghost mode ──
+
 const metaMatch = location.hash.match(/st:eth:0x[0-9a-fA-F]{132}/);
 if (location.search.includes('connect')) setTimeout(() => $('b-connect').click(), 300);
 if (location.search.includes('gentest')) setTimeout(() => {
@@ -923,7 +1285,7 @@ if (location.search.includes('gentest')) setTimeout(() => {
     const spendPub = hex(secp256k1.getPublicKey(buf(spendPriv), true));
     const viewPub = hex(secp256k1.getPublicKey(buf(viewPriv), true));
     const meta = 'st:eth:0x' + (spendPub + viewPub).replace(/0x/g, '');
-    $('bootline').textContent = 'GENTEST OK — meta-address derived: ' + meta.slice(0, 30) + '…';
+    $('bootline').textContent = 'GENTEST OK · meta-address derived: ' + meta.slice(0, 30) + '…';
   } catch (e) { $('bootline').textContent = 'GENTEST FAIL: ' + e.message; }
 }, 700);
 if (metaMatch) {
@@ -943,6 +1305,15 @@ if (metaMatch) {
     $('v-ann').textContent = 'announced: ' + tx.hash;
   };
 }
+// returning user: a stored gp-session collapses the wizard into the dashboard header.
+// pay-a-ghost mode (meta-address in the URL hash) always takes precedence.
+if (!metaMatch) {
+  const sess = loadGpSession();
+  if (sess) enterDashboard(sess);
+}
 </script>
+<script type="module" src="./gp-inbox.mjs"></script>
+<script type="module" src="./gp-money.mjs"></script>
+<script type="module" src="./gp-invoices.mjs"></script>
 </body>
 </html>

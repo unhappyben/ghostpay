@@ -7,4 +7,10 @@ artifact.json
 *.log
 .DS_Store
 runners.local.json
+notify.local.json
+notify-state.json
+fees.jsonl
 deploy-commands.txt
+cache/
+out/
+foundry.lock
