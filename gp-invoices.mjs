@@ -9,7 +9,10 @@
 // pay-a-ghost enhancement (memo format unchanged). Pure helpers are exported so a
 // node smoke test can exercise migration, totals math and recurrence without a DOM.
 
-const GP = typeof window !== 'undefined' ? window.GP || null : null;
+// window.GP is captured lazily: app-core's own module graph fetches esm.sh imports
+// over the network, so on slow loads this module can evaluate before window.GP is
+// assembled. boot() retries below instead of giving up.
+let GP = typeof window !== 'undefined' ? window.GP || null : null;
 
 // ── memo crypto ──
 // Metadata format v2 (backward compatible: 1-byte metadata = bare view tag, no memo):
@@ -358,8 +361,66 @@ async function ethUsd() {
 
 // ── invoice suite UI ──
 // Renders into the shell's tab mounts. Every renderer is defensive: a missing mount
-// means the view is skipped, so the shell can land tabs in any order.
-function initSuite() {
+// means the view is skipped, so the shell can land tabs in any order. Styles come from
+// frag-invoices.html: fetched and injected into #gp-invoices (the shell links only
+// gp-ui.css), with an embedded copy below for static file:// opens.
+async function injectFrag() {
+  if (document.getElementById('gpinv-styles')) return;
+  const container = document.getElementById('gp-invoices');
+  if (!container) return;
+  let html = null;
+  try { const r = await fetch('./frag-invoices.html'); if (r.ok) html = await r.text(); } catch { /* static open: use the embedded copy */ }
+  container.insertAdjacentHTML('afterbegin', html || FRAG_FALLBACK);
+}
+
+// offline fallback: identical copy of frag-invoices.html
+const FRAG_FALLBACK = `<style id="gpinv-styles">
+  #gp-invoices h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
+  #gp-invoices .gpinv-box { border:1px solid #333; padding:16px; }
+  #gp-invoices .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  #gp-invoices .gpinv-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:4px; }
+  #gp-invoices .gpinv-muted { color:#777; }
+  #gp-invoices .gpinv-mono { font-size:11px; color:#777; word-break:break-all; }
+  #gp-invoices .gpinv-mg { width:46px; height:46px; border:1px solid #fff; display:flex; flex:none;
+    align-items:center; justify-content:center; font-weight:700; letter-spacing:.1em; }
+  #gp-invoices .gpinv-tablewrap { overflow-x:auto; }
+  #gp-invoices table { width:100%; border-collapse:collapse; font-size:12px; }
+  #gp-invoices th { text-align:left; font-size:10px; letter-spacing:.2em; color:#777; font-weight:400;
+    padding:6px 10px 6px 0; border-bottom:1px solid #333; white-space:nowrap; }
+  #gp-invoices td { padding:10px 10px 10px 0; border-bottom:1px solid #222; vertical-align:top; }
+  #gp-invoices .gpinv-rowbtn { cursor:pointer; }
+  #gp-invoices .gpinv-rowbtn:hover td { background:#0d0d0d; }
+  #gp-invoices .gpinv-detail td { background:#0a0a0a; padding:16px; }
+  #gp-invoices td input, #gp-invoices td select { margin-top:0; padding:8px 10px; font-size:12px; }
+  #gp-invoices .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
+    letter-spacing:.15em; white-space:nowrap; }
+  #gp-invoices .gpinv-pill.dim { border-color:#444; color:#888; }
+  #gp-invoices .gpinv-pill.solid { background:#fff; color:#000; font-weight:700; }
+  #gp-invoices .gpinv-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  #gp-invoices .gpinv-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  #gp-invoices .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
+  #gp-invoices .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
+    text-align:center; margin-top:4px; }
+  #gp-invoices .gpinv-filter { display:flex; gap:6px; flex-wrap:wrap; margin:16px 0 12px; }
+  #gp-invoices .gpinv-filter button { width:auto; padding:6px 12px; font-size:10px; letter-spacing:.15em; }
+  #gp-invoices .gpinv-filter button.on { background:#fff; color:#000; font-weight:700; border-color:#fff; }
+  #gp-invoices .gpinv-sub { display:flex; border:1px solid #333; margin-bottom:16px; }
+  #gp-invoices .gpinv-sub button { background:#000; color:#888; border:0; border-right:1px solid #333;
+    padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
+  #gp-invoices .gpinv-sub button:last-child { border-right:0; }
+  #gp-invoices .gpinv-sub button.on { background:#fff; color:#000; font-weight:700; }
+  #gp-invoices .gpinv-sticky { position:sticky; bottom:0; background:#000; border-top:1px solid #333;
+    padding:12px 0 8px; z-index:5; }
+  @media (max-width:700px) {
+    #gp-invoices .gpinv-grid { grid-template-columns:1fr; }
+    #gp-invoices .gpinv-actions { flex-direction:column; }
+    #gp-invoices .gpinv-actions button { width:100%; }
+    #gp-invoices .gpinv-sub button, #gp-invoices .gpinv-filter button { min-height:44px; }
+  }
+</style>`;
+
+async function initSuite() {
+  await injectFrag();
   const $ = id => document.getElementById(id);
   const C = GP.crypto;
   const mounts = {
@@ -1725,13 +1786,25 @@ function enhancePayghost() {
   };
 }
 
+let booted = false;
 function boot() {
+  if (booted) return;
+  GP = GP || (typeof window !== 'undefined' ? window.GP || null : null);
   if (!GP) return;
+  booted = true;
   const SUITE_MOUNTS = ['tab-invoices', 'tab-estimates', 'tab-customers', 'tab-items', 'tab-recurring', 'tab-settings'];
-  if (SUITE_MOUNTS.some(id => document.getElementById(id))) initSuite();
+  if (SUITE_MOUNTS.some(id => document.getElementById(id))) {
+    initSuite().catch(e => console.error('gp-invoices: suite init failed', e));
+  }
   enhancePayghost();
 }
 if (typeof document !== 'undefined') {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
+  // window.GP may land a beat after this module evaluates: poll briefly, then stop
+  let bootTries = 0;
+  const bootTimer = setInterval(() => {
+    if (booted || ++bootTries > 150) clearInterval(bootTimer);
+    else boot();
+  }, 100);
 }

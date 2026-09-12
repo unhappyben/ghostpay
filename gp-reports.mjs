@@ -9,7 +9,7 @@
 // exported so a node smoke test can exercise aging buckets, sales-by-month and
 // PARTIAL/OVERDUE derivation without a DOM.
 
-const GP = typeof window !== 'undefined' ? window.GP || null : null;
+let GP = typeof window !== 'undefined' ? window.GP || null : null;
 
 // ── schema v3 registries (read-only in this module) ──
 const INV_KEY = 'gp-invoices';
@@ -50,26 +50,42 @@ export const monthKey = ts => {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
 };
 
-// ── derived statuses (schema v3 contract, compute identically everywhere) ──
+// ── derived statuses (schema v3 contract, computed identically to gp-invoices.mjs:
+// same order, same epsilon, same estimate handling as its paymentState/invStatus) ──
 
-// Amount paid towards a record. rec.paidAmount (maintained by gp-invoices.mjs off GP
-// payment events) is authoritative; matched payment count is the fallback for records
-// that predate the field. Payment records themselves carry no amount.
-export function paidSum(rec, matched = []) {
-  if (Number.isFinite(rec.paidAmount)) return rec.paidAmount;
-  return matched.length;
+// Amount paid towards a record: rec.paidAmount, maintained by gp-invoices.mjs from the
+// stealth address balance on GP payment events. Payment records carry no amount, so
+// there is no other source; missing field means nothing paid.
+export function paidSum(rec) {
+  return Number.isFinite(rec.paidAmount) ? rec.paidAmount : 0;
 }
 
-// PAID (stored, terminal) → derived PAID (paid in full) → PARTIAL (some payment, not
-// full) → OVERDUE (SENT past expiry) → stored status.
-export function derivedStatus(rec, now = Date.now(), matched = []) {
+// Derived payment state from the summed payments: nothing → null, below total →
+// PARTIAL, at/over total → PAID. Never stored.
+export function paymentState(rec) {
+  const paid = paidSum(rec);
+  if (!(paid > 0)) return null;
+  return paid + 1e-9 >= (Number(rec.total) || 0) ? 'PAID' : 'PARTIAL';
+}
+
+// Effective status. Terminal stored states pass through (PAID, and ACCEPTED/DECLINED
+// for estimates). PARTIAL/PAID derive from payments on SENT invoices only, OVERDUE is
+// SENT past expiry, everything else is the stored status.
+export function derivedStatus(rec, now = Date.now()) {
+  if (!rec) return 'DRAFT';
+  if (rec.kind === 'estimate') {
+    if (rec.status === 'ACCEPTED' || rec.status === 'DECLINED') return rec.status;
+    if (rec.status === 'SENT' && rec.expiry && now > rec.expiry) return 'OVERDUE';
+    return rec.status || 'DRAFT';
+  }
   if (rec.status === 'PAID') return 'PAID';
-  const total = Number(rec.total) || 0;
-  const paid = paidSum(rec, matched);
-  if (total > 0 && paid >= total) return 'PAID';
-  if (paid > 0) return 'PARTIAL';
-  if ((rec.status || 'SENT') === 'SENT' && rec.expiry && now > rec.expiry) return 'OVERDUE';
-  return rec.status || 'SENT';
+  if (rec.status === 'SENT') {
+    const ps = paymentState(rec);
+    if (ps) return ps;
+    if (rec.expiry && now > rec.expiry) return 'OVERDUE';
+    return 'SENT';
+  }
+  return rec.status || 'DRAFT';
 }
 
 const isUnpaid = st => st === 'SENT' || st === 'OVERDUE' || st === 'PARTIAL';
@@ -81,10 +97,10 @@ export function daysOverdue(rec, now = Date.now()) {
 }
 
 // Aging buckets for unpaid SENT invoices by days past expiry.
-export function agingBuckets(records, now = Date.now(), matchedFor = () => []) {
+export function agingBuckets(records, now = Date.now()) {
   const buckets = { current: [], d1_7: [], d8_30: [], d30p: [] };
   for (const rec of records || []) {
-    const st = derivedStatus(rec, now, matchedFor(rec));
+    const st = derivedStatus(rec, now);
     if (!isUnpaid(st)) continue;
     const d = daysOverdue(rec, now);
     if (d <= 0) buckets.current.push(rec);
@@ -112,18 +128,18 @@ const addRec = (map, rec, amt) => addMoney(map, rec.token, amt == null ? rec.tot
 // (a) sales by client: invoiced (created in range, drafts excluded: not sales yet),
 // paid (paid in range), outstanding (unpaid right now, created in range).
 // PARTIAL outstanding counts the remainder only.
-export function salesByClient(records, clients = [], from, to, now = Date.now(), matchedFor = () => []) {
+export function salesByClient(records, clients = [], from, to, now = Date.now()) {
   const rows = new Map();
   const nameOf = id => { const c = (clients || []).find(x => x.id === id); return c ? c.name : ''; };
   for (const rec of records || []) {
     const key = rec.clientId || '';
     if (!rows.has(key)) rows.set(key, { clientId: key, name: rec.clientName || nameOf(rec.clientId) || '', invoiced: {}, paid: {}, outstanding: {} });
     const row = rows.get(key);
-    const st = derivedStatus(rec, now, matchedFor(rec));
+    const st = derivedStatus(rec, now);
     if (st !== 'DRAFT' && inRange(rec.created, from, to)) {
       addRec(row.invoiced, rec);
       if (isUnpaid(st)) {
-        const remaining = Math.max(0, (Number(rec.total) || 0) - paidSum(rec, matchedFor(rec)));
+        const remaining = Math.max(0, (Number(rec.total) || 0) - paidSum(rec));
         addRec(row.outstanding, rec, remaining);
       }
     }
@@ -136,7 +152,7 @@ export function salesByClient(records, clients = [], from, to, now = Date.now(),
 // (b) sales by month: one row per month intersecting [from, to], latest 12 max.
 // Invoiced by created month (drafts excluded), paid by paidAt month (created when
 // paidAt is missing).
-export function salesByMonth(records, from, to, now = Date.now(), matchedFor = () => []) {
+export function salesByMonth(records, from, to, now = Date.now()) {
   const start = new Date(from), end = new Date(to);
   const rows = [];
   let y = start.getFullYear(), m = start.getMonth();
@@ -146,12 +162,12 @@ export function salesByMonth(records, from, to, now = Date.now(), matchedFor = (
   }
   const idx = new Map(rows.map((r, i) => [r.month, i]));
   for (const rec of records || []) {
-    const st = derivedStatus(rec, now, matchedFor(rec));
+    const st = derivedStatus(rec, now);
     if (st !== 'DRAFT') { // drafts are not sales yet
       const ik = idx.get(monthKey(rec.created));
       if (ik != null && inRange(rec.created, from, to)) addRec(rows[ik].invoiced, rec);
     }
-    if (derivedStatus(rec, now, matchedFor(rec)) === 'PAID') {
+    if (st === 'PAID') {
       const pts = rec.paidAt || rec.created;
       const pk = idx.get(monthKey(pts));
       if (pk != null && inRange(pts, from, to)) addRec(rows[pk].paid, rec);
@@ -161,10 +177,10 @@ export function salesByMonth(records, from, to, now = Date.now(), matchedFor = (
 }
 
 // (c) aging detail: every unpaid SENT invoice with days overdue, worst first.
-export function agingDetail(records, from, to, now = Date.now(), matchedFor = () => []) {
+export function agingDetail(records, from, to, now = Date.now()) {
   return (records || [])
-    .filter(rec => isUnpaid(derivedStatus(rec, now, matchedFor(rec))) && inRange(rec.created, from, to))
-    .map(rec => ({ rec, status: derivedStatus(rec, now, matchedFor(rec)), days: daysOverdue(rec, now) }))
+    .filter(rec => isUnpaid(derivedStatus(rec, now)) && inRange(rec.created, from, to))
+    .map(rec => ({ rec, status: derivedStatus(rec, now), days: daysOverdue(rec, now) }))
     .sort((a, b) => b.days - a.days || b.rec.created - a.rec.created);
 }
 
@@ -219,7 +235,7 @@ async function ethUsd() {
   return GP.state.ethPriceUsd ?? null;
 }
 
-// payments grouped by lowercase stealth address, for status derivation
+// payments grouped by lowercase stealth address, for the session activity rows
 function paymentMap() {
   const m = new Map();
   for (const p of (GP && GP.state.payments) || []) {
@@ -238,24 +254,26 @@ function accentOf(p) {
 
 // ── print document: invoice + estimate, Zoho-clean, monochrome with the profile
 // accent only in the header bar. Installed as window.GPINVPrint; gp-invoices.mjs
-// defers to it from its own printInvoice when present.
-async function printDocument(rec) {
-  const p = loadProfile();
+// defers to it from its own printInvoice and passes a helpers bag ({profile, fmtAmt,
+// fmtDate, invStatus, qrDataUrl, ethUsd, memo, …}) this build uses when present.
+async function printDocument(rec, helpers) {
+  const h = helpers || {};
+  const p = h.profile || loadProfile();
+  const fmtA = h.fmtAmt || fmtAmt;
+  const fmtD = h.fmtDate || fmtDate;
   const kind = rec.kind === 'estimate' ? 'estimate' : 'invoice';
   const title = kind === 'estimate' ? 'ESTIMATE' : 'INVOICE';
   const accent = accentOf(p);
-  const map = paymentMap();
-  const matched = map.get((rec.stealthAddress || '').toLowerCase()) || [];
-  const st = derivedStatus(rec, Date.now(), matched);
+  const st = h.invStatus ? h.invStatus(rec) : derivedStatus(rec);
   const watermark = st === 'PAID' ? 'PAID' : (st === 'OVERDUE' ? 'OVERDUE' : '');
   const client = rec.clientId ? loadClients().find(c => c.id === rec.clientId) : null;
 
   let qr = null;
   if (kind === 'invoice' && rec.url) {
-    try { qr = await qrDataUrl(rec.url); } catch { /* QR optional: print without it */ }
+    try { qr = await (h.qrDataUrl || qrDataUrl)(rec.url); } catch { /* QR optional: print without it */ }
   }
-  const px = await ethUsd();
-  const totalUsd = fmtUsd(rec.total, rec.token, px);
+  const px = await (h.ethUsd || ethUsd)();
+  const totalUsd = (h.fmtUsd || fmtUsd)(rec.total, rec.token, px);
 
   const w = window.open('', '_blank', 'width=680,height=900');
   if (!w) { GP.toast('popup blocked: allow popups to print'); return; }
@@ -264,8 +282,8 @@ async function printDocument(rec) {
   const rows = (rec.items || []).map(it =>
     '<tr><td>' + escHtml(it.description || 'item') + '</td>'
     + '<td class="r">' + escHtml(it.qty) + '</td>'
-    + '<td class="r">' + fmtAmt(it.unitPrice, rec.token) + '</td>'
-    + '<td class="r">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
+    + '<td class="r">' + fmtA(it.unitPrice, rec.token) + '</td>'
+    + '<td class="r">' + fmtA((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
   ).join('');
   const discount = Number(rec.discountAmount) || 0;
   const tax = Number(rec.taxAmount) || 0;
@@ -298,8 +316,8 @@ async function printDocument(rec) {
     + addressLines.map(l => '<div class="addrline">' + escHtml(l) + '</div>').join('')
     + '</div>'
     + '<div><h1>' + title + '</h1><div class="num"><b>' + escHtml(rec.number || '') + '</b></div>'
-    + '<div class="num">date: ' + fmtDate(rec.created) + '</div>'
-    + (rec.expiry ? '<div class="num">' + (kind === 'estimate' ? 'valid until' : 'due') + ': ' + fmtDate(rec.expiry) + '</div>' : '')
+    + '<div class="num">date: ' + fmtD(rec.created) + '</div>'
+    + (rec.expiry ? '<div class="num">' + (kind === 'estimate' ? 'valid until' : 'due') + ': ' + fmtD(rec.expiry) + '</div>' : '')
     + '</div></div>'
     + (rec.clientName || client
       ? '<div style="margin-top:20px"><div class="muted">BILL TO</div><b>' + escHtml(rec.clientName || (client && client.name) || '') + '</b>'
@@ -308,10 +326,10 @@ async function printDocument(rec) {
       : '')
     + '<table><thead><tr><th style="width:50%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th><th class="r">AMOUNT</th></tr></thead>'
     + '<tbody>' + rows + '</tbody></table>'
-    + '<div class="tot"><div>subtotal · ' + fmtAmt(rec.subtotal, rec.token) + ' ' + rec.token + '</div>'
-    + (discount > 0 ? '<div>discount' + (rec.discountPct ? ' ' + rec.discountPct + '%' : '') + ' · -' + fmtAmt(discount, rec.token) + ' ' + rec.token + '</div>' : '')
-    + (tax > 0 ? '<div>tax' + (rec.taxPct ? ' ' + rec.taxPct + '%' : '') + ' · ' + fmtAmt(tax, rec.token) + ' ' + rec.token + '</div>' : '')
-    + '<div class="grand">total · ' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</div>'
+    + '<div class="tot"><div>subtotal · ' + fmtA(rec.subtotal, rec.token) + ' ' + rec.token + '</div>'
+    + (discount > 0 ? '<div>discount' + (rec.discountPct ? ' ' + rec.discountPct + '%' : '') + ' · -' + fmtA(discount, rec.token) + ' ' + rec.token + '</div>' : '')
+    + (tax > 0 ? '<div>tax' + (rec.taxPct ? ' ' + rec.taxPct + '%' : '') + ' · ' + fmtA(tax, rec.token) + ' ' + rec.token + '</div>' : '')
+    + '<div class="grand">total · ' + fmtA(rec.total, rec.token) + ' ' + rec.token + '</div>'
     + (totalUsd ? '<div class="muted" style="margin-top:2px">≈ ' + totalUsd + ' usd</div>' : '')
     + '</div>'
     + (kind === 'invoice' && rec.stealthAddress
@@ -323,6 +341,7 @@ async function printDocument(rec) {
       : '')
     + (kind === 'estimate' ? '<div class="foot">this is an estimate, not a payment request.</div>' : '')
     + (rec.note ? '<div class="foot">note: ' + escHtml(rec.note) + '</div>' : '')
+    + (h.memo ? '<div class="foot">payment memo: ' + escHtml(h.memo) + '</div>' : '')
     + (p.terms ? '<div class="foot">terms: ' + escHtml(p.terms) + '</div>' : '')
     + (p.footerNote ? '<div class="foot">' + escHtml(p.footerNote) + '</div>' : '')
     + '</div></body></html>');
@@ -375,14 +394,14 @@ function init(dashMount, repsMount) {
     const outstanding = {}, overdue = {}, paidMonth = {};
     let drafts = 0;
     for (const rec of inv) {
-      const st = derivedStatus(rec, now, mf(rec));
+      const st = derivedStatus(rec, now);
       if (st === 'DRAFT') { drafts++; continue; }
       if (st === 'OVERDUE') { addRec(overdue, rec); addRec(outstanding, rec); }
       else if (st === 'SENT' || st === 'PARTIAL') addRec(outstanding, rec);
       else if (st === 'PAID' && monthKey(rec.paidAt || rec.created) === month) addRec(paidMonth, rec);
     }
 
-    const buckets = agingBuckets(inv, now, mf);
+    const buckets = agingBuckets(inv, now);
     const bucketDefs = [
       ['CURRENT', buckets.current], ['1-7 DAYS', buckets.d1_7], ['8-30 DAYS', buckets.d8_30], ['>30 DAYS', buckets.d30p],
     ];
@@ -442,11 +461,9 @@ function init(dashMount, repsMount) {
     const px = await ethUsd();
     if (!el.isConnected) return;
     const now = Date.now();
-    const map = paymentMap();
-    const mf = rec => map.get((rec.stealthAddress || '').toLowerCase()) || [];
     const byClient = new Map();
     for (const rec of inv) {
-      if (derivedStatus(rec, now, mf(rec)) === 'DRAFT') continue;
+      if (derivedStatus(rec, now) === 'DRAFT') continue;
       const name = rec.clientName || '(no client)';
       if (!byClient.has(name)) byClient.set(name, { name, totals: {}, usd: 0 });
       const row = byClient.get(name);
@@ -495,13 +512,11 @@ function init(dashMount, repsMount) {
   function reportTable(key) {
     const inv = loadRecords('invoice');
     const now = Date.now();
-    const map = paymentMap();
-    const mf = rec => map.get((rec.stealthAddress || '').toLowerCase()) || [];
     const { from, to } = ranges[key];
     const endOfTo = new Date(new Date(to).setHours(23, 59, 59, 999)).getTime();
 
     if (key === 'client') {
-      const rows = salesByClient(inv, loadClients(), from, endOfTo, now, mf);
+      const rows = salesByClient(inv, loadClients(), from, endOfTo, now);
       return rows.length
         ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
           + '<th>CLIENT</th><th style="text-align:right">INVOICED</th><th style="text-align:right">PAID</th><th style="text-align:right">OUTSTANDING</th>'
@@ -516,7 +531,7 @@ function init(dashMount, repsMount) {
         : '<div class="gpr-empty">no invoices in this range.</div>';
     }
     if (key === 'month') {
-      const rows = salesByMonth(inv, from, endOfTo, now, mf);
+      const rows = salesByMonth(inv, from, endOfTo, now);
       return rows.length
         ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
           + '<th>MONTH</th><th style="text-align:right">INVOICED</th><th style="text-align:right">PAID</th>'
@@ -529,7 +544,7 @@ function init(dashMount, repsMount) {
           + '</tbody></table></div>'
         : '<div class="gpr-empty">no months in this range.</div>';
     }
-    const rows = agingDetail(inv, from, endOfTo, now, mf);
+    const rows = agingDetail(inv, from, endOfTo, now);
     return rows.length
       ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
         + '<th>NUMBER</th><th>CLIENT</th><th>CREATED</th><th>DUE</th><th style="text-align:right">DAYS OVER</th><th style="text-align:right">TOTAL</th><th style="text-align:right">STATUS</th>'
@@ -560,8 +575,6 @@ function init(dashMount, repsMount) {
   function exportReport(key) {
     const inv = loadRecords('invoice');
     const now = Date.now();
-    const map = paymentMap();
-    const mf = rec => map.get((rec.stealthAddress || '').toLowerCase()) || [];
     const { from, to } = ranges[key];
     const endOfTo = new Date(new Date(to).setHours(23, 59, 59, 999)).getTime();
     const stamp = new Date().toISOString().slice(0, 10);
@@ -569,7 +582,7 @@ function init(dashMount, repsMount) {
     if (key === 'client') {
       name = 'sales-by-client';
       rows = [['client', 'token', 'invoiced', 'paid', 'outstanding']];
-      for (const r of salesByClient(inv, loadClients(), from, endOfTo, now, mf)) {
+      for (const r of salesByClient(inv, loadClients(), from, endOfTo, now)) {
         const tokens = new Set([...Object.keys(r.invoiced), ...Object.keys(r.paid), ...Object.keys(r.outstanding)]);
         for (const t of [...tokens].sort()) {
           rows.push([r.name || '(no client)', t,
@@ -581,7 +594,7 @@ function init(dashMount, repsMount) {
     } else if (key === 'month') {
       name = 'sales-by-month';
       rows = [['month', 'token', 'invoiced', 'paid']];
-      for (const r of salesByMonth(inv, from, endOfTo, now, mf)) {
+      for (const r of salesByMonth(inv, from, endOfTo, now)) {
         const tokens = new Set([...Object.keys(r.invoiced), ...Object.keys(r.paid)]);
         for (const t of [...tokens].sort()) {
           rows.push([r.month, t,
@@ -592,7 +605,7 @@ function init(dashMount, repsMount) {
     } else {
       name = 'aging-detail';
       rows = [['number', 'client', 'created', 'due', 'days_overdue', 'status', 'total', 'token']];
-      for (const { rec, status, days } of agingDetail(inv, from, endOfTo, now, mf)) {
+      for (const { rec, status, days } of agingDetail(inv, from, endOfTo, now)) {
         rows.push([rec.number, rec.clientName || '', fmtDate(rec.created), rec.expiry ? fmtDate(rec.expiry) : '', days, status, fmtAmt(rec.total, rec.token), rec.token]);
       }
     }
@@ -645,11 +658,17 @@ async function ensureStyles() {
 }
 
 async function boot() {
+  // app-core's static esm.sh imports can delay window.GP assembly past this module's
+  // evaluation (same race gp-invoices.mjs handles with lazy capture): retry before giving up.
+  for (let i = 0; i < 30 && !GP; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    GP = window.GP || null;
+  }
   if (!GP) return;
   const dash = document.getElementById('tab-dashboard');
   const reps = document.getElementById('tab-reports');
   if (!dash && !reps) return; // no mounts on this page: stay out of the way
-  window.GPINVPrint = rec => printDocument(rec);
+  window.GPINVPrint = (rec, helpers) => printDocument(rec, helpers);
   await ensureStyles();
   init(dash, reps);
 }

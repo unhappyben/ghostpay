@@ -1,17 +1,18 @@
 <!-- GHOSTPAY invoice suite fragment (storage schema v3).
-     The shell pastes this block inside <div id="gp-invoices"></div> and provides the
-     tab bar plus these mount divs (all optional: gp-invoices.mjs skips a view whose
-     mount is absent):
+     The shell provides the tab bar plus these mount divs inside #gp-invoices (all
+     optional: gp-invoices.mjs skips a view whose mount is absent):
        #tab-invoices    INVOICES (+ ESTIMATES sub-switch when #tab-estimates is absent)
-       #tab-estimates   ESTIMATES (dedicated mount, optional)
+       #tab-estimates   ESTIMATES (dedicated mount, optional; the shell does not ship one)
        #tab-customers   CUSTOMERS
        #tab-items       ITEMS catalog
        #tab-recurring   RECURRING templates
        #tab-settings    SETTINGS (profile, numbering, ENS publish, CSV export)
      Everything renders via JS into those mounts; this frag carries only scoped styles.
-     Actions inside the mounts use data-iact (data-act belongs to the shell tab bar).
-     gp-ui.css is linked page-wide by the shell; the rules below are suite extras. -->
-<style>
+     gp-invoices.mjs fetches and injects this file itself (embedded fallback when opened
+     from disk); the shell does not need to paste it. Actions inside the mounts use
+     data-iact; the shell tab bar uses data-tab. gp-ui.css is linked page-wide by the
+     shell; the rules below are suite extras. -->
+<style id="gpinv-styles">
   #gp-invoices h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
   #gp-invoices .gpinv-box { border:1px solid #333; padding:16px; }
   #gp-invoices .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }

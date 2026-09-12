@@ -1,4 +1,4 @@
-// test-invoices.mjs — node smoke test for the invoice suite pure helpers in
+// test-invoices.mjs · node smoke test for the invoice suite pure helpers in
 // gp-invoices.mjs (no DOM, no network). Covers: v1/v2 → v3 migration (idempotent),
 // totals with tax + discount, PARTIAL/OVERDUE derivation, recurring nextDate advance.
 //
