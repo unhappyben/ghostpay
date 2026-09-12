@@ -36,6 +36,7 @@ const cat = (...as) => {
 };
 
 export async function packMemoMetadata({ viewPub, viewTag, memo, crypto: C }) {
+  if (!crypto.subtle) throw new Error('memos need a secure context (https or localhost): this page is plain http, so the memo cannot be encrypted. Clear the memo field to pay without it.');
   const pub = typeof viewPub === 'string' ? C.buf(viewPub) : viewPub;
   const r = C.mod(BigInt(C.hex(C.secp256k1.utils.randomPrivateKey())));
   const R = C.secp256k1.getPublicKey(r, true);

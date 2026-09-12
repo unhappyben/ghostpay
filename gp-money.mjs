@@ -46,6 +46,7 @@ const fromHex = h => { const u = new Uint8Array(h.length / 2); for (let i = 0; i
 const PBKDF2_ITERATIONS = 600000;
 
 async function backupKey(passcode, salt, iterations) {
+  if (!crypto.subtle) throw new Error('encrypted backup needs a secure context (https or localhost): this page is plain http.');
   const km = await crypto.subtle.importKey('raw', te.encode(passcode), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
     { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
