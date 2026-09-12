@@ -52,7 +52,7 @@
 import http from 'http';
 import https from 'https';
 import { createServer } from 'http';
-import { readFile, stat } from 'fs/promises';
+import { readFile, writeFile, appendFile, stat } from 'fs/promises';
 import { extname, join, normalize, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { ethers } from 'ethers';
@@ -275,7 +275,7 @@ async function readBody(req) {
   }
 }
 
-async function handleAnnounce(body) {
+async function handleAnnounce(body, attempts = 1) {
   const { stealth, ephPub, viewTag } = body || {};
   if (!ethers.isAddress(stealth)) throw Object.assign(new Error('bad stealth address'), { status: 400 });
   if (typeof ephPub !== 'string' || !/^0x[0-9a-fA-F]{66}$/.test(ephPub)) throw Object.assign(new Error('bad ephPub (expected 33-byte compressed point)'), { status: 400 });
@@ -297,7 +297,77 @@ async function handleAnnounce(body) {
   const data = iface.encodeFunctionData('announce', [1, stealth, ephPub, metadata]);
   const runner = pickRunner();
   lastRunner = runner;
-  return broadcast(runner, { to: ANNOUNCER, data }, [2, 15], 'announce');
+  const out = await broadcast(runner, { to: ANNOUNCER, data }, [2, 15], 'announce');
+  await journalBroadcast({ kind: 'announce', hash: out.hash, runner: runner.address, attempts,
+    payload: { stealth, ephPub, metadata: ethers.hexlify(metadata) } });
+  return out;
+}
+
+// ── broadcast journal + reaper: find failed broadcasts and rebroadcast them ──
+// Announces are deterministic from (stealth, ephPub, metadata), so any broadcast with no
+// onchain receipt after a grace window can be rebuilt and re-sent with a fresh nonce.
+// Exists because Flashbots Protect silently drops transactions it cannot include: two
+// announces were lost that way on 2026-09-12 (before local nonce tracking). The reaper
+// checks the journal every 5 minutes, confirms what landed, and rebroadcasts the rest,
+// up to 4 attempts per payload. Sweeps are not journaled: their artifacts stay valid in
+// the app and retrying is a user decision. Journal: broadcasts.jsonl (gitignored).
+const JOURNAL_FILE = new URL('./broadcasts.jsonl', import.meta.url);
+const REAPER_GRACE_MS = 6 * 60 * 1000;   // Protect can take a few minutes to include
+const REAPER_MAX_ATTEMPTS = 4;
+async function journalBroadcast(entry) {
+  try { await appendFile(JOURNAL_FILE, JSON.stringify({ ts: Date.now(), ...entry }) + '\n'); }
+  catch (e) { console.error('journal write failed:', errMsg(e)); }
+}
+async function readJournal() {
+  try {
+    const raw = await readFile(JOURNAL_FILE, 'utf8');
+    return raw.split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+async function writeJournal(entries) {
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // drop completed entries after a week
+  const keep = entries.filter(e => !e.done || e.ts > cutoff);
+  try { await writeFile(JOURNAL_FILE, keep.length ? keep.map(e => JSON.stringify(e)).join('\n') + '\n' : ''); }
+  catch (e) { console.error('journal write failed:', errMsg(e)); }
+}
+async function reaperTick() {
+  const entries = await readJournal();
+  let changed = false;
+  for (const e of entries) {
+    if (e.done) continue;
+    const rcpt = await rpcCall('eth_getTransactionReceipt', [e.hash]).catch(() => null);
+    if (rcpt) {
+      e.done = true; e.finalStatus = rcpt.status === '0x1' ? 'confirmed' : 'reverted'; changed = true;
+      if (e.finalStatus === 'reverted') console.error(`reaper: ${e.kind} tx REVERTED onchain: ${e.hash} (payload kept in the journal, needs a manual look)`);
+      continue;
+    }
+    if (Date.now() - e.ts < REAPER_GRACE_MS) continue;
+    if ((e.attempts || 1) >= REAPER_MAX_ATTEMPTS) {
+      e.done = true; e.finalStatus = 'given-up'; changed = true;
+      console.error(`reaper: gave up on ${e.kind} ${e.hash} after ${e.attempts} broadcasts (payload kept in the journal)`);
+      continue;
+    }
+    if (e.kind !== 'announce') { e.done = true; e.finalStatus = 'untracked'; changed = true; continue; }
+    try {
+      console.log(`reaper: no receipt for announce ${e.hash} after grace, rebroadcasting (attempt ${(e.attempts || 1) + 1})`);
+      const out = await handleAnnounce({ stealth: e.payload.stealth, ephPub: e.payload.ephPub, metadata: e.payload.metadata }, (e.attempts || 1) + 1);
+      e.done = true; e.finalStatus = 'replaced'; e.replacedBy = out.hash; changed = true;
+    } catch (err) { console.error('reaper: rebroadcast failed:', errMsg(err)); }
+  }
+  if (changed) {
+    // rebroadcasts appended fresh journal lines during this tick; re-read and fold the
+    // done-markings in by hash so nothing is lost or duplicated
+    const latest = await readJournal();
+    for (const e of latest) {
+      const u = entries.find(x => x.hash === e.hash);
+      if (u && u.done) Object.assign(e, { done: u.done, finalStatus: u.finalStatus, replacedBy: u.replacedBy });
+    }
+    await writeJournal(latest);
+  }
+}
+if (runners.length) {
+  const first = setTimeout(() => { reaperTick(); setInterval(reaperTick, 5 * 60 * 1000).unref(); }, 10 * 60 * 1000);
+  first.unref();
 }
 
 // ── SweeperV2 intents: an EIP-712 SweepIntent signed by the stealth key, executed via

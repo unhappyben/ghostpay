@@ -10,6 +10,7 @@ runners.local.json
 notify.local.json
 notify-state.json
 fees.jsonl
+broadcasts.jsonl
 deploy-commands.txt
 cache/
 out/
