@@ -189,15 +189,22 @@ async function broadcastRawTx(signed) {
 const getNonce = addr => rpcCall('eth_getTransactionCount', [addr, 'pending']).then(x => parseInt(x, 16));
 const getBalance = addr => rpcCall('eth_getBalance', [addr, 'latest']).then(BigInt);
 // 2x fee bump, same as relay.mjs: sweeps must land even in a fee spike.
+// priority fee floor (MIN_PRIORITY_WEI, default 0.1 gwei): at ultra-low gas prices a 2x
+// bump produces a priority fee so small that builders skip the tx entirely (Protect dropped
+// two announces and a sweep this way on 2026-09-12). The floor costs cents per tx and buys
+// prompt inclusion.
+const MIN_PRIORITY_WEI = BigInt(process.env.MIN_PRIORITY_WEI || '100000000');
 async function feeBump() {
   const gasPrice = BigInt(await rpcCall('eth_gasPrice', []));
   const fh = await rpcCall('eth_feeHistory', ['0x1', 'latest', [50]]).catch(() => null);
   const reward = fh && fh.reward && fh.reward[0] && fh.reward[0][0] ? BigInt(fh.reward[0][0]) : 1500000000n;
   // gasPrice and reward may come from DIFFERENT endpoints (random rotation), so the
   // priority fee can exceed the max fee. Base both on the larger value and clamp.
-  const maxFee = (gasPrice > reward ? gasPrice : reward) * 2n;
-  const priority = reward * 2n;
-  return { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority < maxFee ? priority : maxFee };
+  let priority = reward * 2n;
+  if (priority < MIN_PRIORITY_WEI) priority = MIN_PRIORITY_WEI;
+  let maxFee = (gasPrice > reward ? gasPrice : reward) * 2n;
+  if (maxFee < priority) maxFee = priority;
+  return { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority };
 }
 async function estimateGas(from, tx) {
   const call = { from, to: tx.to, data: tx.data || '0x' };
@@ -347,10 +354,12 @@ async function reaperTick() {
       console.error(`reaper: gave up on ${e.kind} ${e.hash} after ${e.attempts} broadcasts (payload kept in the journal)`);
       continue;
     }
-    if (e.kind !== 'announce') { e.done = true; e.finalStatus = 'untracked'; changed = true; continue; }
+    if (e.kind !== 'announce' && e.kind !== 'sweep-intent') { e.done = true; e.finalStatus = 'untracked'; changed = true; continue; }
     try {
-      console.log(`reaper: no receipt for announce ${e.hash} after grace, rebroadcasting (attempt ${(e.attempts || 1) + 1})`);
-      const out = await handleAnnounce({ stealth: e.payload.stealth, ephPub: e.payload.ephPub, metadata: e.payload.metadata }, (e.attempts || 1) + 1);
+      console.log(`reaper: no receipt for ${e.kind} ${e.hash} after grace, rebroadcasting (attempt ${(e.attempts || 1) + 1})`);
+      const out = e.kind === 'announce'
+        ? await handleAnnounce({ stealth: e.payload.stealth, ephPub: e.payload.ephPub, metadata: e.payload.metadata }, (e.attempts || 1) + 1)
+        : await handleSweep(e.payload, (e.attempts || 1) + 1);
       e.done = true; e.finalStatus = 'replaced'; e.replacedBy = out.hash; changed = true;
     } catch (err) { console.error('reaper: rebroadcast failed:', errMsg(err)); }
   }
@@ -423,7 +432,7 @@ function verifyIntent(sweep) {
   }
 }
 
-async function handleSweep(artifact) {
+async function handleSweep(artifact, attempts = 1) {
   if (!artifact || typeof artifact !== 'object') throw Object.assign(new Error('missing artifact'), { status: 400 });
   if (artifact.kind === 'eip3009') {
     const iface = new ethers.Interface([
@@ -479,6 +488,9 @@ async function handleSweep(artifact) {
       data,
       authorizationList: [wrapAuthorization(artifact.authorization)],
     }, [5, 45], 'sweep/7702-intent');
+    // journal for the reaper: a dropped intent sweep is safe to rebroadcast (if the original
+    // somehow lands too, the replay fails on the consumed auth nonce, it cannot double-sweep)
+    await journalBroadcast({ kind: 'sweep-intent', hash: out.hash, runner: runner.address, attempts, payload: artifact });
     if (bal !== null) await logFee({
       kind: 'sweep-intent', feeBps: Number(artifact.intent.feeBps),
       estFeeWei: (bal * BigInt(artifact.intent.feeBps) / 10000n).toString(),
