@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#000000">
+<meta name="theme-color" content="#14120f">
 <title>GHOSTPAY · APP</title>
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="./icon.svg" type="image/svg+xml">
@@ -11,51 +11,52 @@
 <script>try{const p=JSON.parse(localStorage.getItem('gp-profile')||'{}');if(p&&p.accentColor)document.documentElement.style.setProperty('--gp-accent',p.accentColor)}catch(e){}</script>
 <style>
   * { box-sizing:border-box; margin:0; padding:0; }
-  body { background:#000; color:#fff; font-family:'IBM Plex Mono',monospace; font-size:14px; line-height:1.6; }
+  body { background:var(--gp-bg); color:var(--gp-fg); font-family:'IBM Plex Mono',monospace; font-size:14px; line-height:1.6; }
   .wrap { max-width:640px; margin:0 auto; padding:48px 20px 100px; }
   .logo { font-size:clamp(40px,10vw,72px); font-weight:700; letter-spacing:-2px; }
-  .logo span { background:#fff; color:#000; padding:0 10px; }
-  .sub { color:#888; font-size:12px; margin-top:14px; }
-  .step { border:1px solid #333; margin-top:28px; padding:22px; }
-  .step.on { border-color:#fff; }
-  .step h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin-bottom:14px; }
-  .step.on h2 { color:#fff; }
-  button { background:#fff; color:#000; border:0; padding:14px 28px; font-family:inherit;
+  .logo span { background:var(--gp-fg); color:var(--gp-bg); padding:0 10px; }
+  .sub { color:var(--gp-muted); font-size:12px; margin-top:14px; }
+  .step { border:1px solid var(--gp-line); margin-top:28px; padding:22px; }
+  .step.on { border-color:var(--gp-fg); }
+  .step h2 { font-size:11px; letter-spacing:.25em; color:var(--gp-muted); font-weight:400; margin-bottom:14px; }
+  .step.on h2 { color:var(--gp-fg); }
+  button { background:var(--gp-fg); color:var(--gp-bg); border:0; padding:14px 28px; font-family:inherit;
     font-size:13px; font-weight:700; letter-spacing:.12em; cursor:pointer; width:100%; }
-  button:disabled { background:#222; color:#555; cursor:default; }
-  button.ghost { background:#000; color:#fff; border:1px solid #444; }
-  input, select, textarea { width:100%; background:#000; color:#fff; border:1px solid #333; padding:12px 14px;
+  button:disabled { background:#211e19; color:var(--gp-faint); cursor:default; }
+  button.ghost { background:var(--gp-bg); color:var(--gp-fg); border:1px solid var(--gp-line); }
+  input, select, textarea { width:100%; background:var(--gp-bg); color:var(--gp-fg); border:1px solid var(--gp-line); padding:12px 14px;
     font-family:inherit; font-size:13px; margin-top:8px; }
-  input:focus, select:focus, textarea:focus { outline:1px solid #fff; }
+  input:focus, select:focus, textarea:focus { outline:1px solid var(--gp-fg); }
   textarea { resize:vertical; }
-  .card { background:#fff; color:#000; padding:18px; margin-top:14px; word-break:break-all; font-size:12.5px; }
+  .card { background:var(--gp-fg); color:var(--gp-bg); padding:22px; margin-top:14px; word-break:break-all; font-size:12.5px; }
   .card b { font-weight:700; }
-  .card .lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:6px; }
-  .card button { background:#000; color:#fff; margin-top:12px; padding:10px 18px; font-size:11px; }
-  .pay { border:1px solid #333; padding:16px; margin-top:12px; }
-  .pay.armed { border-color:#fff; }
+  .card .lbl { font-size:10px; letter-spacing:.2em; color:#6a6761; margin-bottom:6px; }
+  .card button { background:var(--gp-bg); color:var(--gp-fg); margin-top:12px; padding:10px 18px; font-size:11px; }
+  .pay { border:1px solid var(--gp-line); padding:16px; margin-top:12px; }
+  .pay.armed { border-color:var(--gp-fg); }
   .pay.swept { opacity:.35; }
   .pay.swept .addr { text-decoration:line-through; }
   .pay .addr { font-weight:700; }
-  .pay .meta { color:#777; font-size:11px; margin:6px 0 10px; }
-  .status { color:#888; font-size:12px; margin-top:12px; }
-  .ok { color:#fff; }
-  a { color:#fff; }
+  .pay .meta { color:var(--gp-faint); font-size:11px; margin:6px 0 10px; }
+  .status { color:var(--gp-muted); font-size:12px; margin-top:12px; }
+  .ok { color:var(--gp-fg); }
+  a { color:var(--gp-fg); }
   /* status strip + returning-user dashboard (ui-core) */
-  #gp-status { border:1px solid #333; padding:8px 12px; font-size:11px; color:#888; margin-bottom:22px;
+  #gp-status { border:1px solid var(--gp-line); padding:8px 12px; font-size:11px; color:var(--gp-muted); margin-bottom:22px;
     word-break:break-word; }
-  #gp-dash { border:1px solid #fff; padding:16px; margin-bottom:8px; }
+  #gp-dash { border:1px solid var(--gp-fg); padding:22px; margin-bottom:8px; }
   #gp-dash .dashaddr { font-size:12px; word-break:break-all; }
-  #gp-dash .dashmode { color:#888; font-size:10px; letter-spacing:.2em; }
+  #gp-dash .dashmode { color:var(--gp-muted); font-size:10px; letter-spacing:.2em; }
   #gp-dash .dashbtns { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
   #gp-dash .dashbtns button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
-  #gp-toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#fff; color:#000;
+  #gp-toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:var(--gp-fg); color:var(--gp-bg);
     padding:12px 20px; font-size:12px; font-weight:700; letter-spacing:.08em; z-index:99; display:none;
     max-width:90vw; text-align:center; }
   /* mobile: full-width steps, 44px touch targets, 16px inputs (stops iOS auto-zoom) */
   @media (max-width:700px) {
     .wrap { padding:24px 12px 80px; }
     .step { padding:16px; width:100%; }
+    .card { padding:16px; }
     button { min-height:44px; }
     input, select, textarea { font-size:16px; }
     #gp-dash .dashbtns { flex-direction:column; }
@@ -76,7 +77,7 @@
   <div id="gp-status">relayer: checking…</div>
   <div class="logo">GHOST<span>PAY</span></div>
   <div class="sub">RECEIVE-ONLY STEALTH · ERC-5564 · KEYS DERIVED FROM YOUR WALLET SIGNATURE · v1.3</div>
-  <div class="sub" id="bootline" style="color:#fff">booting…</div>
+  <div class="sub" id="bootline" style="color:var(--gp-fg)">booting…</div>
 
   <!-- returning-user dashboard: replaces steps 1-2 when a gp-session exists on this device -->
   <div id="gp-dash" style="display:none">
@@ -96,13 +97,13 @@
     <button id="b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
     <div class="status" id="st-connect"></div>
     <div id="qrwrap" style="display:none;margin-top:16px;text-align:center">
-      <canvas id="qr" style="background:#fff;padding:14px;image-rendering:pixelated"></canvas>
+      <canvas id="qr" style="background:var(--gp-fg);padding:14px;image-rendering:pixelated"></canvas>
       <div class="status">scan with your wallet</div>
-      <a id="wc-link" href="#" style="display:inline-block;margin-top:12px;background:#fff;color:#000;padding:14px 28px;font-weight:700;letter-spacing:.12em;text-decoration:none">OPEN WALLET</a>
-      <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="wc-raw" style="word-break:break-all;color:#fff"></span></div>
+      <a id="wc-link" href="#" style="display:inline-block;margin-top:12px;background:var(--gp-fg);color:var(--gp-bg);padding:14px 28px;font-weight:700;letter-spacing:.12em;text-decoration:none">OPEN WALLET</a>
+      <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="wc-raw" style="word-break:break-all;color:var(--gp-fg)"></span></div>
     </div>
     <button class="ghost" id="b-injected" style="display:none">USE INJECTED WALLET INSTEAD</button>
-    <div class="status" style="margin-top:10px"><a href="#" id="b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
+    <div class="status" style="margin-top:10px"><a href="#" id="b-forcelatrine" style="color:var(--gp-muted)">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
     <input id="i-wcpid" type="hidden" value="c6c9bacd35afa3eb9e6cccf6d8464395">
   </div>
 
@@ -112,26 +113,26 @@
     <button id="b-gen" disabled>GENERATE MY STEALTH KEYS</button>
     <div class="status" id="st-gen">sign one message · your keys are derived from the signature. same wallet, same signature, same keys. nothing to back up.</div>
     <div id="remember-row" style="display:none;margin-top:14px">
-      <label style="display:block;font-size:12px;color:#fff;cursor:pointer"><input type="checkbox" id="i-remember" style="width:auto;margin-right:6px">remember this device (watch-only)</label>
-      <div class="status" style="color:#666;margin-top:4px">warning: watch-only persistence reveals your payment history to anyone with access to this browser profile. the spend key is NEVER stored: sweeping always requires a fresh wallet signature.</div>
+      <label style="display:block;font-size:12px;color:var(--gp-fg);cursor:pointer"><input type="checkbox" id="i-remember" style="width:auto;margin-right:6px">remember this device (watch-only)</label>
+      <div class="status" style="color:var(--gp-faint);margin-top:4px">warning: watch-only persistence reveals your payment history to anyone with access to this browser profile. the spend key is NEVER stored: sweeping always requires a fresh wallet signature.</div>
     </div>
     <div class="card" id="c-recv" style="display:none">
       <div class="lbl">YOUR ONE-TIME RECEIVING ADDRESS · SHARE THIS TO GET PAID</div>
       <b id="v-recv"></b>
       <button id="b-copyrecv">COPY ADDRESS</button>
-      <div style="margin-top:14px;border-top:1px solid #ddd;padding-top:10px">
-        <div style="font-size:11px;color:#555;margin-bottom:8px">only needed if the payer pays the raw address outside a payment link: payment links announce automatically when the payer pays.</div>
-        <button id="b-annrecv" class="ghost" style="background:#fff;color:#000;border:1px solid #000;width:auto;padding:8px 14px;font-size:10px;margin-top:0">ANNOUNCE IT</button>
-        <div class="status" id="st-announce" style="color:#444"></div>
+      <div style="margin-top:14px;border-top:1px solid #cec9be;padding-top:10px">
+        <div style="font-size:11px;color:#5c5953;margin-bottom:8px">only needed if the payer pays the raw address outside a payment link: payment links announce automatically when the payer pays.</div>
+        <button id="b-annrecv" class="ghost" style="background:var(--gp-fg);color:var(--gp-bg);border:1px solid var(--gp-bg);width:auto;padding:8px 14px;font-size:10px;margin-top:0">ANNOUNCE IT</button>
+        <div class="status" id="st-announce" style="color:#4e4b46"></div>
       </div>
     </div>
     <details id="d-meta" style="display:none;margin-top:12px">
-      <summary style="cursor:pointer;color:#888;font-size:11px">advanced: stealth meta-address + pay-me link</summary>
+      <summary style="cursor:pointer;color:var(--gp-muted);font-size:11px">advanced: stealth meta-address + pay-me link</summary>
       <div class="card">
         <div class="lbl">YOUR STEALTH META-ADDRESS</div>
         <b id="v-meta"></b>
         <button id="b-copymeta">COPY META-ADDRESS</button>
-        <button id="b-copylink" class="ghost" style="background:#000;color:#fff;border:0">COPY PAY-ME LINK</button>
+        <button id="b-copylink" class="ghost" style="background:var(--gp-bg);color:var(--gp-fg);border:0">COPY PAY-ME LINK</button>
       </div>
     </details>
   </div>
@@ -142,13 +143,13 @@
     <div class="status" id="st-scan">connect + generate first.</div>
     <button class="ghost" id="b-rescan" style="margin-bottom:10px">RESCAN</button>
     <input id="i-fromblock" type="number" min="0" placeholder="from block (optional · default: latest − 50000)">
-    <label style="display:block;margin:6px 0;font-size:12px;color:#888"><input type="checkbox" id="i-legacy" style="width:auto;margin-right:6px">legacy scheme (sha256) · needed to find + sweep announcements made before 2026-09-08</label>
+    <label style="display:block;margin:6px 0;font-size:12px;color:var(--gp-muted)"><input type="checkbox" id="i-legacy" style="width:auto;margin-right:6px">legacy scheme (sha256) · needed to find + sweep announcements made before 2026-09-08</label>
     <div id="payments"></div>
     <div id="sweeper-ui" style="display:none">
-      <div class="status" id="st-armed" style="color:#fff"></div>
+      <div class="status" id="st-armed" style="color:var(--gp-fg)"></div>
       <div class="status" style="margin-top:4px">door: PRIVACY POOLS · any amount (the only door now)</div>
       <button id="b-sweep" style="margin-top:8px">SIGN SWEEP</button>
-      <div class="card" id="c-secret" style="display:none;border:4px solid #000">
+      <div class="card" id="c-secret" style="display:none;border:4px solid var(--gp-bg)">
         <div class="lbl" id="v-secret-lbl">WITHDRAWAL SECRET</div>
         <b id="v-secret"></b>
         <button id="b-dlsecret">DOWNLOAD SECRET FILE AGAIN</button>
@@ -157,7 +158,7 @@
         <div class="lbl">SIGNED</div>
         <b id="v-artifact"></b>
         <button class="ghost" id="b-copyart">COPY ARTIFACT</button>
-        <div class="status" id="st-broadcast" style="color:#444"></div>
+        <div class="status" id="st-broadcast" style="color:#4e4b46"></div>
       </div>
     </div>
     <div id="gp-sweep"></div>

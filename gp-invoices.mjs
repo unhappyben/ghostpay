@@ -1,4 +1,4 @@
-// gp-invoices.mjs · GHOSTPAY invoice suite module (docs/GP-API.md), storage schema v3.
+// gp-invoices.mjs · GHOSTPAY invoice suite module (docs/GP-API.md), storage schema v4.
 // Renders into the shell's tab mounts inside #gp-invoices on invoices.html: INVOICES
 // (plus ESTIMATES), CUSTOMERS, ITEMS, RECURRING, SETTINGS over six localStorage
 // registries: gp-profile, gp-clients, gp-items, gp-invoices, gp-estimates, gp-recurring.
@@ -79,33 +79,67 @@ export function namehash(name, keccak) {
 
 // ── pure suite helpers (exported for the node smoke test) ──
 
-// gp-profile, schema v3.
+// gp-profile, schema v4. v4 adds taxNumber (VAT / tax id printed on documents).
 export const DEFAULT_PROFILE = {
   name: '', contact: '', addressLines: [], token: 'USDC', prefix: 'GP-', next: 1,
-  terms: 'payment due on receipt', taxPct: null, accentColor: null, footerNote: '',
+  terms: 'payment due on receipt', taxPct: null, taxNumber: '', accentColor: null, footerNote: '',
 };
 
 const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
 const round6 = n => Math.round(n * 1e6) / 1e6;
 
-// Line items + optional discount % + optional tax % → subtotal/discount/tax/total.
-// Discount comes off the subtotal first, tax applies to the discounted amount; both
-// are their own lines, never folded into the item prices.
+// Line items → subtotal/discount/tax/total, schema v4 (Moneybird-style per-line tax).
+// Rounding rules: each line rounds on its own (gross, then its per-line discount, then
+// the net), rounded nets sum into per-rate bases, and tax rounds once per rate group.
+// Per-line it.taxPct / it.discountPct win; the taxPct/discountPct arguments are only
+// defaults for lines that carry no own rate (legacy callers, recurring templates).
+// taxLines is the grouped tax block: [{ rate, base, amount }] sorted by rate.
 export function computeTotals(items, taxPct, discountPct) {
-  const subtotal = round2((items || []).reduce((s, it) => s + (parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), 0));
-  const dpct = parseFloat(discountPct);
-  const useDisc = Number.isFinite(dpct) && dpct > 0;
-  const discountAmount = useDisc ? round2(subtotal * dpct / 100) : 0;
-  const taxable = round2(subtotal - discountAmount);
-  const pct = parseFloat(taxPct);
-  const useTax = Number.isFinite(pct) && pct > 0;
-  const taxAmount = useTax ? round2(taxable * pct / 100) : 0;
+  const defTax = parseFloat(taxPct);
+  const defDisc = parseFloat(discountPct);
+  const groups = new Map(); // rate → sum of rounded line nets
+  let subtotal = 0, discountAmount = 0;
+  for (const it of items || []) {
+    const gross = round2((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0));
+    const dp = it.discountPct != null && it.discountPct !== '' ? parseFloat(it.discountPct) : defDisc;
+    const disc = Number.isFinite(dp) && dp > 0 ? round2(gross * dp / 100) : 0;
+    const net = round2(gross - disc);
+    const tp = it.taxPct != null && it.taxPct !== '' ? parseFloat(it.taxPct) : defTax;
+    const rate = Number.isFinite(tp) && tp > 0 ? tp : 0;
+    subtotal = round2(subtotal + gross);
+    discountAmount = round2(discountAmount + disc);
+    if (rate > 0) groups.set(rate, round2((groups.get(rate) || 0) + net));
+  }
+  const taxLines = [...groups.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([rate, base]) => ({ rate, base, amount: round2(base * rate / 100) }));
+  const taxAmount = round2(taxLines.reduce((s, tl) => s + tl.amount, 0));
   return {
     subtotal,
-    discountPct: useDisc ? dpct : null, discountAmount,
-    taxPct: useTax ? pct : null, taxAmount,
-    total: round2(taxable + taxAmount),
+    discountPct: Number.isFinite(defDisc) && defDisc > 0 ? defDisc : null, discountAmount,
+    taxPct: Number.isFinite(defTax) && defTax > 0 ? defTax : null, taxAmount,
+    taxLines,
+    total: round2(subtotal - discountAmount + taxAmount),
   };
+}
+
+// The grouped tax block of a stored record. v4 records carry taxLines; anything older
+// synthesizes one group from the stored invoice-level rate and stored totals (issued
+// numbers never shift), falling back to computing from the items when there are no
+// stored totals. Lines with a nonpositive or nonnumeric rate are dropped.
+// Same contract as taxLinesOf in gp-reports.mjs, duplicated so both files stay
+// importable on their own.
+export function taxLinesOf(rec) {
+  if (rec && Array.isArray(rec.taxLines)) {
+    return rec.taxLines
+      .map(tl => ({ rate: +tl.rate, base: +tl.base, amount: +tl.amount }))
+      .filter(tl => Number.isFinite(tl.rate) && tl.rate > 0 && Number.isFinite(tl.base) && Number.isFinite(tl.amount));
+  }
+  const rate = Number(rec && rec.taxPct) || 0;
+  if (rate > 0 && Number.isFinite(rec.subtotal)) {
+    return [{ rate, base: round2(rec.subtotal - (Number(rec.discountAmount) || 0)), amount: Number(rec.taxAmount) || 0 }];
+  }
+  return computeTotals(rec ? rec.items : [], rec && rec.taxPct, rec && rec.discountPct).taxLines;
 }
 
 // Document numbers come from the profile counter: prefix + zero-padded counter.
@@ -146,8 +180,10 @@ export function invStatus(rec, now, paidSum) {
   return rec.status || 'DRAFT';
 }
 
-// Profile upgrade to schema v3. Idempotent: v3 fields keep their values, missing
-// fields get defaults. A legacy string address becomes one address line.
+// Profile upgrade to schema v4. Idempotent: existing fields keep their values, missing
+// fields get defaults. A legacy string address becomes one address line. v4 adds
+// taxNumber (VAT / tax id); there are deliberately no bank fields: the invoice's
+// stealth address is the payment detail.
 export function migrateProfile(p) {
   const out = { ...DEFAULT_PROFILE, ...(p || {}) };
   out.addressLines = Array.isArray(out.addressLines)
@@ -155,6 +191,7 @@ export function migrateProfile(p) {
     : (typeof out.addressLines === 'string' && out.addressLines ? out.addressLines.split('\n') : []);
   out.token = out.token === 'ETH' ? 'ETH' : 'USDC';
   out.taxPct = Number.isFinite(+out.taxPct) && +out.taxPct > 0 ? +out.taxPct : null;
+  out.taxNumber = typeof out.taxNumber === 'string' ? out.taxNumber : '';
   out.accentColor = typeof out.accentColor === 'string' && out.accentColor ? out.accentColor : null;
   out.footerNote = typeof out.footerNote === 'string' ? out.footerNote : '';
   out.next = Number.isFinite(+out.next) && +out.next > 0 ? Math.floor(+out.next) : 1;
@@ -166,9 +203,7 @@ export function migrateProfile(p) {
 // a single line item, UNPAID becomes SENT (the link was already handed out), a number
 // is assigned. v2 fields carry over; the v3 additions (discount, paidAmount,
 // estimateOf, kind) get defaults. kind is 'invoice' or 'estimate'.
-export function migrateInvoice(rec, number, kind) {
-  kind = kind === 'estimate' ? 'estimate' : 'invoice';
-  if (rec && rec.v === 3) return rec;
+function migrateV3(rec, number, kind) {
   const amount = parseFloat(rec.amount) || 0;
   const items = Array.isArray(rec.items) && rec.items.length
     ? rec.items.map(it => ({ description: it.description || 'item', qty: parseFloat(it.qty) || 0, unitPrice: parseFloat(it.unitPrice) || 0 }))
@@ -207,19 +242,49 @@ export function migrateInvoice(rec, number, kind) {
   };
 }
 
-// Whole-registry migration: legacy records get numbers in creation order, the profile
-// counter advances past them. Idempotent: v3 records pass through untouched.
+// v3 → v4 record upgrade: additive. Each line gains taxPct/discountPct (seeded from the
+// legacy invoice-level rates) and the record gains taxLines, synthesized from the stored
+// v3 totals so the issued document's numbers never shift by a rounding cent. taxLines
+// on a v3 record (hand-written) is sanitized and kept.
+function upgradeV4(rec) {
+  const items = rec.items.map(it => ({
+    ...it,
+    taxPct: Number.isFinite(+it.taxPct) && +it.taxPct >= 0 ? +it.taxPct : (rec.taxPct > 0 ? rec.taxPct : 0),
+    discountPct: Number.isFinite(+it.discountPct) && +it.discountPct > 0 ? +it.discountPct : (rec.discountPct > 0 ? rec.discountPct : null),
+  }));
+  const taxLines = Array.isArray(rec.taxLines)
+    ? taxLinesOf({ taxLines: rec.taxLines })
+    : (rec.taxPct > 0
+      ? [{ rate: rec.taxPct, base: round2(rec.subtotal - (rec.discountAmount || 0)), amount: rec.taxAmount || 0 }]
+      : []);
+  return { ...rec, v: 4, items, taxLines };
+}
+
+// Any older record → v4. Idempotent: v4 records pass through untouched.
+export function migrateInvoice(rec, number, kind) {
+  kind = kind === 'estimate' ? 'estimate' : 'invoice';
+  if (rec && rec.v === 4) return rec;
+  return upgradeV4(rec && rec.v === 3 ? { ...rec, kind } : migrateV3(rec, number, kind));
+}
+
+// Whole-registry migration: legacy records without a number get one in creation order
+// and the profile counter advances past them (numbered records keep their number and
+// burn nothing). Idempotent: v4 records pass through untouched.
 export function migrateRegistry(records, profile, kind) {
   const p = migrateProfile(profile);
-  const out = (records || []).map(r => (r && r.v === 3 ? r : null));
+  const out = (records || []).map(r => (r && r.v === 4 ? r : null));
   const legacy = (records || [])
     .map((r, i) => ({ r, i }))
-    .filter(x => x.r && x.r.v !== 3)
+    .filter(x => x.r && x.r.v !== 4)
     .sort((a, b) => (a.r.created || 0) - (b.r.created || 0));
   for (const { r, i } of legacy) {
-    const a = allocateNumber(p);
-    p.next = a.next;
-    out[i] = migrateInvoice(r, a.number, kind);
+    let number = r.number;
+    if (!number) {
+      const a = allocateNumber(p);
+      p.next = a.next;
+      number = a.number;
+    }
+    out[i] = migrateInvoice(r, number, kind);
   }
   return { records: out.filter(Boolean), profile: p };
 }
@@ -270,7 +335,7 @@ const memos = typeof localStorage !== 'undefined' ? loadMemos() : {};
 // Registry loads migrate legacy records on the way out and persist the result once.
 function loadReg(key, kind) {
   const raw = lsGet(key, []);
-  if (!raw.some(r => r && r.v !== 3)) return raw;
+  if (!raw.some(r => r && r.v !== 4)) return raw;
   const { records, profile } = migrateRegistry(raw, loadProfile(), kind);
   lsSet(key, records);
   saveProfile(profile);
@@ -300,6 +365,22 @@ const monogram = name => {
   const w = (name || '').trim().split(/\s+/).filter(Boolean);
   return (w.length ? w.slice(0, 2).map(x => x[0]).join('') : 'GP').toUpperCase();
 };
+
+// One-click reminder for overdue invoices: a short polite message with the payment
+// link, copied to the clipboard (no email backend). Pure, so the smoke test can build it.
+export function reminderText(rec, profile) {
+  const p = profile || {};
+  const lines = [
+    'hi ' + (rec.clientName || 'there') + ',',
+    '',
+    'a friendly reminder: invoice ' + rec.number + ' for ' + fmtAmt(rec.total, rec.token) + ' ' + rec.token
+      + (rec.expiry ? ' was due on ' + fmtDate(rec.expiry) + ' and is still open.' : ' is still open.'),
+    '',
+  ];
+  if (rec.url) lines.push('pay here: ' + rec.url, '');
+  lines.push('thanks,', p.name || 'ghostpay');
+  return lines.join('\n');
+}
 
 // ── qrcode-generator: same vendored module the core uses, loaded lazily so this file
 // stays importable under plain node (no DOM, no network) for the smoke test.
@@ -393,6 +474,7 @@ const FRAG_FALLBACK = `<style id="gpinv-styles">
   #gp-invoices .gpinv-rowbtn:hover td { background:#0d0d0d; }
   #gp-invoices .gpinv-detail td { background:#0a0a0a; padding:16px; }
   #gp-invoices td input, #gp-invoices td select { margin-top:0; padding:8px 10px; font-size:12px; }
+  /* status pills: same idiom as the inbox (outline, dim, solid) */
   #gp-invoices .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
     letter-spacing:.15em; white-space:nowrap; }
   #gp-invoices .gpinv-pill.dim { border-color:#444; color:#888; }
@@ -402,14 +484,17 @@ const FRAG_FALLBACK = `<style id="gpinv-styles">
   #gp-invoices .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
   #gp-invoices .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
     text-align:center; margin-top:4px; }
+  /* status filter row */
   #gp-invoices .gpinv-filter { display:flex; gap:6px; flex-wrap:wrap; margin:16px 0 12px; }
   #gp-invoices .gpinv-filter button { width:auto; padding:6px 12px; font-size:10px; letter-spacing:.15em; }
   #gp-invoices .gpinv-filter button.on { background:#fff; color:#000; font-weight:700; border-color:#fff; }
+  /* INVOICES / ESTIMATES sub-switch (only when the shell has no #tab-estimates mount) */
   #gp-invoices .gpinv-sub { display:flex; border:1px solid #333; margin-bottom:16px; }
   #gp-invoices .gpinv-sub button { background:#000; color:#888; border:0; border-right:1px solid #333;
     padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
   #gp-invoices .gpinv-sub button:last-child { border-right:0; }
   #gp-invoices .gpinv-sub button.on { background:#fff; color:#000; font-weight:700; }
+  /* editor save/cancel bar stays reachable on long forms */
   #gp-invoices .gpinv-sticky { position:sticky; bottom:0; background:#000; border-top:1px solid #333;
     padding:12px 0 8px; z-index:5; }
   @media (max-width:700px) {
@@ -434,13 +519,13 @@ async function initSuite() {
   let invKind = 'invoice';       // sub-view inside #tab-invoices when there is no #tab-estimates mount
   let invFilter = 'ALL', estFilter = 'ALL';
   let showForm = false, formKind = 'invoice', editId = null;
-  let formRows = [{ description: '', qty: 1, unitPrice: '' }];
+  let formRows = [{ description: '', qty: 1, unitPrice: '', discPct: '', taxPct: '0' }];
   let formDraft = {};
   let recFormOpen = false, recEditId = null;
-  let recRows = [{ description: '', qty: 1, unitPrice: '' }];
+  let recRows = [{ description: '', qty: 1, unitPrice: '', discPct: '', taxPct: '0' }];
   let recDraft = {};
   let itemEditId = null;
-  let itemDraft = { name: '', description: '', unitPrice: '', token: 'USDC' };
+  let itemDraft = { name: '', description: '', unitPrice: '', token: 'USDC', taxPct: '', discPct: '' };
   let openId = null, qrFor = null, recOpen = null;
 
   // status pills: same idiom as the inbox (outline default, dim for inactive,
@@ -469,9 +554,24 @@ async function initSuite() {
   }
 
   // ── shared line-items editor (invoices, estimates, recurring templates) ──
+  // Each row carries a tax rate picker (0% / 9% / 21% / custom, defaulting to the
+  // profile rate) and an optional per-line discount %.
+  const TAX_PRESETS = ['0', '9', '21'];
+  function taxCellHtml(r, i, pref) {
+    const rateStr = r.taxPct == null || r.taxPct === '' ? '' : String(r.taxPct);
+    const sel = r._taxpick ?? (rateStr === '' ? '0' : (TAX_PRESETS.includes(rateStr) ? rateStr : 'custom'));
+    return '<select data-row="' + i + '" data-f="taxpick" data-pref="' + pref + '" style="margin-top:0">'
+      + TAX_PRESETS.map(v => '<option value="' + v + '"' + (sel === v ? ' selected' : '') + '>' + v + '%</option>').join('')
+      + '<option value="custom"' + (sel === 'custom' ? ' selected' : '') + '>custom…</option>'
+      + '</select>'
+      + (sel === 'custom'
+        ? '<input data-row="' + i + '" data-f="taxcustom" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="%" value="' + escHtml(rateStr) + '" style="margin-top:6px">'
+        : '');
+  }
+
   function rowsTableHtml(rows, token, catalog, pref) {
     return '<div class="gpinv-tablewrap"><table id="gpinv-' + pref + '-items"><thead><tr>'
-      + '<th style="width:46%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th style="text-align:right">AMOUNT</th><th></th>'
+      + '<th style="width:34%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th>DISC %</th><th>TAX</th><th style="text-align:right">AMOUNT</th><th></th>'
       + '</tr></thead><tbody>'
       + rows.map((r, i) =>
           '<tr><td>'
@@ -485,6 +585,8 @@ async function initSuite() {
           + '<input data-row="' + i + '" data-f="description" data-pref="' + pref + '" placeholder="description" value="' + escHtml(r.description) + '"></td>'
           + '<td><input data-row="' + i + '" data-f="qty" data-pref="' + pref + '" type="number" min="0" step="any" value="' + escHtml(r.qty) + '"></td>'
           + '<td><input data-row="' + i + '" data-f="unitPrice" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="0.00" value="' + escHtml(r.unitPrice) + '"></td>'
+          + '<td><input data-row="' + i + '" data-f="discPct" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="0" value="' + escHtml(r.discPct ?? '') + '"></td>'
+          + '<td style="white-space:nowrap">' + taxCellHtml(r, i, pref) + '</td>'
           + '<td style="text-align:right;white-space:nowrap" data-rowamt="' + i + '" data-pref="' + pref + '">' + fmtAmt((parseFloat(r.qty) || 0) * (parseFloat(r.unitPrice) || 0), token) + '</td>'
           + '<td style="width:1%"><button class="ghost gpinv-x" data-iact="' + pref + '-del-row" data-row="' + i + '" title="remove row">×</button></td></tr>'
         ).join('')
@@ -498,18 +600,32 @@ async function initSuite() {
     if (!tbl) return null;
     tbl.querySelectorAll('tbody tr').forEach(tr => {
       const get = f => { const el = tr.querySelector('[data-f="' + f + '"]'); return el ? el.value : ''; };
-      rows.push({ description: get('description').trim(), qty: get('qty'), unitPrice: get('unitPrice'), _pick: get('pick') });
+      const taxpick = get('taxpick') || '0';
+      rows.push({
+        description: get('description').trim(), qty: get('qty'), unitPrice: get('unitPrice'),
+        discPct: get('discPct'),
+        taxPct: taxpick === 'custom' ? get('taxcustom') : taxpick,
+        _pick: get('pick'), _taxpick: taxpick,
+      });
     });
     return rows;
   }
 
+  // v4 totals block: subtotal, total discount, one line per tax rate (rate · base ·
+  // amount), grand total. The whole block rewrites on each keystroke (no inputs inside).
+  function totalsInnerHtml(pref, t, token) {
+    return '<div>subtotal · <b>' + fmtAmt(t.subtotal, token) + '</b></div>'
+      + (t.discountAmount > 0 ? '<div>discount · −<b>' + fmtAmt(t.discountAmount, token) + '</b></div>' : '')
+      + (t.taxLines || []).map(tl =>
+          '<div>tax ' + tl.rate + '% on ' + fmtAmt(tl.base, token) + ' · <b>' + fmtAmt(tl.amount, token) + '</b></div>'
+        ).join('')
+      + '<div style="font-size:16px;margin-top:4px">total · <b>' + fmtAmt(t.total, token) + '</b> ' + token + '</div>'
+      + '<div class="status" style="margin-top:2px" id="gpinv-' + pref + '-usd"></div>';
+  }
+
   function totalsBlockHtml(pref, t, token) {
-    return '<div style="margin-top:14px;text-align:right;font-size:12px">'
-      + '<div>subtotal · <b id="gpinv-' + pref + '-sub">' + fmtAmt(t.subtotal, token) + '</b></div>'
-      + '<div id="gpinv-' + pref + '-discrow"' + (t.discountPct ? '' : ' style="display:none"') + '>discount <span id="gpinv-' + pref + '-discpct">' + (t.discountPct ?? '') + '</span>% · −<b id="gpinv-' + pref + '-disc">' + fmtAmt(t.discountAmount, token) + '</b></div>'
-      + '<div id="gpinv-' + pref + '-taxrow"' + (t.taxPct ? '' : ' style="display:none"') + '>tax <span id="gpinv-' + pref + '-taxpct">' + (t.taxPct ?? '') + '</span>% · <b id="gpinv-' + pref + '-tax">' + fmtAmt(t.taxAmount, token) + '</b></div>'
-      + '<div style="font-size:16px;margin-top:4px">total · <b id="gpinv-' + pref + '-total">' + fmtAmt(t.total, token) + '</b> <span id="gpinv-' + pref + '-tok2">' + token + '</span></div>'
-      + '<div class="status" style="margin-top:2px" id="gpinv-' + pref + '-usd"></div>'
+    return '<div style="margin-top:14px;text-align:right;font-size:12px" id="gpinv-' + pref + '-totals">'
+      + totalsInnerHtml(pref, t, token)
       + '</div>';
   }
 
@@ -518,23 +634,15 @@ async function initSuite() {
   let selfTouch = 0;
   const touchSelf = () => { selfTouch = Date.now(); };
 
-  function paintTotals(pref, rows, token, taxPct, discPct) {
+  function paintTotals(pref, rows, token) {
     touchSelf();
-    const t = computeTotals(rows, taxPct, discPct);
+    const t = computeTotals(rows, null, null);
     rows.forEach((r, i) => {
       const cell = document.querySelector('[data-rowamt="' + i + '"][data-pref="' + pref + '"]');
       if (cell) cell.textContent = fmtAmt((parseFloat(r.qty) || 0) * (parseFloat(r.unitPrice) || 0), token);
     });
-    const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-    set('gpinv-' + pref + '-sub', fmtAmt(t.subtotal, token));
-    const drow = $('gpinv-' + pref + '-discrow');
-    if (drow) drow.style.display = t.discountPct ? 'block' : 'none';
-    if (t.discountPct) { set('gpinv-' + pref + '-discpct', t.discountPct); set('gpinv-' + pref + '-disc', fmtAmt(t.discountAmount, token)); }
-    const trow = $('gpinv-' + pref + '-taxrow');
-    if (trow) trow.style.display = t.taxPct ? 'block' : 'none';
-    if (t.taxPct) { set('gpinv-' + pref + '-taxpct', t.taxPct); set('gpinv-' + pref + '-tax', fmtAmt(t.taxAmount, token)); }
-    set('gpinv-' + pref + '-total', fmtAmt(t.total, token));
-    set('gpinv-' + pref + '-tok2', token);
+    const box = $('gpinv-' + pref + '-totals');
+    if (box) box.innerHTML = totalsInnerHtml(pref, t, token);
     const usdEl = $('gpinv-' + pref + '-usd');
     if (usdEl) {
       const direct = fmtUsd(t.total, token, GP.state.ethPriceUsd);
@@ -548,21 +656,26 @@ async function initSuite() {
   }
 
   // ── invoice / estimate editor ──
+  // new rows default to the profile tax rate
+  const blankRow = () => ({ description: '', qty: 1, unitPrice: '', discPct: '', taxPct: String(loadProfile().taxPct ?? 0) });
+
   function startForm(kind, rec) {
     const p = loadProfile();
     showForm = true;
     formKind = kind;
     editId = rec ? rec.id : null;
     formRows = rec
-      ? rec.items.map(it => ({ description: it.description, qty: it.qty, unitPrice: it.unitPrice }))
-      : [{ description: '', qty: 1, unitPrice: '' }];
+      ? rec.items.map(it => ({
+          description: it.description, qty: it.qty, unitPrice: it.unitPrice,
+          taxPct: it.taxPct > 0 ? String(it.taxPct) : '0',
+          discPct: it.discountPct > 0 ? String(it.discountPct) : '',
+        }))
+      : [blankRow()];
     formDraft = {
       clientId: rec ? rec.clientId || '' : '',
       token: rec ? rec.token : p.token,
       note: rec ? rec.note : '',
       expDays: rec && rec.expiry ? Math.max(1, Math.round((rec.expiry - Date.now()) / 86400000)) : '',
-      taxPct: rec ? (rec.taxPct ?? '') : (p.taxPct ?? ''),
-      discPct: rec ? (rec.discountPct ?? '') : '',
     };
   }
 
@@ -578,13 +691,9 @@ async function initSuite() {
       + '<select id="gpinv-f-client" style="margin-top:4px"><option value="">no client</option>'
       + clients.map(c => '<option value="' + escHtml(c.id) + '"' + (d.clientId === c.id ? ' selected' : '') + '>' + escHtml(c.name) + '</option>').join('')
       + '</select>'
-      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS</div>'
+      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS · TAX RATE PER ROW, DEFAULT ' + escHtml(String(p.taxPct ?? 0)) + '% FROM YOUR PROFILE</div>'
       + rowsTableHtml(formRows, d.token, catalog, 'f')
-      + '<div class="gpinv-grid" style="margin-top:14px">'
-      + '<div><div class="gpinv-lbl">DISCOUNT % (OPTIONAL)</div><input id="gpinv-f-disc" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.discPct) + '" placeholder="e.g. 10"></div>'
-      + '<div><div class="gpinv-lbl">TAX % (OPTIONAL)</div><input id="gpinv-f-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.taxPct) + '" placeholder="' + (p.taxPct ?? 'e.g. 20') + '"></div>'
-      + '</div>'
-      + totalsBlockHtml('f', computeTotals(formRows, d.taxPct, d.discPct), d.token)
+      + totalsBlockHtml('f', computeTotals(formRows, null, null), d.token)
       + '<div class="gpinv-lbl" style="margin-top:14px">TOKEN</div>'
       + '<select id="gpinv-f-token" style="margin-top:4px">'
       + ['USDC', 'ETH'].map(t => '<option' + (d.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
@@ -602,7 +711,7 @@ async function initSuite() {
   function syncFormFromDom() {
     const rows = readRows('f');
     if (rows) formRows = rows;
-    const m = { 'gpinv-f-client': 'clientId', 'gpinv-f-token': 'token', 'gpinv-f-note': 'note', 'gpinv-f-exp': 'expDays', 'gpinv-f-tax': 'taxPct', 'gpinv-f-disc': 'discPct' };
+    const m = { 'gpinv-f-client': 'clientId', 'gpinv-f-token': 'token', 'gpinv-f-note': 'note', 'gpinv-f-exp': 'expDays' };
     for (const [id, k] of Object.entries(m)) {
       const el = $(id);
       if (el) formDraft[k] = el.value;
@@ -614,12 +723,16 @@ async function initSuite() {
     const kind = rec.kind === 'estimate' ? 'estimate' : 'invoice';
     const st = invStatus(rec);
     const memo = memos[(rec.stealthAddress || '').toLowerCase()] || '';
+    const anyDisc = rec.items.some(it => it.discountPct > 0);
     const itemRows = rec.items.map(it =>
       '<tr><td>' + escHtml(it.description || 'item') + '</td>'
       + '<td>' + escHtml(it.qty) + '</td>'
       + '<td>' + fmtAmt(it.unitPrice, rec.token) + '</td>'
+      + (anyDisc ? '<td>' + (it.discountPct > 0 ? it.discountPct + '%' : '<span class="gpinv-muted">·</span>') + '</td>' : '')
+      + '<td>' + (it.taxPct > 0 ? it.taxPct + '%' : '0%') + '</td>'
       + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
     ).join('');
+    const tls = taxLinesOf(rec);
     return '<div class="gpinv-lbl">' + kind.toUpperCase() + ' ' + escHtml(rec.number) + ' · ' + pill(st) + '</div>'
       + '<div class="gpinv-muted" style="font-size:12px">'
       + 'created ' + fmtDate(rec.created)
@@ -630,12 +743,12 @@ async function initSuite() {
       + (rec.estimateOf ? ' · converted from estimate' : '')
       + '</div>'
       + '<div class="gpinv-tablewrap" style="margin-top:12px"><table><thead><tr>'
-      + '<th style="width:46%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th style="text-align:right">AMOUNT</th>'
+      + '<th style="width:40%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th>' + (anyDisc ? '<th>DISC</th>' : '') + '<th>TAX</th><th style="text-align:right">AMOUNT</th>'
       + '</tr></thead><tbody>' + itemRows + '</tbody></table></div>'
       + '<div style="margin-top:10px;text-align:right;font-size:12px">'
       + '<div>subtotal · ' + fmtAmt(rec.subtotal, rec.token) + ' ' + rec.token + '</div>'
-      + (rec.discountPct ? '<div>discount ' + rec.discountPct + '% · −' + fmtAmt(rec.discountAmount, rec.token) + ' ' + rec.token + '</div>' : '')
-      + (rec.taxPct ? '<div>tax ' + rec.taxPct + '% · ' + fmtAmt(rec.taxAmount, rec.token) + ' ' + rec.token + '</div>' : '')
+      + (rec.discountAmount > 0 ? '<div>discount · −' + fmtAmt(rec.discountAmount, rec.token) + ' ' + rec.token + '</div>' : '')
+      + tls.map(tl => '<div>tax ' + tl.rate + '% on ' + fmtAmt(tl.base, rec.token) + ' · ' + fmtAmt(tl.amount, rec.token) + ' ' + rec.token + '</div>').join('')
       + '<div style="font-size:16px;margin-top:2px"><b>' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</b></div>'
       + '<div class="status" style="margin-top:2px" data-usd data-amt="' + rec.total + '" data-token="' + rec.token + '"></div>'
       + (st === 'PARTIAL' ? '<div class="status" style="color:#fff">paid so far · ' + fmtAmt(rec.paidAmount, rec.token) + ' ' + rec.token + ' · remaining ' + fmtAmt(round2(rec.total - rec.paidAmount), rec.token) + ' ' + rec.token + '</div>' : '')
@@ -651,6 +764,7 @@ async function initSuite() {
       + '<button class="ghost" data-iact="view" data-id="' + escHtml(rec.id) + '">VIEW LINK</button>'
       + '<button class="ghost" data-iact="qr" data-id="' + escHtml(rec.id) + '">QR</button>'
       + '<button class="ghost" data-iact="copy" data-id="' + escHtml(rec.id) + '">COPY LINK</button>'
+      + (kind === 'invoice' && st === 'OVERDUE' ? '<button class="ghost" data-iact="remind" data-id="' + escHtml(rec.id) + '">REMINDER</button>' : '')
       + '<button class="ghost" data-iact="dup" data-id="' + escHtml(rec.id) + '">DUPLICATE</button>'
       + '<button class="ghost" data-iact="print" data-id="' + escHtml(rec.id) + '">PRINT / PDF</button>'
       + (st === 'DRAFT' ? '<button class="ghost" data-iact="edit" data-id="' + escHtml(rec.id) + '">EDIT</button>' : '')
@@ -735,6 +849,8 @@ async function initSuite() {
       + '<div class="gpinv-box">'
       + '<input id="gpinv-c-name" placeholder="name" style="margin-top:0">'
       + '<input id="gpinv-c-contact" placeholder="contact (email, telegram, …)">'
+      + '<textarea id="gpinv-c-addr" rows="2" placeholder="address lines (optional, one per line: printed on invoices)"></textarea>'
+      + '<input id="gpinv-c-vat" placeholder="VAT / tax number (optional: printed under the bill-to block)">'
       + '<input id="gpinv-c-notes" placeholder="notes (optional)">'
       + '<button data-iact="add-client" style="margin-top:14px">ADD CUSTOMER</button>'
       + '<div class="status" id="gpinv-c-st"></div>'
@@ -750,6 +866,7 @@ async function initSuite() {
               const cell = m => Object.keys(m).length ? Object.keys(m).map(t => fmtAmt(m[t], t) + ' ' + t).join('<br>') : '<span class="gpinv-muted">·</span>';
               const open = i => ['SENT', 'PARTIAL', 'OVERDUE'].includes(invStatus(i, now));
               return '<tr><td><b>' + escHtml(c.name) + '</b>'
+                + (c.vatNumber ? '<div class="gpinv-muted" style="font-size:10px">tax id: ' + escHtml(c.vatNumber) + '</div>' : '')
                 + (c.notes ? '<div class="gpinv-muted" style="font-size:10px">' + escHtml(c.notes) + '</div>' : '')
                 + '</td><td>' + (c.contact ? escHtml(c.contact) : '<span class="gpinv-muted">·</span>') + '</td>'
                 + '<td style="text-align:right">' + cell(tot(open)) + '</td>'
@@ -776,6 +893,10 @@ async function initSuite() {
       + ['USDC', 'ETH'].map(t => '<option' + (itemDraft.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
       + '</select></div>'
       + '</div>'
+      + '<div class="gpinv-grid" style="margin-top:8px">'
+      + '<div><div class="gpinv-lbl">TAX % (OPTIONAL: PREFILLS THE ROW RATE)</div><input id="gpinv-i-tax" type="number" min="0" step="any" style="margin-top:4px" value="' + escHtml(itemDraft.taxPct) + '" placeholder="blank = profile rate"></div>'
+      + '<div><div class="gpinv-lbl">DISCOUNT % (OPTIONAL)</div><input id="gpinv-i-disc" type="number" min="0" step="any" style="margin-top:4px" value="' + escHtml(itemDraft.discPct) + '" placeholder="0"></div>'
+      + '</div>'
       + '<div class="gpinv-actions gpinv-sticky">'
       + '<button data-iact="save-item">' + (itemEditId ? 'SAVE ITEM' : 'ADD ITEM') + '</button>'
       + (itemEditId ? '<button class="ghost" data-iact="cancel-item">CANCEL</button>' : '')
@@ -785,11 +906,12 @@ async function initSuite() {
       + '<h3>CATALOG</h3>'
       + (items.length
         ? '<div class="gpinv-tablewrap"><table><thead><tr>'
-          + '<th>NAME</th><th>DESCRIPTION</th><th style="text-align:right">UNIT PRICE</th><th></th>'
+          + '<th>NAME</th><th>DESCRIPTION</th><th>TAX</th><th style="text-align:right">UNIT PRICE</th><th></th>'
           + '</tr></thead><tbody>'
           + items.map(it =>
               '<tr><td><b>' + escHtml(it.name) + '</b></td>'
               + '<td>' + (it.description ? escHtml(it.description) : '<span class="gpinv-muted">·</span>') + '</td>'
+              + '<td>' + (it.taxPct > 0 ? it.taxPct + '%' : '<span class="gpinv-muted">·</span>') + '</td>'
               + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(it.unitPrice, it.token) + ' ' + it.token + '</td>'
               + '<td style="width:1%;white-space:nowrap">'
               + '<button class="ghost gpinv-x" data-iact="edit-item" data-id="' + escHtml(it.id) + '" title="edit item">✎</button> '
@@ -802,21 +924,22 @@ async function initSuite() {
 
   // ── tab: RECURRING ──
   function startRecForm(rec) {
-    const p = loadProfile();
     recFormOpen = true;
     recEditId = rec ? rec.id : null;
     recRows = rec
-      ? rec.items.map(it => ({ description: it.description, qty: it.qty, unitPrice: it.unitPrice }))
-      : [{ description: '', qty: 1, unitPrice: '' }];
+      ? rec.items.map(it => ({
+          description: it.description, qty: it.qty, unitPrice: it.unitPrice,
+          taxPct: it.taxPct > 0 ? String(it.taxPct) : '0',
+          discPct: it.discountPct > 0 ? String(it.discountPct) : '',
+        }))
+      : [blankRow()];
     recDraft = {
       clientId: rec ? rec.clientId || '' : '',
-      token: rec ? rec.token : p.token,
+      token: rec ? rec.token : loadProfile().token,
       note: rec ? rec.note : '',
       everyN: rec ? rec.everyN : 1,
       unit: rec ? rec.unit : 'months',
       next: rec ? dateInputVal(rec.nextDate) : dateInputVal(nextRecurrence(Date.now(), 1, 'months')),
-      taxPct: rec ? (rec.taxPct ?? '') : (p.taxPct ?? ''),
-      discPct: rec ? (rec.discountPct ?? '') : '',
       active: rec ? rec.active !== false : true,
     };
   }
@@ -831,13 +954,9 @@ async function initSuite() {
       + '<select id="gpinv-r-client" style="margin-top:4px"><option value="">no client</option>'
       + clients.map(c => '<option value="' + escHtml(c.id) + '"' + (d.clientId === c.id ? ' selected' : '') + '>' + escHtml(c.name) + '</option>').join('')
       + '</select>'
-      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS</div>'
+      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS · TAX RATE PER ROW</div>'
       + rowsTableHtml(recRows, d.token, catalog, 'r')
-      + '<div class="gpinv-grid" style="margin-top:14px">'
-      + '<div><div class="gpinv-lbl">DISCOUNT % (OPTIONAL)</div><input id="gpinv-r-disc" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.discPct) + '"></div>'
-      + '<div><div class="gpinv-lbl">TAX % (OPTIONAL)</div><input id="gpinv-r-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.taxPct) + '"></div>'
-      + '</div>'
-      + totalsBlockHtml('r', computeTotals(recRows, d.taxPct, d.discPct), d.token)
+      + totalsBlockHtml('r', computeTotals(recRows, null, null), d.token)
       + '<div class="gpinv-lbl" style="margin-top:14px">TOKEN</div>'
       + '<select id="gpinv-r-token" style="margin-top:4px">'
       + ['USDC', 'ETH'].map(t => '<option' + (d.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
@@ -863,7 +982,7 @@ async function initSuite() {
   function syncRecFromDom() {
     const rows = readRows('r');
     if (rows) recRows = rows;
-    const m = { 'gpinv-r-client': 'clientId', 'gpinv-r-token': 'token', 'gpinv-r-note': 'note', 'gpinv-r-everyn': 'everyN', 'gpinv-r-unit': 'unit', 'gpinv-r-next': 'next', 'gpinv-r-tax': 'taxPct', 'gpinv-r-disc': 'discPct' };
+    const m = { 'gpinv-r-client': 'clientId', 'gpinv-r-token': 'token', 'gpinv-r-note': 'note', 'gpinv-r-everyn': 'everyN', 'gpinv-r-unit': 'unit', 'gpinv-r-next': 'next' };
     for (const [id, k] of Object.entries(m)) {
       const el = $(id);
       if (el) recDraft[k] = el.value;
@@ -874,22 +993,27 @@ async function initSuite() {
 
   function recDetailHtml(r) {
     const t = computeTotals(r.items, r.taxPct, r.discountPct);
-    const itemRows = r.items.map(it =>
-      '<tr><td>' + escHtml(it.description || 'item') + '</td>'
-      + '<td>' + escHtml(it.qty) + '</td>'
-      + '<td>' + fmtAmt(it.unitPrice, r.token) + '</td>'
-      + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), r.token) + '</td></tr>'
-    ).join('');
+    const anyDisc = r.items.some(it => it.discountPct > 0);
+    const itemRows = r.items.map(it => {
+      // legacy templates carry the rate at template level: show the effective row rate
+      const rate = Number.isFinite(+it.taxPct) && +it.taxPct >= 0 && it.taxPct != null && it.taxPct !== '' ? +it.taxPct : (r.taxPct > 0 ? r.taxPct : 0);
+      return '<tr><td>' + escHtml(it.description || 'item') + '</td>'
+        + '<td>' + escHtml(it.qty) + '</td>'
+        + '<td>' + fmtAmt(it.unitPrice, r.token) + '</td>'
+        + (anyDisc ? '<td>' + (it.discountPct > 0 ? it.discountPct + '%' : '<span class="gpinv-muted">·</span>') + '</td>' : '')
+        + '<td>' + rate + '%</td>'
+        + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), r.token) + '</td></tr>';
+    }).join('');
     const due = r.active && r.nextDate <= Date.now();
     return '<div class="gpinv-muted" style="font-size:12px">'
       + 'every ' + r.everyN + ' ' + r.unit + ' · next run ' + fmtDate(r.nextDate) + (due ? ' · due now' : '')
       + '</div>'
       + '<div class="gpinv-tablewrap" style="margin-top:12px"><table><thead><tr>'
-      + '<th style="width:46%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th style="text-align:right">AMOUNT</th>'
+      + '<th style="width:40%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th>' + (anyDisc ? '<th>DISC</th>' : '') + '<th>TAX</th><th style="text-align:right">AMOUNT</th>'
       + '</tr></thead><tbody>' + itemRows + '</tbody></table></div>'
       + '<div style="margin-top:10px;text-align:right;font-size:12px">'
-      + (t.discountPct ? '<div>discount ' + t.discountPct + '% · −' + fmtAmt(t.discountAmount, r.token) + ' ' + r.token + '</div>' : '')
-      + (t.taxPct ? '<div>tax ' + t.taxPct + '% · ' + fmtAmt(t.taxAmount, r.token) + ' ' + r.token + '</div>' : '')
+      + (t.discountAmount > 0 ? '<div>discount · −' + fmtAmt(t.discountAmount, r.token) + ' ' + r.token + '</div>' : '')
+      + t.taxLines.map(tl => '<div>tax ' + tl.rate + '% on ' + fmtAmt(tl.base, r.token) + ' · ' + fmtAmt(tl.amount, r.token) + ' ' + r.token + '</div>').join('')
       + '<div style="font-size:16px;margin-top:2px"><b>' + fmtAmt(t.total, r.token) + ' ' + r.token + '</b> per run</div>'
       + '</div>'
       + (r.note ? '<div class="status">note: ' + escHtml(r.note) + '</div>' : '')
@@ -951,10 +1075,11 @@ async function initSuite() {
       + '<div class="gpinv-lbl" style="margin-top:12px">FROM / CONTACT LINE</div><input id="gpinv-p-contact" style="margin-top:4px" value="' + escHtml(p.contact) + '" placeholder="e.g. ben@ghoststudio.eth">'
       + '<div class="gpinv-lbl" style="margin-top:12px">ADDRESS LINES (ONE PER LINE: PRINTED ON DOCUMENTS)</div>'
       + '<textarea id="gpinv-p-addr" rows="3" style="margin-top:4px" placeholder="1 Ghost Lane&#10;Berlin">' + escHtml(p.addressLines.join('\n')) + '</textarea>'
+      + '<div class="gpinv-lbl" style="margin-top:12px">VAT / TAX NUMBER (OPTIONAL: PRINTED UNDER YOUR ADDRESS)</div><input id="gpinv-p-vat" style="margin-top:4px" value="' + escHtml(p.taxNumber) + '" placeholder="e.g. NL123456789B01">'
       + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT TOKEN</div><select id="gpinv-p-token" style="margin-top:4px">'
       + ['USDC', 'ETH'].map(t => '<option' + (p.token === t ? ' selected' : '') + '>' + t + '</option>').join('') + '</select>'
       + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT PAYMENT TERMS</div><input id="gpinv-p-terms" style="margin-top:4px" value="' + escHtml(p.terms) + '" placeholder="payment due on receipt">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">TAX % (OPTIONAL: SHOWN AS ITS OWN LINE)</div><input id="gpinv-p-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + (p.taxPct ?? '') + '" placeholder="e.g. 20">'
+      + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT TAX % (OPTIONAL: PREFILLS EVERY NEW ROW RATE)</div><input id="gpinv-p-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + (p.taxPct ?? '') + '" placeholder="e.g. 21">'
       + '<div class="gpinv-lbl" style="margin-top:12px">ACCENT COLOR (OPTIONAL HEX: STAMPS PRINTED DOCUMENTS)</div><input id="gpinv-p-accent" style="margin-top:4px" value="' + escHtml(p.accentColor || '') + '" placeholder="#fff · blank = plain black and white">'
       + '<div class="gpinv-lbl" style="margin-top:12px">FOOTER NOTE (PRINTED AT THE BOTTOM OF EVERY DOCUMENT)</div><input id="gpinv-p-footer" style="margin-top:4px" value="' + escHtml(p.footerNote) + '" placeholder="e.g. thank you for your business">'
       + '<button data-iact="save-profile" style="margin-top:14px">SAVE PROFILE</button>'
@@ -1016,6 +1141,20 @@ async function initSuite() {
   }
 
   // ── persistence ──
+  // form rows → stored v4 line items: explicit per-line tax rate (0 allowed) and
+  // optional per-line discount
+  const rowsToItems = rows => rows.map(r => {
+    const rate = parseFloat(r.taxPct);
+    const dp = parseFloat(r.discPct);
+    return {
+      description: (r.description || '').trim() || 'item',
+      qty: parseFloat(r.qty),
+      unitPrice: parseFloat(r.unitPrice),
+      taxPct: Number.isFinite(rate) && rate > 0 ? rate : 0,
+      discountPct: Number.isFinite(dp) && dp > 0 ? dp : null,
+    };
+  });
+
   function saveForm() {
     const kind = formKind;
     const st = m => { const el = $('gpinv-f-st'); if (el) el.textContent = m; };
@@ -1028,8 +1167,8 @@ async function initSuite() {
     const days = parseFloat(formDraft.expDays);
     const clientId = formDraft.clientId || null;
     const client = clientId ? loadClients().find(c => c.id === clientId) : null;
-    const items = rows.map(r => ({ description: (r.description || '').trim() || 'item', qty: parseFloat(r.qty), unitPrice: parseFloat(r.unitPrice) }));
-    const t = computeTotals(items, formDraft.taxPct, formDraft.discPct);
+    const items = rowsToItems(rows);
+    const t = computeTotals(items, null, null);
     const expiry = Number.isFinite(days) && days > 0 ? Date.now() + Math.round(days * 86400000) : null;
     const reg = kind === 'estimate' ? loadEst() : loadInv();
     const save = kind === 'estimate' ? saveEst : saveInv;
@@ -1039,8 +1178,8 @@ async function initSuite() {
       if (!rec) { st('record not found.'); return; }
       Object.assign(rec, {
         clientId, clientName: client ? client.name : '', items, token,
-        subtotal: t.subtotal, taxPct: t.taxPct, taxAmount: t.taxAmount,
-        discountPct: t.discountPct, discountAmount: t.discountAmount, total: t.total,
+        subtotal: t.subtotal, taxPct: null, taxAmount: t.taxAmount, taxLines: t.taxLines,
+        discountPct: null, discountAmount: t.discountAmount, total: t.total,
         note, expiry,
       });
       const pin = parsePinned(rec.url);
@@ -1058,11 +1197,11 @@ async function initSuite() {
       const id = (kind === 'estimate' ? 'est-' : 'inv-') + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36);
       const url = buildUrl({ amount: fmtAmt(t.total, token), token, note, id, number: a.number, expiry, st: d.stealth, eph: d.ephPub, vt: d.viewTag });
       reg.push({
-        v: 3, id, number: a.number,
+        v: 4, id, number: a.number,
         clientId, clientName: client ? client.name : '',
         items, token,
-        subtotal: t.subtotal, taxPct: t.taxPct, taxAmount: t.taxAmount,
-        discountPct: t.discountPct, discountAmount: t.discountAmount, total: t.total,
+        subtotal: t.subtotal, taxPct: null, taxAmount: t.taxAmount, taxLines: t.taxLines,
+        discountPct: null, discountAmount: t.discountAmount, total: t.total,
         note, stealthAddress: d.stealth, created: Date.now(), url, expiry,
         status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null, paidAmount: null,
         estimateOf: null, kind,
@@ -1115,12 +1254,13 @@ async function initSuite() {
     const url = buildUrl({ amount: fmtAmt(est.total, est.token), token: est.token, note: est.note, id, number: a.number, expiry: null, st: d.stealth, eph: d.ephPub, vt: d.viewTag });
     const inv = loadInv();
     inv.push({
-      v: 3, id, number: a.number,
+      v: 4, id, number: a.number,
       clientId: est.clientId, clientName: est.clientName,
       items: est.items.map(it => ({ ...it })),
       token: est.token,
-      subtotal: est.subtotal, taxPct: est.taxPct ?? null, taxAmount: est.taxAmount || 0,
-      discountPct: est.discountPct ?? null, discountAmount: est.discountAmount || 0, total: est.total,
+      subtotal: est.subtotal, taxPct: null, taxAmount: est.taxAmount || 0,
+      taxLines: taxLinesOf(est),
+      discountPct: null, discountAmount: est.discountAmount || 0, total: est.total,
       note: est.note, stealthAddress: d.stealth, created: Date.now(), url, expiry: null,
       status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null, paidAmount: null,
       estimateOf: est.id, kind: 'invoice',
@@ -1142,19 +1282,16 @@ async function initSuite() {
     if (!rows.length) { st('add at least one line item with qty and unit price.'); return; }
     const clientId = recDraft.clientId || null;
     const client = clientId ? loadClients().find(c => c.id === clientId) : null;
-    const items = rows.map(r => ({ description: (r.description || '').trim() || 'item', qty: parseFloat(r.qty), unitPrice: parseFloat(r.unitPrice) }));
+    const items = rowsToItems(rows);
     const everyN = Math.max(1, Math.floor(parseFloat(recDraft.everyN) || 1));
     const unit = recDraft.unit === 'months' ? 'months' : 'weeks';
     const nextDate = recDraft.next ? new Date(recDraft.next + 'T00:00:00').getTime() : Date.now();
     if (!Number.isFinite(nextDate)) { st('pick a valid next run date.'); return; }
-    const tax = parseFloat(recDraft.taxPct);
-    const disc = parseFloat(recDraft.discPct);
     const list = loadRecurring();
     const fields = {
       clientId, clientName: client ? client.name : '',
       items, token: recDraft.token === 'ETH' ? 'ETH' : 'USDC',
-      taxPct: Number.isFinite(tax) && tax > 0 ? tax : null,
-      discountPct: Number.isFinite(disc) && disc > 0 ? disc : null,
+      taxPct: null, discountPct: null,
       note: (recDraft.note || '').trim(),
       everyN, unit, nextDate,
       active: recDraft.active !== false,
@@ -1175,11 +1312,16 @@ async function initSuite() {
   }
 
   // GENERATE NOW: one invoice from the template (fresh stealth address, next number),
-  // then nextDate advances by exactly one period.
+  // then nextDate advances by exactly one period. Legacy templates carry the rate at
+  // template level: fold it into the line items so the invoice is fully v4.
   function generateFromTemplate(rec) {
     if (!GP.state.unlocked || !GP.state.meta) { GP.toast('generate your stealth keys first (step 2)'); return; }
-    const items = rec.items.map(it => ({ ...it }));
-    const t = computeTotals(items, rec.taxPct, rec.discountPct);
+    const items = rec.items.map(it => ({
+      ...it,
+      taxPct: Number.isFinite(+it.taxPct) && +it.taxPct >= 0 && it.taxPct !== '' && it.taxPct != null ? +it.taxPct : (rec.taxPct > 0 ? rec.taxPct : 0),
+      discountPct: Number.isFinite(+it.discountPct) && +it.discountPct > 0 ? +it.discountPct : (rec.discountPct > 0 ? rec.discountPct : null),
+    }));
+    const t = computeTotals(items, null, null);
     const profile = loadProfile();
     const a = allocateNumber(profile);
     profile.next = a.next;
@@ -1189,11 +1331,11 @@ async function initSuite() {
     const url = buildUrl({ amount: fmtAmt(t.total, rec.token), token: rec.token, note: rec.note, id, number: a.number, expiry: null, st: d.stealth, eph: d.ephPub, vt: d.viewTag });
     const inv = loadInv();
     inv.push({
-      v: 3, id, number: a.number,
+      v: 4, id, number: a.number,
       clientId: rec.clientId, clientName: rec.clientName,
       items, token: rec.token,
-      subtotal: t.subtotal, taxPct: t.taxPct, taxAmount: t.taxAmount,
-      discountPct: t.discountPct, discountAmount: t.discountAmount, total: t.total,
+      subtotal: t.subtotal, taxPct: null, taxAmount: t.taxAmount, taxLines: t.taxLines,
+      discountPct: null, discountAmount: t.discountAmount, total: t.total,
       note: rec.note || '', stealthAddress: d.stealth, created: Date.now(), url, expiry: null,
       status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null, paidAmount: null,
       estimateOf: null, kind: 'invoice',
@@ -1235,25 +1377,26 @@ async function initSuite() {
       return;
     }
     if (act === 'save-form') { saveForm(); return; }
-    if (act === 'f-add-row') { syncFormFromDom(); formRows.push({ description: '', qty: 1, unitPrice: '' }); renderAll(); return; }
+    if (act === 'f-add-row') { syncFormFromDom(); formRows.push(blankRow()); renderAll(); return; }
     if (act === 'f-del-row') {
       syncFormFromDom();
       formRows.splice(Number(el.dataset.row), 1);
-      if (!formRows.length) formRows.push({ description: '', qty: 1, unitPrice: '' });
+      if (!formRows.length) formRows.push(blankRow());
       renderAll();
       return;
     }
-    if (act === 'r-add-row') { syncRecFromDom(); recRows.push({ description: '', qty: 1, unitPrice: '' }); renderAll(); return; }
+    if (act === 'r-add-row') { syncRecFromDom(); recRows.push(blankRow()); renderAll(); return; }
     if (act === 'r-del-row') {
       syncRecFromDom();
       recRows.splice(Number(el.dataset.row), 1);
-      if (!recRows.length) recRows.push({ description: '', qty: 1, unitPrice: '' });
+      if (!recRows.length) recRows.push(blankRow());
       renderAll();
       return;
     }
     if (act === 'open') { openId = openId === id ? null : id; if (qrFor !== openId) qrFor = null; renderAll(); return; }
     if (act === 'qr') { openId = id; qrFor = qrFor === id ? null : id; renderAll(); return; }
     if (act === 'copy' && rec) { copyBtn(rec.url, el, 'COPY LINK'); return; }
+    if (act === 'remind' && rec) { copyBtn(reminderText(rec, loadProfile()), el, 'REMINDER'); return; }
     if (act === 'view' && rec) { window.open(rec.url, '_blank', 'noopener'); return; }
     if (act === 'print' && rec) { printInvoice(rec); return; }
     if (act === 'edit' && rec && invStatus(rec) === 'DRAFT') {
@@ -1294,7 +1437,13 @@ async function initSuite() {
       const name = $('gpinv-c-name').value.trim();
       if (!name) { $('gpinv-c-st').textContent = 'enter a name.'; return; }
       const clients = loadClients();
-      clients.push({ id: 'cl-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36), name, contact: $('gpinv-c-contact').value.trim(), notes: $('gpinv-c-notes').value.trim(), created: Date.now() });
+      clients.push({
+        id: 'cl-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36),
+        name, contact: $('gpinv-c-contact').value.trim(),
+        addressLines: $('gpinv-c-addr').value.split('\n').map(s => s.trim()).filter(Boolean),
+        vatNumber: $('gpinv-c-vat').value.trim(),
+        notes: $('gpinv-c-notes').value.trim(), created: Date.now(),
+      });
       saveClients(clients); renderAll();
       GP.toast('customer added: ' + name);
       return;
@@ -1310,8 +1459,15 @@ async function initSuite() {
       const price = parseFloat($('gpinv-i-price').value);
       if (!name) { stEl.textContent = 'enter an item name.'; return; }
       if (!Number.isFinite(price) || price <= 0) { stEl.textContent = 'enter a unit price above zero.'; return; }
+      const tax = parseFloat($('gpinv-i-tax').value);
+      const disc = parseFloat($('gpinv-i-disc').value);
       const items = loadItems();
-      const fields = { name, description: ($('gpinv-i-desc').value || '').trim(), unitPrice: price, token: $('gpinv-i-token').value === 'ETH' ? 'ETH' : 'USDC' };
+      const fields = {
+        name, description: ($('gpinv-i-desc').value || '').trim(), unitPrice: price,
+        token: $('gpinv-i-token').value === 'ETH' ? 'ETH' : 'USDC',
+        taxPct: Number.isFinite(tax) && tax >= 0 && $('gpinv-i-tax').value.trim() !== '' ? tax : null,
+        discountPct: Number.isFinite(disc) && disc > 0 ? disc : null,
+      };
       if (itemEditId) {
         const it = items.find(x => x.id === itemEditId);
         if (it) Object.assign(it, fields);
@@ -1322,25 +1478,32 @@ async function initSuite() {
       }
       saveItems(items);
       itemEditId = null;
-      itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token };
+      itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token, taxPct: '', discPct: '' };
       renderAll();
       return;
     }
     if (act === 'edit-item') {
       const it = loadItems().find(x => x.id === id);
-      if (it) { itemEditId = it.id; itemDraft = { name: it.name, description: it.description || '', unitPrice: it.unitPrice, token: it.token }; }
+      if (it) {
+        itemEditId = it.id;
+        itemDraft = {
+          name: it.name, description: it.description || '', unitPrice: it.unitPrice, token: it.token,
+          taxPct: it.taxPct != null ? String(it.taxPct) : '',
+          discPct: it.discountPct > 0 ? String(it.discountPct) : '',
+        };
+      }
       renderAll();
       return;
     }
     if (act === 'cancel-item') {
       itemEditId = null;
-      itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token };
+      itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token, taxPct: '', discPct: '' };
       renderAll();
       return;
     }
     if (act === 'del-item') {
       saveItems(loadItems().filter(x => x.id !== id));
-      if (itemEditId === id) { itemEditId = null; itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token }; }
+      if (itemEditId === id) { itemEditId = null; itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token, taxPct: '', discPct: '' }; }
       renderAll();
       return;
     }
@@ -1383,6 +1546,7 @@ async function initSuite() {
       p.name = $('gpinv-p-name').value.trim();
       p.contact = $('gpinv-p-contact').value.trim();
       p.addressLines = $('gpinv-p-addr').value.split('\n').map(s => s.trim()).filter(Boolean);
+      p.taxNumber = $('gpinv-p-vat').value.trim();
       p.token = $('gpinv-p-token').value === 'ETH' ? 'ETH' : 'USDC';
       p.prefix = $('gpinv-p-prefix').value.trim() || 'GP-';
       p.next = Math.max(1, Math.floor(parseFloat($('gpinv-p-next').value) || 1));
@@ -1405,16 +1569,16 @@ async function initSuite() {
   document.addEventListener('input', e => {
     const t = e.target;
     if (!t.closest || !t.closest('#gp-invoices')) return;
-    if (t.closest('#gpinv-f-items') || ['gpinv-f-client', 'gpinv-f-token', 'gpinv-f-note', 'gpinv-f-exp', 'gpinv-f-tax', 'gpinv-f-disc'].includes(t.id)) {
+    if (t.closest('#gpinv-f-items') || ['gpinv-f-client', 'gpinv-f-token', 'gpinv-f-note', 'gpinv-f-exp'].includes(t.id)) {
       syncFormFromDom();
-      paintTotals('f', formRows, formDraft.token, formDraft.taxPct, formDraft.discPct);
+      paintTotals('f', formRows, formDraft.token);
     }
-    if (t.closest('#gpinv-r-items') || ['gpinv-r-client', 'gpinv-r-token', 'gpinv-r-note', 'gpinv-r-everyn', 'gpinv-r-unit', 'gpinv-r-next', 'gpinv-r-tax', 'gpinv-r-disc'].includes(t.id)) {
+    if (t.closest('#gpinv-r-items') || ['gpinv-r-client', 'gpinv-r-token', 'gpinv-r-note', 'gpinv-r-everyn', 'gpinv-r-unit', 'gpinv-r-next'].includes(t.id)) {
       syncRecFromDom();
-      paintTotals('r', recRows, recDraft.token, recDraft.taxPct, recDraft.discPct);
+      paintTotals('r', recRows, recDraft.token);
     }
-    if (['gpinv-i-name', 'gpinv-i-desc', 'gpinv-i-price', 'gpinv-i-token'].includes(t.id)) {
-      itemDraft = { name: $('gpinv-i-name').value, description: $('gpinv-i-desc').value, unitPrice: $('gpinv-i-price').value, token: $('gpinv-i-token').value };
+    if (['gpinv-i-name', 'gpinv-i-desc', 'gpinv-i-price', 'gpinv-i-token', 'gpinv-i-tax', 'gpinv-i-disc'].includes(t.id)) {
+      itemDraft = { name: $('gpinv-i-name').value, description: $('gpinv-i-desc').value, unitPrice: $('gpinv-i-price').value, token: $('gpinv-i-token').value, taxPct: $('gpinv-i-tax').value, discPct: $('gpinv-i-disc').value };
     }
     if (t.id === 'gpinv-ensname') {
       const n = t.value.trim().toLowerCase();
@@ -1444,13 +1608,22 @@ async function initSuite() {
           row.description = cat.description || cat.name;
           row.unitPrice = cat.unitPrice;
           if (cat.token && cat.token !== draft.token) draft.token = cat.token;
+          // catalog defaults prefill the row rate; blank keeps the current (profile) rate
+          if (cat.taxPct != null) { row.taxPct = String(cat.taxPct); row._taxpick = undefined; }
+          if (cat.discountPct > 0) row.discPct = String(cat.discountPct);
         }
       }
       renderAll();
       return;
     }
-    if (['gpinv-f-client', 'gpinv-f-token'].includes(t.id)) { syncFormFromDom(); paintTotals('f', formRows, formDraft.token, formDraft.taxPct, formDraft.discPct); }
-    if (['gpinv-r-client', 'gpinv-r-token', 'gpinv-r-unit', 'gpinv-r-next', 'gpinv-r-active'].includes(t.id)) { syncRecFromDom(); paintTotals('r', recRows, recDraft.token, recDraft.taxPct, recDraft.discPct); }
+    // tax rate picker: custom reveals a free-form % input, so the table re-renders
+    if (t.dataset && t.dataset.f === 'taxpick') {
+      if (t.dataset.pref === 'r') syncRecFromDom(); else syncFormFromDom();
+      renderAll();
+      return;
+    }
+    if (['gpinv-f-client', 'gpinv-f-token'].includes(t.id)) { syncFormFromDom(); paintTotals('f', formRows, formDraft.token); }
+    if (['gpinv-r-client', 'gpinv-r-token', 'gpinv-r-unit', 'gpinv-r-next', 'gpinv-r-active'].includes(t.id)) { syncRecFromDom(); paintTotals('r', recRows, recDraft.token); }
     if (t.id === 'gpinv-i-token') itemDraft.token = t.value;
   });
 
@@ -1477,12 +1650,18 @@ async function initSuite() {
     const st = invStatus(i);
     const memo = memos[(i.stealthAddress || '').toLowerCase()] || '';
     const accent = p.accentColor || '#000';
+    const client = i.clientId ? loadClients().find(c => c.id === i.clientId) : null;
+    const clientAddr = client && Array.isArray(client.addressLines) ? client.addressLines.filter(Boolean) : [];
+    const anyDisc = i.items.some(it => it.discountPct > 0);
     const rows = i.items.map(it =>
       '<tr><td>' + escHtml(it.description || 'item') + '</td>'
       + '<td class="r">' + escHtml(it.qty) + '</td>'
       + '<td class="r">' + fmtAmt(it.unitPrice, i.token) + '</td>'
+      + (anyDisc ? '<td class="r">' + (it.discountPct > 0 ? it.discountPct + '%' : '·') + '</td>' : '')
+      + '<td class="r">' + (it.taxPct > 0 ? it.taxPct + '%' : '0%') + '</td>'
       + '<td class="r">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), i.token) + '</td></tr>'
     ).join('');
+    const tls = taxLinesOf(i);
     w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + kind + ' ' + escHtml(i.number) + '</title>'
       + '<style>body{font-family:\'IBM Plex Mono\',monospace;background:#fff;color:#000;padding:40px;font-size:12px;line-height:1.6;max-width:640px;margin:0 auto}'
       + '.top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #000;padding-bottom:20px}'
@@ -1499,16 +1678,21 @@ async function initSuite() {
       + '<div class="top"><div><div class="mg">' + escHtml(monogram(p.name)) + '</div>'
       + '<div class="biz">' + escHtml(p.name || 'GHOSTPAY') + '</div>'
       + (p.contact ? '<div class="muted">' + escHtml(p.contact) + '</div>' : '')
-      + p.addressLines.map(l => '<div class="muted">' + escHtml(l) + '</div>').join('') + '</div>'
+      + p.addressLines.map(l => '<div class="muted">' + escHtml(l) + '</div>').join('')
+      + (p.taxNumber ? '<div class="muted">tax id: ' + escHtml(p.taxNumber) + '</div>' : '') + '</div>'
       + '<div><h1>' + kind.toUpperCase() + '</h1><div class="num"><b>' + escHtml(i.number) + '</b></div>'
       + '<div class="num">date: ' + fmtDate(i.created) + '</div>'
       + (i.expiry ? '<div class="num">' + (kind === 'invoice' ? 'due' : 'valid until') + ': ' + fmtDate(i.expiry) + '</div>' : '') + '</div></div>'
-      + (i.clientName ? '<div style="margin-top:20px"><div class="muted">BILL TO</div><b>' + escHtml(i.clientName) + '</b></div>' : '')
-      + '<table><thead><tr><th style="width:50%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th><th class="r">AMOUNT</th></tr></thead>'
+      + (i.clientName ? '<div style="margin-top:20px"><div class="muted">BILL TO</div><b>' + escHtml(i.clientName) + '</b>'
+        + (client && client.contact ? '<div class="muted">' + escHtml(client.contact) + '</div>' : '')
+        + clientAddr.map(l => '<div class="muted">' + escHtml(l) + '</div>').join('')
+        + (client && client.vatNumber ? '<div class="muted">tax id: ' + escHtml(client.vatNumber) + '</div>' : '')
+        + '</div>' : '')
+      + '<table><thead><tr><th style="width:44%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th>' + (anyDisc ? '<th class="r">DISC</th>' : '') + '<th class="r">TAX</th><th class="r">AMOUNT</th></tr></thead>'
       + '<tbody>' + rows + '</tbody></table>'
       + '<div class="tot"><div>subtotal · ' + fmtAmt(i.subtotal, i.token) + ' ' + i.token + '</div>'
-      + (i.discountPct ? '<div>discount ' + i.discountPct + '% · −' + fmtAmt(i.discountAmount, i.token) + ' ' + i.token + '</div>' : '')
-      + (i.taxPct ? '<div>tax ' + i.taxPct + '% · ' + fmtAmt(i.taxAmount, i.token) + ' ' + i.token + '</div>' : '')
+      + (i.discountAmount > 0 ? '<div>discount · −' + fmtAmt(i.discountAmount, i.token) + ' ' + i.token + '</div>' : '')
+      + tls.map(tl => '<div>tax ' + tl.rate + '% on ' + fmtAmt(tl.base, i.token) + ' · ' + fmtAmt(tl.amount, i.token) + ' ' + i.token + '</div>').join('')
       + '<div class="grand">total · ' + fmtAmt(i.total, i.token) + ' ' + i.token + '</div></div>'
       + (st === 'PAID' ? '<div style="text-align:right"><span class="stamp">PAID</span></div>' : '')
       + '<div class="pay"><img src="' + qr + '" alt="payment QR"><div>'

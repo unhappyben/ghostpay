@@ -1,4 +1,4 @@
-<!-- GHOSTPAY dashboard + reports fragment.
+<!-- GHOSTPAY dashboard + reports fragment (storage schema v4).
      Scoped styles for the #tab-dashboard / #tab-reports mounts on invoices.html, layered
      on the gp-ui.css primitives (gp-card, gp-table, gp-pill, gp-label, gp-muted).
      Pasting this block into the page is optional: gp-reports.mjs renders straight into
@@ -7,15 +7,19 @@
 <style id="gpr-styles">
   #tab-dashboard .gpr-cards { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
   #tab-dashboard .gpr-stat { margin-top:0; padding:14px; }
+  /* stat cards: big number on top, small label underneath (never an empty box) */
+  #tab-dashboard .gpr-stat .gp-label { margin:8px 0 0; }
   #tab-dashboard .gpr-big, #tab-reports .gpr-big { font-size:20px; font-weight:700; letter-spacing:-.5px; }
   #tab-dashboard .gpr-unit, #tab-reports .gpr-unit { font-size:11px; color:var(--gp-muted); letter-spacing:.1em; }
-  #tab-dashboard .gpr-barrow { display:flex; align-items:center; gap:10px; margin-top:8px; font-size:11px; }
+  /* aging: flat horizontal bars (no bordered input look), amounts always visible */
+  #tab-dashboard .gpr-barrow { display:flex; align-items:center; gap:10px; margin-top:10px; font-size:11px; }
   #tab-dashboard .gpr-barrow:first-child { margin-top:0; }
   #tab-dashboard .gpr-barlbl { width:64px; flex:none; color:var(--gp-muted); letter-spacing:.15em; font-size:10px; }
-  #tab-dashboard .gpr-bar { flex:1; height:12px; border:1px solid var(--gp-line); }
+  #tab-dashboard .gpr-bar { flex:1; height:14px; background:#161616; }
   #tab-dashboard .gpr-barfill { height:100%; background:var(--gp-fg); }
   #tab-dashboard .gpr-barfill.dim { background:var(--gp-faint); }
-  #tab-dashboard .gpr-barval { flex:none; min-width:120px; text-align:right; }
+  #tab-dashboard .gpr-barval { flex:none; min-width:150px; text-align:right; color:var(--gp-muted); }
+  #tab-dashboard .gpr-barval b { color:var(--gp-fg); font-weight:700; }
   #tab-dashboard .gpr-split { display:grid; grid-template-columns:3fr 2fr; gap:18px; margin-top:24px; }
   #tab-dashboard .gpr-section, #tab-reports .gpr-section { font-size:11px; letter-spacing:.25em;
     color:var(--gp-muted); margin:24px 0 10px; }

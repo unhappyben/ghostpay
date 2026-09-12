@@ -1,14 +1,15 @@
 /* gp-ui.css · GHOSTPAY shared design system: fixed top nav, layout + card/table/pill
    primitives, invoice suite tab shell. Monochrome first. --gp-accent may be set from
    localStorage gp-profile accentColor by a one-line inline script on each page; the
-   default stays white, so no script means pure monochrome. */
+   default stays bone, so no script means pure monochrome. Palette: bone white on warm
+   off-black, never pure #000/#fff. */
 :root {
-  --gp-bg: #000;
-  --gp-fg: #fff;
-  --gp-muted: #888;
-  --gp-faint: #555;
-  --gp-line: #333;
-  --gp-accent: #fff;
+  --gp-bg: #14120f;      /* warm off-black */
+  --gp-fg: #ece7db;      /* bone white */
+  --gp-muted: #a39e92;
+  --gp-faint: #6b665b;
+  --gp-line: #3a362e;
+  --gp-accent: #ece7db;
   --gp-nav-h: 48px;
 }
 
@@ -24,7 +25,7 @@ body { padding-top: var(--gp-nav-h); }
 .gp-nav-link { color: var(--gp-muted); text-decoration: none; font-size: 11px;
   letter-spacing: .15em; padding: 8px 14px; border: 1px solid transparent; }
 .gp-nav-link:hover { color: var(--gp-fg); border-color: var(--gp-line); }
-.gp-nav-link.on { background: var(--gp-accent); color: #000; font-weight: 700; }
+.gp-nav-link.on { background: var(--gp-accent); color: var(--gp-bg); font-weight: 700; }
 
 /* visible focus everywhere, monochrome (or the accent when one is set) */
 a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
@@ -37,9 +38,26 @@ textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
 .gp-label { font-size: 10px; letter-spacing: .2em; color: var(--gp-muted); margin-bottom: 6px; }
 .gp-muted { color: var(--gp-muted); }
 
-/* dark bordered card: companion to the inverted white .card the flow pages already use */
+/* dark bordered card: companion to the inverted bone .card the flow pages already use */
 .gp-card { border: 1px solid var(--gp-line); padding: 22px; margin-top: 14px; }
 .gp-card.on { border-color: var(--gp-fg); }
+
+/* stat card: big number + small label (invoice dashboard) */
+.gp-stat { border: 1px solid var(--gp-line); padding: 14px 16px; }
+.gp-stat-num { font-size: 22px; font-weight: 700; letter-spacing: -.5px; }
+.gp-stat-num .gp-stat-unit { font-size: 11px; font-weight: 400; color: var(--gp-muted);
+  letter-spacing: .1em; }
+.gp-stat-label { font-size: 10px; letter-spacing: .2em; color: var(--gp-muted); margin-bottom: 6px; }
+
+/* horizontal bar with a visible amount (invoice dashboard) */
+.gp-bar { display: flex; align-items: center; gap: 10px; font-size: 11px; margin-top: 8px; }
+.gp-bar:first-child { margin-top: 0; }
+.gp-bar-label { width: 64px; flex: none; color: var(--gp-muted); letter-spacing: .15em;
+  font-size: 10px; }
+.gp-bar-track { flex: 1; height: 12px; border: 1px solid var(--gp-line); }
+.gp-bar-fill { height: 100%; background: var(--gp-fg); }
+.gp-bar-fill.dim { background: var(--gp-faint); }
+.gp-bar-val { flex: none; min-width: 96px; text-align: right; }
 
 /* tables */
 .gp-tablewrap { overflow-x: auto; }
@@ -47,21 +65,26 @@ textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
 .gp-table th { text-align: left; font-size: 10px; letter-spacing: .2em; color: var(--gp-muted);
   font-weight: 400; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--gp-line);
   white-space: nowrap; }
-.gp-table td { padding: 12px 12px 12px 0; border-bottom: 1px solid #1c1c1c; vertical-align: top; }
+.gp-table td { padding: 12px 12px 12px 0; border-bottom: 1px solid #26231d; vertical-align: top; }
 
 /* pills */
 .gp-pill { display: inline-block; border: 1px solid var(--gp-fg); padding: 2px 8px;
   font-size: 10px; letter-spacing: .15em; white-space: nowrap; }
-.gp-pill.dim { border-color: #444; color: var(--gp-muted); }
+.gp-pill.dim { border-color: #4b473f; color: var(--gp-muted); }
 
-/* ── invoice suite tab shell (invoices.html, #gp-invoices) ── */
-.gp-tabs { display: flex; flex-wrap: wrap; border: 1px solid var(--gp-line); margin-top: 16px; }
+/* ── invoice suite tab shell (invoices.html, #gp-invoices): one row that scrolls
+   horizontally instead of wrapping, with a thin scrollbar ── */
+.gp-tabs { display: flex; flex-wrap: nowrap; overflow-x: auto; border: 1px solid var(--gp-line);
+  margin-top: 16px; scrollbar-width: thin; scrollbar-color: var(--gp-line) transparent; }
+.gp-tabs::-webkit-scrollbar { height: 4px; }
+.gp-tabs::-webkit-scrollbar-track { background: transparent; }
+.gp-tabs::-webkit-scrollbar-thumb { background: var(--gp-line); }
 .gp-tab { background: var(--gp-bg); color: var(--gp-muted); border: 0;
   border-right: 1px solid var(--gp-line); padding: 12px 10px; font-size: 10px;
-  letter-spacing: .15em; font-weight: 400; flex: 1 1 auto; width: auto; }
+  letter-spacing: .15em; font-weight: 400; flex: 1 0 auto; width: auto; white-space: nowrap; }
 .gp-tab:last-child { border-right: 0; }
 .gp-tab:hover { color: var(--gp-fg); }
-.gp-tab.on { background: var(--gp-accent); color: #000; font-weight: 700; }
+.gp-tab.on { background: var(--gp-accent); color: var(--gp-bg); font-weight: 700; }
 .gp-tabpane { padding: 22px 0 8px; }
 
 @media (max-width: 700px) {

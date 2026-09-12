@@ -1,32 +1,32 @@
 // gp-reports.mjs · GHOSTPAY dashboard, reports and print documents (docs/GP-API.md).
 // Renders into #tab-dashboard / #tab-reports on invoices.html (the shell's gp-tabpane
-// mounts) over the schema v3 localStorage registries (gp-profile, gp-clients, gp-items,
+// mounts) over the schema v4 localStorage registries (gp-profile, gp-clients, gp-items,
 // gp-invoices, gp-estimates). Storage is read-only here: status changes belong to
 // gp-invoices.mjs, this module only derives them. Markup builds on the gp-ui.css
 // primitives; the extra scoped styles live in frag-reports.html and are self-injected
 // when that fragment was not pasted into the page. Also installs window.GPINVPrint,
 // the print-document builder gp-invoices.mjs defers to when present. Pure helpers are
-// exported so a node smoke test can exercise aging buckets, sales-by-month and
-// PARTIAL/OVERDUE derivation without a DOM.
+// exported so a node smoke test can exercise aging buckets, sales-by-month, the tax
+// report and PARTIAL/OVERDUE derivation without a DOM.
 
 let GP = typeof window !== 'undefined' ? window.GP || null : null;
 
-// ── schema v3 registries (read-only in this module) ──
+// ── schema v4 registries (read-only in this module) ──
 const INV_KEY = 'gp-invoices';
 const EST_KEY = 'gp-estimates';
 const PROFILE_KEY = 'gp-profile';
 const CLIENTS_KEY = 'gp-clients';
 
-export const DEFAULT_PROFILE_V3 = {
+export const DEFAULT_PROFILE_V4 = {
   name: '', contact: '', addressLines: [], token: 'USDC', prefix: 'GP-', next: 1,
-  terms: 'payment due on receipt', taxPct: null, accentColor: '', footerNote: '',
+  terms: 'payment due on receipt', taxPct: null, taxNumber: '', accentColor: '', footerNote: '',
 };
 
 const lsGet = (k, d) => {
   if (typeof localStorage === 'undefined') return d;
   try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; }
 };
-const loadProfile = () => ({ ...DEFAULT_PROFILE_V3, ...lsGet(PROFILE_KEY, {}) });
+const loadProfile = () => ({ ...DEFAULT_PROFILE_V4, ...lsGet(PROFILE_KEY, {}) });
 const loadClients = () => lsGet(CLIENTS_KEY, []);
 const loadRecords = kind => (lsGet(kind === 'estimate' ? EST_KEY : INV_KEY, []) || []).filter(r => r && typeof r === 'object');
 
@@ -184,6 +184,48 @@ export function agingDetail(records, from, to, now = Date.now()) {
     .sort((a, b) => b.days - a.days || b.rec.created - a.rec.created);
 }
 
+// ── schema v4 tax lines ──
+const round2r = n => Math.round((n + Number.EPSILON) * 100) / 100;
+
+// The grouped tax block of a stored record: v4 records carry taxLines; anything older
+// synthesizes one group from the stored invoice-level rate over subtotal minus discount.
+// Same contract as taxLinesOf in gp-invoices.mjs for every stored-record shape,
+// duplicated so both files stay importable on their own.
+export function taxLinesOf(rec) {
+  if (rec && Array.isArray(rec.taxLines)) {
+    return rec.taxLines
+      .map(tl => ({ rate: +tl.rate, base: +tl.base, amount: +tl.amount }))
+      .filter(tl => Number.isFinite(tl.rate) && tl.rate > 0 && Number.isFinite(tl.base) && Number.isFinite(tl.amount));
+  }
+  const rate = Number(rec && rec.taxPct) || 0;
+  if (!(rate > 0)) return [];
+  return [{
+    rate,
+    base: round2r((Number(rec.subtotal) || 0) - (Number(rec.discountAmount) || 0)),
+    amount: Number(rec.taxAmount) || 0,
+  }];
+}
+
+// (d) tax report: VAT-style per-rate aggregation over PAID + SENT invoices created in
+// range (SENT covers the derived PARTIAL/OVERDUE states; drafts and estimates are not
+// revenue yet). One row per rate, amounts per token: base, tax, and their sum.
+export function taxReport(records, from, to, now = Date.now()) {
+  const groups = new Map(); // rate → { rate, base: {token: amt}, tax: {token: amt} }
+  for (const rec of records || []) {
+    if (!rec || rec.kind === 'estimate') continue;
+    const st = derivedStatus(rec, now);
+    if (!(st === 'PAID' || st === 'SENT' || st === 'PARTIAL' || st === 'OVERDUE')) continue;
+    if (!inRange(rec.created, from, to)) continue;
+    for (const tl of taxLinesOf(rec)) {
+      if (!groups.has(tl.rate)) groups.set(tl.rate, { rate: tl.rate, base: {}, tax: {} });
+      const g = groups.get(tl.rate);
+      addMoney(g.base, rec.token, tl.base);
+      addMoney(g.tax, rec.token, tl.amount);
+    }
+  }
+  return [...groups.values()].sort((a, b) => a.rate - b.rate);
+}
+
 // ── everything below runs only in the browser with window.GP present ──
 
 // qrcode-generator: same lazy vendored import gp-invoices.mjs uses, so this file stays
@@ -279,14 +321,18 @@ async function printDocument(rec, helpers) {
   if (!w) { GP.toast('popup blocked: allow popups to print'); return; }
 
   const addressLines = Array.isArray(p.addressLines) ? p.addressLines.filter(Boolean) : [];
+  const clientAddr = client && Array.isArray(client.addressLines) ? client.addressLines.filter(Boolean) : [];
+  const anyDisc = (rec.items || []).some(it => it.discountPct > 0);
   const rows = (rec.items || []).map(it =>
     '<tr><td>' + escHtml(it.description || 'item') + '</td>'
     + '<td class="r">' + escHtml(it.qty) + '</td>'
     + '<td class="r">' + fmtA(it.unitPrice, rec.token) + '</td>'
+    + (anyDisc ? '<td class="r">' + (it.discountPct > 0 ? it.discountPct + '%' : '·') + '</td>' : '')
+    + '<td class="r">' + (it.taxPct > 0 ? it.taxPct + '%' : '0%') + '</td>'
     + '<td class="r">' + fmtA((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
   ).join('');
   const discount = Number(rec.discountAmount) || 0;
-  const tax = Number(rec.taxAmount) || 0;
+  const tls = taxLinesOf(rec);
 
   w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + kind + ' ' + escHtml(rec.number || '') + '</title>'
     + '<style>'
@@ -314,6 +360,7 @@ async function printDocument(rec, helpers) {
     + '<div class="biz">' + escHtml(p.name || 'GHOSTPAY') + '</div>'
     + (p.contact ? '<div class="muted">' + escHtml(p.contact) + '</div>' : '')
     + addressLines.map(l => '<div class="addrline">' + escHtml(l) + '</div>').join('')
+    + (p.taxNumber ? '<div class="addrline">tax id: ' + escHtml(p.taxNumber) + '</div>' : '')
     + '</div>'
     + '<div><h1>' + title + '</h1><div class="num"><b>' + escHtml(rec.number || '') + '</b></div>'
     + '<div class="num">date: ' + fmtD(rec.created) + '</div>'
@@ -322,13 +369,15 @@ async function printDocument(rec, helpers) {
     + (rec.clientName || client
       ? '<div style="margin-top:20px"><div class="muted">BILL TO</div><b>' + escHtml(rec.clientName || (client && client.name) || '') + '</b>'
         + (client && client.contact ? '<div class="addrline">' + escHtml(client.contact) + '</div>' : '')
+        + clientAddr.map(l => '<div class="addrline">' + escHtml(l) + '</div>').join('')
+        + (client && client.vatNumber ? '<div class="addrline">tax id: ' + escHtml(client.vatNumber) + '</div>' : '')
         + '</div>'
       : '')
-    + '<table><thead><tr><th style="width:50%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th><th class="r">AMOUNT</th></tr></thead>'
+    + '<table><thead><tr><th style="width:44%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th>' + (anyDisc ? '<th class="r">DISC</th>' : '') + '<th class="r">TAX</th><th class="r">AMOUNT</th></tr></thead>'
     + '<tbody>' + rows + '</tbody></table>'
     + '<div class="tot"><div>subtotal · ' + fmtA(rec.subtotal, rec.token) + ' ' + rec.token + '</div>'
-    + (discount > 0 ? '<div>discount' + (rec.discountPct ? ' ' + rec.discountPct + '%' : '') + ' · -' + fmtA(discount, rec.token) + ' ' + rec.token + '</div>' : '')
-    + (tax > 0 ? '<div>tax' + (rec.taxPct ? ' ' + rec.taxPct + '%' : '') + ' · ' + fmtA(tax, rec.token) + ' ' + rec.token + '</div>' : '')
+    + (discount > 0 ? '<div>discount · -' + fmtA(discount, rec.token) + ' ' + rec.token + '</div>' : '')
+    + tls.map(tl => '<div>tax ' + tl.rate + '% on ' + fmtA(tl.base, rec.token) + ' · ' + fmtA(tl.amount, rec.token) + ' ' + rec.token + '</div>').join('')
     + '<div class="grand">total · ' + fmtA(rec.total, rec.token) + ' ' + rec.token + '</div>'
     + (totalUsd ? '<div class="muted" style="margin-top:2px">≈ ' + totalUsd + ' usd</div>' : '')
     + '</div>'
@@ -405,15 +454,25 @@ function init(dashMount, repsMount) {
     const bucketDefs = [
       ['CURRENT', buckets.current], ['1-7 DAYS', buckets.d1_7], ['8-30 DAYS', buckets.d8_30], ['>30 DAYS', buckets.d30p],
     ];
+    // bar width follows the money, not the count: USDC at face value, ETH at the last
+    // known strip price; with no price (or all-zero buckets) fall back to invoice count
+    const px = GP.state.ethPriceUsd;
+    const weight = rs => rs.reduce((s, r) => s + (r.token === 'ETH' ? (Number(r.total) || 0) * (px || 0) : (Number(r.total) || 0)), 0);
+    const weights = bucketDefs.map(([, rs]) => weight(rs));
+    const maxW = Math.max(...weights);
     const maxCount = Math.max(1, ...bucketDefs.map(([, rs]) => rs.length));
-    const bucketRows = bucketDefs.map(([lbl, rs], i) => {
-      const m = {};
-      for (const r of rs) addRec(m, r);
-      const val = Object.keys(m).length ? Object.keys(m).sort().map(t => fmtAmt(m[t], t) + ' ' + t).join(' · ') : '·';
-      return '<div class="gpr-barrow"><span class="gpr-barlbl">' + lbl + '</span>'
-        + '<div class="gpr-bar"><div class="gpr-barfill' + (i ? ' dim' : '') + '" style="width:' + Math.round(rs.length / maxCount * 100) + '%"></div></div>'
-        + '<span class="gpr-barval">' + rs.length + ' · ' + val + '</span></div>';
-    }).join('');
+    const totalUnpaid = bucketDefs.reduce((s, [, rs]) => s + rs.length, 0);
+    const bucketRows = totalUnpaid === 0
+      ? '<div class="gpr-empty">nothing unpaid: sent invoices age here by days past due.</div>'
+      : bucketDefs.map(([lbl, rs], i) => {
+          const m = {};
+          for (const r of rs) addRec(m, r);
+          const val = Object.keys(m).length ? Object.keys(m).sort().map(t => fmtAmt(m[t], t) + ' ' + t).join(' · ') : '·';
+          const w = maxW > 0 ? weights[i] / maxW * 100 : rs.length / maxCount * 100;
+          return '<div class="gpr-barrow"><span class="gpr-barlbl">' + lbl + '</span>'
+            + '<div class="gpr-bar"><div class="gpr-barfill' + (i ? ' dim' : '') + '" style="width:' + (rs.length ? Math.max(2, Math.round(w)) : 0) + '%"></div></div>'
+            + '<span class="gpr-barval"><b>' + val + '</b> · ' + rs.length + ' inv</span></div>';
+        }).join('');
 
     // recent activity: created / sent / paid events + payments seen onchain this session
     const ev = [];
@@ -439,10 +498,10 @@ function init(dashMount, repsMount) {
 
     dashView.innerHTML =
       '<div class="gpr-cards">'
-      + '<div class="gp-card gpr-stat"><div class="gp-label">TOTAL OUTSTANDING</div>' + moneyLines(outstanding, true) + '</div>'
-      + '<div class="gp-card gpr-stat"><div class="gp-label">OVERDUE</div>' + moneyLines(overdue, true) + '</div>'
-      + '<div class="gp-card gpr-stat"><div class="gp-label">PAID THIS MONTH</div>' + moneyLines(paidMonth, true) + '</div>'
-      + '<div class="gp-card gpr-stat"><div class="gp-label">DRAFTS</div><div class="gpr-big">' + drafts + '</div></div>'
+      + '<div class="gp-card gpr-stat">' + moneyLines(outstanding, true) + '<div class="gp-label">TOTAL OUTSTANDING</div></div>'
+      + '<div class="gp-card gpr-stat">' + moneyLines(overdue, true) + '<div class="gp-label">OVERDUE</div></div>'
+      + '<div class="gp-card gpr-stat">' + moneyLines(paidMonth, true) + '<div class="gp-label">PAID THIS MONTH</div></div>'
+      + '<div class="gp-card gpr-stat"><div class="gpr-big">' + drafts + '</div><div class="gp-label">DRAFTS</div></div>'
       + '</div>'
       + '<div class="gpr-section">AGING · UNPAID SENT INVOICES</div>'
       + '<div class="gp-card" style="margin-top:0">' + (bucketRows || '') + '</div>'
@@ -485,7 +544,7 @@ function init(dashMount, repsMount) {
     const d = new Date();
     return { from: new Date(d.getFullYear(), d.getMonth(), 1).getTime(), to: Date.now() };
   };
-  const ranges = { client: monthStart(), month: monthStart(), aging: monthStart() };
+  const ranges = { client: monthStart(), month: monthStart(), aging: monthStart(), tax: monthStart() };
   const dstr = ts => {
     const d = new Date(ts);
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
@@ -500,6 +559,7 @@ function init(dashMount, repsMount) {
     { key: 'client', title: 'SALES BY CLIENT' },
     { key: 'month', title: 'SALES BY MONTH' },
     { key: 'aging', title: 'AGING DETAIL' },
+    { key: 'tax', title: 'TAX BY RATE' },
   ];
 
   const rangeHtml = key =>
@@ -543,6 +603,35 @@ function init(dashMount, repsMount) {
             ).join('')
           + '</tbody></table></div>'
         : '<div class="gpr-empty">no months in this range.</div>';
+    }
+    if (key === 'tax') {
+      const rows = taxReport(inv, from, endOfTo, now);
+      if (!rows.length) return '<div class="gpr-empty">no taxed invoices in this range: per-line tax rates total up here across sent and paid invoices.</div>';
+      const tot = { base: {}, tax: {} };
+      for (const r of rows) {
+        for (const t of Object.keys(r.base)) addMoney(tot.base, t, r.base[t]);
+        for (const t of Object.keys(r.tax)) addMoney(tot.tax, t, r.tax[t]);
+      }
+      const sumCell = (a, b) => {
+        const m = {};
+        for (const t of new Set([...Object.keys(a), ...Object.keys(b)])) m[t] = (a[t] || 0) + (b[t] || 0);
+        return moneyCell(m);
+      };
+      return '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
+        + '<th>RATE</th><th style="text-align:right">BASE</th><th style="text-align:right">TAX</th><th style="text-align:right">TOTAL</th>'
+        + '</tr></thead><tbody>'
+        + rows.map(r =>
+            '<tr><td><b>' + r.rate + '%</b></td>'
+            + '<td style="text-align:right">' + moneyCell(r.base) + '</td>'
+            + '<td style="text-align:right">' + moneyCell(r.tax) + '</td>'
+            + '<td style="text-align:right">' + sumCell(r.base, r.tax) + '</td></tr>'
+          ).join('')
+        + '<tr><td><b>TOTAL</b></td>'
+        + '<td style="text-align:right"><b>' + moneyCell(tot.base) + '</b></td>'
+        + '<td style="text-align:right"><b>' + moneyCell(tot.tax) + '</b></td>'
+        + '<td style="text-align:right"><b>' + sumCell(tot.base, tot.tax) + '</b></td></tr>'
+        + '</tbody></table></div>'
+        + '<div class="status">base and tax across PAID + SENT invoices created in range, grouped by the per-line tax rate on each invoice.</div>';
     }
     const rows = agingDetail(inv, from, endOfTo, now);
     return rows.length
@@ -600,6 +689,16 @@ function init(dashMount, repsMount) {
           rows.push([r.month, t,
             r.invoiced[t] != null ? fmtAmt(r.invoiced[t], t) : '0',
             r.paid[t] != null ? fmtAmt(r.paid[t], t) : '0']);
+        }
+      }
+    } else if (key === 'tax') {
+      name = 'tax-by-rate';
+      rows = [['rate_pct', 'token', 'base', 'tax', 'total']];
+      for (const r of taxReport(inv, from, endOfTo, now)) {
+        const tokens = new Set([...Object.keys(r.base), ...Object.keys(r.tax)]);
+        for (const t of [...tokens].sort()) {
+          const base = r.base[t] || 0, tax = r.tax[t] || 0;
+          rows.push([r.rate, t, fmtAmt(base, t), fmtAmt(tax, t), fmtAmt(base + tax, t)]);
         }
       }
     } else {

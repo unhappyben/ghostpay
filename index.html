@@ -49,6 +49,24 @@
   .r-tab.done { color:#fff; border-color:#555; }
   .r-panel { display:none; }
   .r-panel.on { display:block; }
+  /* PAYMENTS: rows, pills, sweep panels (monochrome, same idiom as the inbox) */
+  .r-row { border:1px solid #333; padding:14px 16px; margin-top:12px; }
+  .r-row-in { animation:rRowIn .5s ease-out; }
+  @keyframes rRowIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+  .r-row-top { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .r-row-addr { font-weight:700; font-size:12.5px; word-break:break-all; }
+  .r-row-meta { color:#888; font-size:11.5px; margin-top:6px; }
+  .r-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px; letter-spacing:.15em; white-space:nowrap; }
+  .r-pill.dim { border-color:#444; color:#888; }
+  .r-row-actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  .r-row-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  .r-spanel { border:1px solid #444; padding:12px; margin-top:10px; font-size:12px; }
+  .r-spanel .status { margin-top:6px; }
+  .r-spanel button { margin-top:8px; }
+  .r-secret { background:#fff; color:#000; padding:12px; margin-top:10px; word-break:break-all;
+    font-size:11px; max-height:150px; overflow:auto; white-space:pre-wrap; }
+  .gp-pulse { display:inline-block; animation:gpPulse 1.2s ease-in-out infinite; }
+  @keyframes gpPulse { 0%,100% { opacity:.25 } 50% { opacity:1 } }
   /* status strip + toast (same as the app) */
   #gp-status { border:1px solid #333; padding:8px 12px; font-size:11px; color:#888; margin-bottom:22px;
     word-break:break-word; }
@@ -85,7 +103,7 @@
       <button class="r-tab on" id="r-tab-0">1 · CONNECT</button>
       <button class="r-tab" id="r-tab-1">2 · GENERATE</button>
       <button class="r-tab" id="r-tab-2">3 · AMOUNT</button>
-      <button class="r-tab" id="r-tab-3">4 · COPY</button>
+      <button class="r-tab" id="r-tab-3">4 · SHARE</button>
     </div>
 
     <div class="r-panel on" id="r-p0">
@@ -126,21 +144,29 @@
         <button id="r-b-copyaddr">COPY ADDRESS</button>
       </div>
       <div class="card">
-        <div class="lbl">PAYMENT LINK · ANNOUNCES AUTOMATICALLY WHEN PAID</div>
+        <div class="lbl">PAYMENT LINK · ANNOUNCES ITSELF WHEN THE PAYER PAYS</div>
         <b id="r-v-link"></b>
         <button id="r-b-copylink">COPY LINK</button>
-        <div id="r-qrlink-wrap" style="display:none;margin-top:14px;text-align:center">
-          <canvas id="r-qrlink" style="padding:10px;image-rendering:pixelated"></canvas>
+        <div id="r-qrlink-wrap" style="display:none;margin-top:16px;text-align:center">
+          <canvas id="r-qrlink" style="background:#fff;padding:16px;image-rendering:pixelated;max-width:100%"></canvas>
         </div>
       </div>
-      <div class="status" id="r-st-ann" style="margin-top:14px">payment links announce automatically when the payer pays. a raw-address payment needs one announce:</div>
-      <button class="ghost" id="r-b-ann">ANNOUNCE ADDRESS</button>
+      <div class="status" style="margin-top:14px">payment links announce themselves when the payer pays. this announce is for raw-address payers:</div>
+      <div class="status" id="r-st-ann"></div>
+      <button class="ghost" id="r-b-ann" style="display:none">RETRY ANNOUNCE</button>
     </div>
 
     <div id="r-remember-row" style="display:none;margin-top:14px">
       <label style="font-size:12px;color:#888;display:flex;gap:8px;align-items:center;cursor:pointer">
         <input type="checkbox" id="r-i-remember" style="width:auto;margin:0"> remember this device (watch-only: viewing key + meta-address, never the spend key)
       </label>
+    </div>
+
+    <div id="r-payments" style="display:none;margin-top:26px">
+      <h2 style="margin-bottom:10px">PAYMENTS</h2>
+      <div class="status" id="r-watch-note" style="display:none;margin-top:0">watch-only session restored: scanning works, but the spend key is never stored on this device. connect above and SIGN · GENERATE STEALTH KEYS again (same wallet, same keys) to sweep.</div>
+      <div class="status" id="r-scan-st" style="margin-top:4px"></div>
+      <div id="r-rows"></div>
     </div>
   </div>
   <div id="r-recovery" style="display:none;border:1px solid #fff;padding:14px;margin-top:14px;font-size:12px;line-height:1.7"></div>
@@ -207,6 +233,7 @@ import { IrnClient } from './vendor/latrine-irn.mjs';
 import { WalletConnect, WcPairing } from './vendor/latrine-wc.mjs';
 import { Jwt } from './vendor/latrine-jwt.mjs';
 import qrcode from './vendor/qrcode-generator.mjs';
+import { poseidon2 } from './vendor/poseidon2.mjs';
 
 const $ = id => document.getElementById(id);
 const hex = b => '0x' + [...b].map(x => x.toString(16).padStart(2, '0')).join('');
@@ -227,6 +254,32 @@ function derive(metaHex) {
   return { stealth: addrOf(stealthPub), ephPub: hex(ephPub), viewTag: sh[0], sh: hex(sh) };
 }
 
+// receiver side of scheme 1, ported from app-core.mjs (keccak shared-secret hash; the
+// legacy sha256 scheme lives in the full app, not on the homepage).
+function check(viewPriv, spendPub, ephPub, addr) {
+  const sh = keccak_256(secp256k1.getSharedSecret(buf(viewPriv), buf(ephPub), true));
+  const stealthPub = secp256k1.ProjectivePoint.fromHex(buf(spendPub)).add(secp256k1.ProjectivePoint.BASE.multiply(mod(bint(sh))));
+  return { match: addrOf(stealthPub).toLowerCase() === addr.toLowerCase(), viewTag: sh[0], sh: hex(sh) };
+}
+const stealthKey = (spendPriv, sh) => '0x' + mod(bint(buf(spendPriv)) + bint(buf(sh))).toString(16).padStart(64,'0');
+
+// minimal RLP + 7702 auth (app-core.mjs, verbatim)
+const big2b = n => { const h = n.toString(16); return buf(h.length%2?'0'+h:h); };
+function rlp(x){
+  if (Array.isArray(x)) { const p = cat(...x.map(rlp)); return cat(rlplen(p,0xc0), p); }
+  let b = typeof x === 'bigint' ? (x===0n ? new Uint8Array(0) : big2b(x)) : buf(x);
+  if (b.length===1 && b[0]<0x80) return b;
+  return cat(rlplen(b,0x80), b);
+}
+const rlplen = (p,off) => p.length<56 ? Uint8Array.from([off+p.length]) : cat(Uint8Array.from([off+55+nb(p.length)]), nbarr(p.length));
+const nb = n => { let c=0; while(n){c++;n>>=8;} return c; };
+const nbarr = n => { const a=new Uint8Array(nb(n)); for(let i=a.length-1;i>=0;i--){a[i]=n&255;n>>=8;} return a; };
+function sign7702(priv, chainId, sweeper, nonce) {
+  const msg = keccak_256(cat(Uint8Array.from([0x05]), rlp([BigInt(chainId), sweeper, BigInt(nonce)])));
+  const sig = secp256k1.sign(msg, buf(priv));
+  return { chainId, address: sweeper, nonce, yParity: sig.recovery, r: '0x'+sig.r.toString(16).padStart(64,'0'), s: '0x'+sig.s.toString(16).padStart(64,'0') };
+}
+
 // state
 let W = null; // { account, prov, eip1193 } or { account, session }
 // connect UI sink: the pay-a-ghost panel by default. The GET PAID card points the same
@@ -239,6 +292,16 @@ const CHAIN_ID = 1;
 // PayAndAnnounce contract (pay(stealth, ephPub, metadata) payable: announces + forwards the
 // ETH in one transaction). Deployed on mainnet; bytecode verified against test/PayAndAnnounce.t.sol.
 const PAY_AND_ANNOUNCE = '0x665E5f19FFFfBa541B3314E66bBAaCD08080cC02';
+// StealthSweeperV2 (signed intents), mainnet. Same constants as app-core.mjs.
+const SWEEPER_V2 = '0xCC29c7723116155ccF20C7c0b8924F4747331903';
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+const PP_MIN_SWEEP = 10000000000000000n; // 0.01 ETH: below this a deposit cannot enter Privacy Pools
+const INTENT_TYPES = { SweepIntent: [
+  { name: 'action', type: 'uint8' }, { name: 'token', type: 'address' }, { name: 'destination', type: 'address' },
+  { name: 'precommitment', type: 'uint256' }, { name: 'feeBps', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
+] };
+// EIP-712 domain: verifyingContract is the stealth EOA itself (SweeperV2 executes AS the EOA under 7702)
+const intentDomain = stealth => ({ name: 'GhostpaySweeper', version: '1', chainId: CHAIN_ID, verifyingContract: stealth });
 
 const copy = (txt, btn) => { navigator.clipboard.writeText(txt); btn.textContent = 'COPIED ✓'; setTimeout(()=>btn.textContent=btn.dataset.t, 1200); };
 document.querySelectorAll('button').forEach(b => b.dataset.t = b.textContent);
@@ -388,6 +451,12 @@ async function jrpc(method, params) {
 // status strip (#gp-status): relayer health + min fee + ETH price, refreshed every 60s.
 // every endpoint is optional: static-only serving shows "relayer: offline", a failed
 // /price simply hides the price.
+const formatEth = wei => { const s = ethers.formatEther(BigInt(wei)); return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s; };
+let ethPriceUsd = null;
+const formatUsd = (eth, usd) => {
+  const p = usd ?? ethPriceUsd;
+  return p == null ? null : '$' + (Number(eth) * p).toLocaleString(undefined, { maximumFractionDigits: 2 });
+};
 async function pollStatus() {
   const el = $('gp-status'); if (!el) return;
   const parts = [];
@@ -418,7 +487,7 @@ async function pollStatus() {
     if (r.ok) {
       const p = await r.json();
       const usd = p.usd ?? p.ethUsd ?? p.price ?? (p.ethereum && p.ethereum.usd);
-      if (usd != null && isFinite(Number(usd))) parts.push('ETH $' + Number(usd).toLocaleString());
+      if (usd != null && isFinite(Number(usd))) { ethPriceUsd = Number(usd); parts.push('ETH $' + ethPriceUsd.toLocaleString()); }
     }
   } catch { /* price hidden on failure, by design */ }
   el.textContent = parts.join(' · ');
@@ -431,6 +500,19 @@ setInterval(pollStatus, 60000);
 window.GP = {
   version: '1.0-homepay',
   state: {
+    get connected() { return !!(W && (W.prov || W.session)); },
+    get unlocked() { return !!(W && W.viewPriv); },
+    get watchOnly() { return !!(W && W.viewPriv && !W.spendPriv); },
+    get address() { return (W && W.account) || null; },
+    get keys() {
+      return W && W.viewPriv
+        ? { viewPriv: W.viewPriv, viewPub: W.viewPub, spendPub: W.spendPub, spendPriv: W.spendPriv || null, meta: W.meta }
+        : null;
+    },
+    get meta() { return (W && W.meta) || null; },
+    get recv() { return (W && W.recv) || null; },
+    get ethPriceUsd() { return ethPriceUsd; },
+    get payments() { return payments; },
     walletRequest(method, params) {
       if (W && W.session) return W.session.request({ chainId: 'eip155:1', request: { method, params } });
       if (W && W.eip1193) return W.eip1193.request({ method, params });
@@ -438,10 +520,14 @@ window.GP = {
       throw new Error('no wallet connected');
     },
   },
+  scan: opts => scan(opts || {}),
+  relayerCaps,
+  jrpc,
   toast,
   ethers,
-  const: { ANNOUNCER, CHAIN_ID, PAY_AND_ANNOUNCE },
-  crypto: { secp256k1, keccak_256, hex, buf, mod, N, derive },
+  fmt: { formatEth, formatUsd },
+  const: { ANNOUNCER, CHAIN_ID, PAY_AND_ANNOUNCE, SWEEPER_V2 },
+  crypto: { secp256k1, keccak_256, hex, buf, mod, N, derive, check, stealthKey, sign7702, intentDomain, INTENT_TYPES, poseidon2 },
 };
 
 // PWA: cache-first offline shell. http(s) only: file:// and weird schemes skip registration.
@@ -617,7 +703,7 @@ function deriveKeysFromSig(sig) {
 }
 
 // tab stepper: auto-advance on completion, completed tabs get a ✓ and stay clickable.
-const R_NAMES = ['CONNECT', 'GENERATE', 'AMOUNT', 'COPY'];
+const R_NAMES = ['CONNECT', 'GENERATE', 'AMOUNT', 'SHARE'];
 const rDone = [false, false, false, false];
 let rStep = 0;
 function rGoto(n) {
@@ -629,7 +715,7 @@ function rGoto(n) {
     t.textContent = (rDone[i] ? '✓ ' : (i + 1) + ' · ') + R_NAMES[i];
     $('r-p' + i).classList.toggle('on', i === n);
   }
-  if (n === 3 && W && W.meta) refreshCopyPanel();
+  if (n === 3 && W && W.meta && W.recv) refreshCopyPanel();
 }
 function rAdvance(i) { rDone[i] = true; rGoto(i < 3 ? i + 1 : i); }
 R_NAMES.forEach((_, i) => { $('r-tab-' + i).onclick = () => { if (i === rStep || rDone[i] || (i > 0 && rDone[i - 1])) rGoto(i); }; });
@@ -689,6 +775,7 @@ $('r-b-gen').onclick = async () => {
     $('r-i-remember').checked = !!loadGpSession();
     if ($('r-i-remember').checked) saveGpSession();
     rAdvance(1);
+    startJourney();
   } catch (e) {
     $('r-st-gen').textContent = 'signing failed: ' + ((e && e.message) || e);
   } finally { btn.disabled = false; }
@@ -722,7 +809,7 @@ async function drawLinkQr(text) {
     qrLinkLib ??= (await import('./vendor/qrcode-generator.mjs')).default;
     const q = qrLinkLib(0, 'M'); q.addData(text); q.make();
     const cv = $('r-qrlink'), ctx = cv.getContext('2d');
-    const n = q.getModuleCount(), scale = 4;
+    const n = q.getModuleCount(), scale = 6;
     cv.width = cv.height = n * scale;
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height);
     ctx.fillStyle = '#000';
@@ -739,27 +826,419 @@ function refreshCopyPanel() {
 $('r-b-copyaddr').onclick = e => copy(W.recv.stealth, e.target);
 $('r-b-copylink').onclick = e => copy($('r-v-link').textContent, e.target);
 
-// raw-address payments only: payment links announce automatically when the payer pays.
-// Relayer announce (POST /announce); a successful announce prunes the record, as app-core does.
+// raw-address payments only: payment links announce themselves when the payer pays.
+// Relayer announce (POST /announce) with app-core's poll-to-confirm pattern via /status;
+// a confirmed announce prunes the record, as app-core does. Auto-fired by startJourney()
+// on generate; the SHARE panel button is the clean retry.
 async function announceRecv(rec, setSt) {
   const st = setSt || (m => $('r-st-ann').textContent = m);
+  const retryBtn = rec ? null : $('r-b-ann');
+  if (retryBtn) retryBtn.style.display = 'none';
   const src = rec || (W && W.recv);
   if (!src) { st('generate your stealth keys first.'); return null; }
   const { stealth, ephPub, viewTag } = src;
   try {
-    st('announcing via relayer… (deliberate privacy delay before broadcast: hold on)');
+    st('announcing… (deliberate privacy delay before broadcast: the relayer holds the tx so its timing cannot be linked to you)');
     const r = await fetch('/announce', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stealth, ephPub, viewTag }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
-    st('announced: ' + j.hash + ' · your scanner will now find payments to this address.');
-    dropRecvRecord(stealth); // announced onchain: the scanner covers recovery from here
-    return { hash: j.hash };
+    st('broadcast: ' + j.hash + ' · waiting for confirmation (private mempool: explorers show it only once mined)…');
+    (async () => {
+      for (let i = 0; i < 120; i++) {
+        await new Promise(x => setTimeout(x, 5000));
+        try {
+          const s = await fetch('/status/' + j.hash).then(r => r.json());
+          if (s.status === 'confirmed') {
+            st('announced · ' + j.hash + ' · your scanner now finds payments to this address. share it and get paid.');
+            dropRecvRecord(stealth); // confirmed onchain: the scanner covers recovery from here
+            return;
+          }
+          if (s.status === 'failed') {
+            st('announce tx reverted onchain · ' + j.hash + ' · hit RETRY ANNOUNCE.');
+            if (retryBtn) retryBtn.style.display = 'block';
+            return;
+          }
+        } catch { /* keep polling */ }
+      }
+      st('still pending after 10 minutes · ' + j.hash + ' · it is in the private mempool, it usually lands within a few more minutes.');
+    })();
+    return { hash: j.hash, via: 'relayer' };
   } catch (e) {
-    st('announce failed: ' + ((e && e.message) || e) + ' · payment links announce automatically, raw addresses need this announce.');
+    st('announce failed: ' + ((e && e.message) || e) + ' · payment links announce themselves when the payer pays; raw-address payers need this announce.');
+    if (retryBtn) retryBtn.style.display = 'block';
     return null;
   }
 }
 $('r-b-ann').onclick = async () => { $('r-b-ann').disabled = true; await announceRecv(); $('r-b-ann').disabled = false; };
+
+// ── PAYMENTS: the journey after generate ──
+// Scan ported from app-core.mjs EXACTLY: announcer topic, chunked eth_getLogs with the
+// same split/retry workers, cursor 'ghostpay:lastScanned:<viewPub>' (default latest −
+// 50000), view-tag prefilter + check(). Only the rendering differs (rows, not app cards).
+
+// relayer capabilities (sweeperV2 + fee floor), fetched once per session, then cached.
+let capsPromise = null;
+function relayerCaps() {
+  capsPromise ??= (async () => {
+    let sweeperV2 = null, minFeeBps = 30;
+    try { const r = await fetch('./health'); if (r.ok) { const h = await r.json(); sweeperV2 = h.sweeperV2 || null; } } catch { /* relayer offline */ }
+    try { const r = await fetch('./fee'); if (r.ok) { const j = await r.json(); if (Number.isFinite(j.minFeeBps)) minFeeBps = j.minFeeBps; } } catch { /* keep the 30 bps default */ }
+    return { sweeperV2, minFeeBps };
+  })();
+  return capsPromise;
+}
+
+// withdrawal-secret download (app-core's helper): the file is the ONLY place the secret exists.
+function download(filename, text) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'application/octet-stream' }));
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+let scanSeq = 0;
+let scanBusy = false;
+const payments = [];        // one record per rendered row
+const seenPays = new Set(); // dedupe tx:addr across incremental scans; cleared on full scans
+const rowsByAddr = new Map(); // addrLower → { rec, el, refs, swept }
+const blockTimeCache = new Map();
+async function blockTime(b) {
+  if (blockTimeCache.has(b)) return blockTimeCache.get(b);
+  const blk = await jrpc('eth_getBlockByNumber', ['0x' + b.toString(16), false]);
+  const s = new Date(parseInt(blk.timestamp, 16) * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  blockTimeCache.set(b, s);
+  return s;
+}
+
+async function scan(opts = {}) {
+  const append = !!opts.append, quiet = !!opts.quiet;
+  if (scanBusy && append) return payments; // a scan is in flight: skip this background tick
+  scanBusy = true;
+  const mySeq = ++scanSeq;
+  if (!append) { $('r-rows').innerHTML = ''; seenPays.clear(); payments.length = 0; rowsByAddr.clear(); }
+  if (!quiet) $('r-scan-st').textContent = 'scanning announcements…';
+  try {
+    const topic0 = ethers.id('Announcement(uint256,address,address,bytes,bytes)');
+    const t1 = ethers.zeroPadValue('0x01', 32);
+    const latest = parseInt(await jrpc('eth_blockNumber', []), 16);
+    // scan cursor: after a clean scan we remember `latest` per wallet and resume from there.
+    // clearing localStorage forces a full rescan (default window: latest − 50000).
+    const cursorKey = 'ghostpay:lastScanned:' + (W.viewPub || W.account || '');
+    const stored = parseInt(localStorage.getItem(cursorKey) || '', 10);
+    const fromBlock = Number.isFinite(stored) && stored >= 0 ? Math.min(stored, latest) : Math.max(0, latest - 50000);
+    const ranges = [];
+    for (let f = fromBlock; f <= latest; f += 100000) ranges.push([f, Math.min(f + 99999, latest), 0]);
+    const logs = []; let done = 0, failed = 0;
+    async function worker() {
+      while (ranges.length) {
+        if (mySeq !== scanSeq) return;
+        const r = ranges.shift(); const [f, t] = [r[0], r[1]];
+        try {
+          const res = await jrpc('eth_getLogs', [{ address: ANNOUNCER, topics: [topic0, t1], fromBlock: '0x' + f.toString(16), toBlock: '0x' + t.toString(16) }]);
+          logs.push(...res); done++;
+          if (!quiet) $('r-scan-st').textContent = 'scanning blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ' · ' + logs.length + ' announcements found so far…';
+        } catch (e) {
+          if (t - f + 1 > 10000) { for (let g = f; g <= t; g += 10000) ranges.push([g, Math.min(g + 9999, t), 0]); }
+          else if (r[2] < 3) { r[2]++; ranges.push(r); await new Promise(x => setTimeout(x, 600)); }
+          else { failed++; }
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: 6 }, worker));
+    if (mySeq !== scanSeq) return payments;
+    if (!quiet) $('r-scan-st').textContent = logs.length + ' announcements. filtering…';
+    let found = 0;
+    for (const l of logs) {
+      const [ephPub, metadata] = ethers.AbiCoder.defaultAbiCoder().decode(['bytes','bytes'], l.data);
+      const addr = '0x' + l.topics[2].slice(-40);
+      const r = check(W.viewPriv, W.spendPub, ephPub, addr);
+      if (metadata.length >= 3 && parseInt(metadata.slice(2,4),16) !== r.viewTag) continue;
+      if (!r.match) continue;
+      const dedupeKey = l.transactionHash + ':' + addr.toLowerCase();
+      if (seenPays.has(dedupeKey)) continue;
+      seenPays.add(dedupeKey);
+      found++;
+      addPaymentRow({ address: addr, ephPub, block: parseInt(l.blockNumber, 16), tx: l.transactionHash, swept: false });
+    }
+    // advance the cursor only on a fully clean scan, so unreachable ranges are never skipped for good
+    if (!failed) localStorage.setItem(cursorKey, String(latest));
+    if (!quiet || found) {
+      $('r-scan-st').textContent = (found ? found + (append ? ' new ' : ' ') + 'payment(s) found. sweep when ready.' : 'nothing in this range yet. this page keeps scanning every 30s while it is open.')
+        + ' (blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ')'
+        + (failed ? ' (' + failed + ' block range(s) unreachable · rescan to retry)' : '');
+    }
+    return payments;
+  } catch (e) { $('r-scan-st').textContent = 'scan failed: ' + e.message; return payments; }
+  finally { scanBusy = false; }
+}
+
+// ── rows ──
+const shortAddr = a => a.slice(0, 10) + '…' + a.slice(-6);
+function addPaymentRow(rec) {
+  payments.push(rec);
+  const el = document.createElement('div');
+  el.className = 'r-row r-row-in';
+  const top = document.createElement('div'); top.className = 'r-row-top';
+  const addrEl = document.createElement('span'); addrEl.className = 'r-row-addr';
+  addrEl.textContent = shortAddr(rec.address); addrEl.title = rec.address;
+  const pill = document.createElement('span'); pill.className = 'r-pill dim'; pill.textContent = 'DETECTED';
+  top.append(addrEl, pill);
+  const meta = document.createElement('div'); meta.className = 'r-row-meta'; meta.textContent = 'reading balance…';
+  const note = document.createElement('div'); note.className = 'r-row-meta'; note.style.display = 'none';
+  const actions = document.createElement('div'); actions.className = 'r-row-actions';
+  const panel = document.createElement('div'); panel.className = 'r-spanel'; panel.style.display = 'none';
+  el.append(top, meta, note, actions, panel);
+  $('r-rows').appendChild(el);
+  const row = { rec, el, refs: { pill, meta, note, actions, panel }, busy: false, swept: false };
+  rowsByAddr.set(rec.address.toLowerCase(), row);
+  refreshRow(row);
+}
+
+async function refreshRow(row) {
+  if (row.busy || row.swept) return;
+  row.busy = true;
+  const { pill, meta, actions } = row.refs;
+  const addr = row.rec.address;
+  try {
+    const bal = BigInt(await jrpc('eth_getBalance', [addr, 'latest']));
+    let timeTxt = 'block ' + row.rec.block.toLocaleString();
+    try { timeTxt = await blockTime(row.rec.block); } catch { /* keep the block number */ }
+    let balTxt = formatEth(bal) + ' ETH';
+    const usd = formatUsd(formatEth(bal));
+    if (usd) balTxt += ' · ' + usd;
+    meta.textContent = balTxt + ' · detected ' + timeTxt;
+    actions.textContent = '';
+    if (bal > 0n) {
+      pill.textContent = 'LIVE';
+      pill.classList.remove('dim');
+      if (bal >= PP_MIN_SWEEP) {
+        const b = document.createElement('button');
+        b.textContent = 'SWEEP';
+        b.onclick = () => openPoolSweep(row, bal);
+        actions.appendChild(b);
+      } else {
+        const b = document.createElement('button');
+        b.className = 'ghost';
+        b.textContent = 'SWEEP DIRECT';
+        b.onclick = () => openDirectSweep(row, bal);
+        actions.appendChild(b);
+        row.refs.note.style.display = 'block';
+        row.refs.note.textContent = 'below the 0.01 ETH Privacy Pools minimum: sweep direct to an address you choose.';
+      }
+    } else {
+      pill.textContent = 'SWEPT';
+      pill.classList.add('dim');
+    }
+  } catch { meta.textContent = 'balance check failed · next scan retries'; }
+  finally { row.busy = false; }
+}
+
+function rowPanel(row, noteTxt) {
+  const { panel } = row.refs;
+  panel.textContent = '';
+  panel.style.display = 'block';
+  const note = document.createElement('div'); note.className = 'status';
+  note.style.marginTop = '0'; note.textContent = noteTxt;
+  const st = document.createElement('div'); st.className = 'status';
+  panel.append(note, st);
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  return { panel, st };
+}
+
+// stealth signing key: transient, derived on demand, never stored, never logged.
+function stealthWallet(rec) {
+  if (!W || !W.spendPriv) {
+    throw new Error('watch-only session: your spend key is never stored on this device. connect above, SIGN · GENERATE STEALTH KEYS again (same wallet, same keys), then retry.');
+  }
+  const { sh } = check(W.viewPriv, W.spendPub, rec.ephPub, rec.address);
+  const w = new ethers.Wallet(stealthKey(W.spendPriv, sh));
+  if (w.address.toLowerCase() !== rec.address.toLowerCase()) throw new Error('derived key mismatch');
+  return w;
+}
+
+// broadcast a signed artifact via the local relayer (serve.mjs POST /sweep), ported from
+// app-core's relaySweep. The runner wallet pays gas; the stealth EOA stays unfunded.
+async function relaySweep(artifact, onHash) {
+  try {
+    const r = await fetch('/sweep', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(artifact) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
+    if (onHash) { try { onHash(j.hash); } catch { /* listener errors never break the relay */ } }
+    for (let i = 0; i < 120; i++) {
+      await new Promise(x => setTimeout(x, 5000));
+      const rcpt = await jrpc('eth_getTransactionReceipt', [j.hash]);
+      if (rcpt) {
+        if (rcpt.status === '0x1') return { hash: j.hash, status: 'confirmed', block: parseInt(rcpt.blockNumber, 16) };
+        return { hash: j.hash, status: 'reverted' };
+      }
+    }
+    return { hash: j.hash, status: 'timeout' };
+  } catch (e) {
+    return { status: 'error', error: e.message };
+  }
+}
+
+// signed preview + broadcast with the inbox's live loading states: pulsing dot + elapsed
+// timer while the relayer works, the hash once broadcast, then confirmed/failed.
+function previewAndBroadcast(row, panel, st, artifact, summary, doneLine) {
+  const prev = document.createElement('div'); prev.className = 'status'; prev.style.color = '#fff';
+  prev.textContent = 'signed · ' + summary;
+  const bBc = document.createElement('button'); bBc.textContent = 'BROADCAST VIA RELAYER';
+  const bCp = document.createElement('button'); bCp.className = 'ghost'; bCp.textContent = 'COPY ARTIFACT';
+  bCp.onclick = () => { navigator.clipboard.writeText(JSON.stringify(artifact, null, 2)); toast('artifact copied'); };
+  panel.append(prev, bBc, bCp);
+  bBc.onclick = async () => {
+    bBc.disabled = true;
+    const t0 = Date.now();
+    let phase = 'broadcasting via relayer', extra = '5-45s privacy delay';
+    const tick = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      st.innerHTML = '<span class="gp-pulse">&#9679;</span> ' + phase + ' · ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') + (extra ? ' · ' + extra : '');
+    }, 1000);
+    const out = await relaySweep(artifact, h => {
+      phase = 'pending'; extra = 'tx ' + h.slice(0, 14) + '… · explorers show it only once mined';
+    });
+    clearInterval(tick);
+    if (out && out.hash) {
+      const link = ' · <a href="https://etherscan.io/tx/' + out.hash + '" target="_blank" rel="noopener">etherscan</a>';
+      if (out.status === 'confirmed') {
+        st.innerHTML = '&#10003; confirmed' + (out.block ? ' in block ' + out.block.toLocaleString() : '') + ' · tx ' + out.hash.slice(0, 14) + '…' + link + ' · ' + doneLine;
+        row.swept = true;
+        row.refs.pill.textContent = artifact.precommitment ? 'IN POOL' : 'SWEPT DIRECT';
+        row.refs.pill.classList.add('dim');
+        row.refs.actions.textContent = '';
+        return;
+      }
+      if (out.status === 'reverted') {
+        st.textContent = 'tx REVERTED onchain · ' + out.hash + ' · the artifact stays valid: COPY ARTIFACT and retry.';
+      } else {
+        st.innerHTML = 'still pending after 10 minutes · tx ' + out.hash.slice(0, 14) + '…' + link + ' · it is in the private mempool, it usually lands within a few more minutes.';
+      }
+    } else {
+      st.textContent = 'relayer broadcast failed: ' + ((out && out.error) || 'unknown') + ' · the artifact stays valid: COPY ARTIFACT and retry via relay.mjs.';
+    }
+    bBc.disabled = false;
+  };
+}
+
+// pool-sized (≥ 0.01 ETH): app-core's intent path, EXACTLY: PP secret + poseidon2
+// precommitment, the same secret-file download + ghostpay:ppnote:* tracking record,
+// stealthKey, EIP-712 SweepIntent action 1 (feeBps from ./fee, deadline now + 24h,
+// domain verifyingContract = the stealth address), 7702 auth to SweeperV2, POST /sweep.
+async function openPoolSweep(row, bal) {
+  const { panel, st } = rowPanel(row,
+    'the whole balance enters Privacy Pools (0xbow). the relayer pays gas; your wallet never appears onchain.');
+  try {
+    const rec = row.rec, addr = rec.address;
+    const caps = await relayerCaps();
+    if (!caps.sweeperV2) throw new Error('this relayer does not run intent sweeps (sweeperV2 not configured) · open the full app to sweep.');
+    const w = stealthWallet(rec); // throws on watch-only, with the re-connect + re-sign instructions
+    st.textContent = 'signing the sweep intent…';
+    // precommitment = poseidon2(nullifier, secret), 31-byte values, identical to
+    // ept-privacy-pools / the zFi client, so the downloaded file works in the standard
+    // withdrawal flow (v2.privacypools.com).
+    const nullifier = crypto.getRandomValues(new Uint8Array(31));
+    const ppsecret = crypto.getRandomValues(new Uint8Array(31));
+    const pre = poseidon2([BigInt(hex(nullifier)), BigInt(hex(ppsecret))]);
+    const preHex = '0x' + pre.toString(16).padStart(64, '0');
+    const secretFile = {
+      note: 'GHOSTPAY Privacy Pools withdrawal secret. KEEP SAFE. Anyone with this file can withdraw the deposit.',
+      nullifier: hex(nullifier),
+      secret: hex(ppsecret),
+      precommitment: preHex,
+      amount: bal.toString(),
+      chainId: CHAIN_ID,
+      sweeper: SWEEPER_V2,
+      stealthAddress: addr,
+      timestamp: new Date().toISOString(),
+      pool: 'ETH mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
+    };
+    // non-secret tracking record (nullifier only, it cannot withdraw) so the full app can
+    // show this deposit's lifecycle. The secret itself is NEVER stored anywhere.
+    try {
+      localStorage.setItem('ghostpay:ppnote:' + addr.toLowerCase(), JSON.stringify({
+        nullifier: hex(nullifier), precommitment: preHex, amount: bal.toString(), ts: Date.now()
+      }));
+    } catch { /* storage blocked/full: tracking is best-effort, the sweep is unaffected */ }
+    const sec = document.createElement('div'); sec.className = 'r-secret';
+    sec.textContent = 'PRIVACY POOLS WITHDRAWAL SECRET · KEEP this file: it is your withdrawal secret. lose it and the deposit is gone forever.\n\n' + JSON.stringify(secretFile, null, 2);
+    const bDl = document.createElement('button'); bDl.className = 'ghost'; bDl.textContent = 'DOWNLOAD SECRET AGAIN';
+    bDl.onclick = () => download('pp-secret-' + addr.slice(2, 10) + '.json', JSON.stringify(secretFile, null, 2));
+    panel.append(sec, bDl);
+    download('pp-secret-' + addr.slice(2, 10) + '.json', JSON.stringify(secretFile, null, 2));
+    const deadline = Math.floor(Date.now() / 1000) + 86400;
+    const intent = { action: 1, token: ZERO_ADDR, destination: ZERO_ADDR, precommitment: preHex, feeBps: caps.minFeeBps, deadline };
+    const signature = await w.signTypedData(intentDomain(addr), INTENT_TYPES, intent);
+    const nonce = parseInt(await jrpc('eth_getTransactionCount', [addr, 'latest']), 16);
+    const artifact = {
+      kind: 'eip7702-intent', chainId: CHAIN_ID, stealthAddress: addr, sweeper: SWEEPER_V2,
+      authorization: sign7702(w.privateKey, CHAIN_ID, SWEEPER_V2, nonce),
+      intent, signature,
+      precommitment: preHex,
+      warning: 'KEEP the downloaded secret file: it is your withdrawal secret',
+    };
+    st.textContent = '';
+    previewAndBroadcast(row, panel, st, artifact,
+      formatEth(bal) + ' ETH → Privacy Pools · fee ' + caps.minFeeBps + ' bps · valid 24h',
+      'swept into Privacy Pools · withdraw from the full app after ASP review');
+  } catch (e) { st.textContent = 'error: ' + e.message; }
+}
+
+// dust (< 0.01 ETH): cannot enter Privacy Pools, so a direct sweep to a destination.
+// Same signed-intent shape, action 0, with the privacy note up front.
+function openDirectSweep(row, bal) {
+  const { panel, st } = rowPanel(row,
+    'privacy note: direct sweeps skip the pool, so the destination sees this address.');
+  const amt = document.createElement('div'); amt.className = 'status';
+  amt.textContent = 'amount: ' + formatEth(bal) + ' ETH (full balance, below the 0.01 pool minimum)';
+  const dest = document.createElement('input'); dest.type = 'text'; dest.placeholder = 'destination address (0x…)';
+  if (W && W.account) dest.value = W.account;
+  const b = document.createElement('button'); b.textContent = 'SIGN DIRECT SWEEP';
+  panel.insertBefore(amt, st); panel.insertBefore(dest, st); panel.appendChild(b);
+  b.onclick = async () => {
+    try {
+      if (!ethers.isAddress(dest.value.trim())) throw new Error('bad destination address');
+      const to = ethers.getAddress(dest.value.trim());
+      const caps = await relayerCaps();
+      if (!caps.sweeperV2) throw new Error('this relayer does not run intent sweeps (sweeperV2 not configured) · open the full app to sweep.');
+      const w = stealthWallet(row.rec);
+      const nonce = parseInt(await jrpc('eth_getTransactionCount', [row.rec.address, 'latest']), 16);
+      const intent = {
+        action: 0, token: ZERO_ADDR, destination: to, precommitment: 0,
+        feeBps: caps.minFeeBps, deadline: Math.floor(Date.now() / 1000) + 86400,
+      };
+      const signature = await w.signTypedData(intentDomain(row.rec.address), INTENT_TYPES, intent);
+      const artifact = {
+        kind: 'eip7702-intent', chainId: CHAIN_ID, stealthAddress: row.rec.address,
+        sweeper: SWEEPER_V2,
+        authorization: sign7702(w.privateKey, CHAIN_ID, SWEEPER_V2, nonce),
+        intent, signature,
+      };
+      b.remove();
+      st.textContent = '';
+      previewAndBroadcast(row, panel, st, artifact,
+        formatEth(bal) + ' ETH → ' + shortAddr(to) + ' · direct intent (no pool) · fee ' + caps.minFeeBps + ' bps',
+        'sent to ' + to);
+    } catch (e) { st.textContent = 'error: ' + e.message; }
+  };
+}
+
+// the seamless journey kicks off the moment keys exist: PAYMENTS section + first scan
+// + the background auto-announce for raw-address payers.
+function startJourney() {
+  $('r-watch-note').style.display = 'none';
+  $('r-payments').style.display = 'block';
+  scan();
+  announceRecv(); // background: its status lives in the SHARE panel
+}
+
+// auto-rescan every 30s while the page is visible; each tick also refreshes row balances.
+setInterval(() => {
+  if (document.visibilityState !== 'visible') return;
+  if (!W || !W.viewPriv || $('r-payments').style.display !== 'block') return;
+  scan({ append: true, quiet: true }).then(() => { for (const row of rowsByAddr.values()) refreshRow(row); });
+}, 30000);
 
 // recovery line under the card: unannounced addresses from dead tabs stay recoverable.
 // Same rule as app-core: anything in gp-recv-records that is not the current session's recv.
@@ -805,6 +1284,7 @@ if (location.search.includes('gentest')) setTimeout(() => {
     deriveKeysFromSig(sig);
     $('r-remember-row').style.display = 'block';
     rAdvance(1);
+    startJourney();
     bl.textContent = 'GENTEST OK · ' + W.meta + ' · recv ' + W.recv.stealth;
   } catch (e) { bl.textContent = 'GENTEST FAIL: ' + ((e && e.message) || e); }
   document.body.appendChild(bl);
@@ -812,6 +1292,22 @@ if (location.search.includes('gentest')) setTimeout(() => {
 
 // opened with a payment hash: jump straight to the pay panel.
 enterPayMode();
+
+// returning user: a stored gp-session restores watch-only (viewing key + meta, never the
+// spend key). Scanning works immediately; sweeping asks to re-connect + re-sign.
+(function restoreWatchOnly() {
+  if ($('payflow').style.display === 'block') return; // payer mode: no restore
+  const sess = loadGpSession();
+  if (!sess || !sess.viewPriv || !sess.meta || W) return;
+  try {
+    const hexPart = sess.meta.replace(/^st:eth:0x/, '');
+    if (!/^[0-9a-fA-F]{132}$/.test(hexPart)) return;
+    W = { viewPriv: sess.viewPriv, meta: sess.meta, spendPub: '0x' + hexPart.slice(0, 66), viewPub: '0x' + hexPart.slice(66) };
+    $('r-watch-note').style.display = 'block';
+    $('r-payments').style.display = 'block';
+    scan();
+  } catch { /* corrupt session: ignore, the stepper still works */ }
+})();
 </script>
 <script type="module" src="./gp-invoices.mjs"></script>
 </body>

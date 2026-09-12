@@ -1,4 +1,4 @@
-<!-- GHOSTPAY invoice suite fragment (storage schema v3).
+<!-- GHOSTPAY invoice suite fragment (storage schema v4).
      The shell provides the tab bar plus these mount divs inside #gp-invoices (all
      optional: gp-invoices.mjs skips a view whose mount is absent):
        #tab-invoices    INVOICES (+ ESTIMATES sub-switch when #tab-estimates is absent)
@@ -8,6 +8,8 @@
        #tab-recurring   RECURRING templates
        #tab-settings    SETTINGS (profile, numbering, ENS publish, CSV export)
      Everything renders via JS into those mounts; this frag carries only scoped styles.
+     Line-item rows have their own tax rate picker (0% / 9% / 21% / custom) and discount
+     column, so the items table scrolls horizontally on narrow screens (.gpinv-tablewrap).
      gp-invoices.mjs fetches and injects this file itself (embedded fallback when opened
      from disk); the shell does not need to paste it. Actions inside the mounts use
      data-iact; the shell tab bar uses data-tab. gp-ui.css is linked page-wide by the
