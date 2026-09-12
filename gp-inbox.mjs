@@ -332,13 +332,39 @@ function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
     bBc.disabled = true;
     onRelayed();
     row._pendingArt = artifact;
-    st.textContent = 'relaying… (5-45s privacy delay, then block time. minutes, not seconds.)';
-    await GP.relaySweep(artifact); // emits "swept" on confirmation; the event handler advances the pill
-    // relaySweep swallows its own errors, so judge the outcome by the event it emits
-    st.textContent = row._pendingArt === artifact
-      ? 'relayer flow ended without a confirmation. the artifact stays valid: COPY ARTIFACT and retry via relay.mjs if needed.'
-      : 'confirmed. the pill above tracks the lifecycle.';
-    if (row._pendingArt === artifact) bBc.disabled = false;
+    // live broadcast lifecycle: a static line reads as dead during the minutes this takes.
+    // pulsing dot + elapsed timer while the relayer works, then the hash, then the outcome.
+    if (!document.getElementById('gp-pulse-style')) {
+      const s = document.createElement('style');
+      s.id = 'gp-pulse-style';
+      s.textContent = '.gp-pulse{display:inline-block;animation:gpPulse 1.2s ease-in-out infinite}@keyframes gpPulse{0%,100%{opacity:.25}50%{opacity:1}}';
+      document.head.appendChild(s);
+    }
+    const t0 = Date.now();
+    let phase = 'broadcasting via relayer', extra = '5-45s privacy delay';
+    const tick = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      st.innerHTML = '<span class="gp-pulse">&#9679;</span> ' + phase + ' · ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') + (extra ? ' · ' + extra : '');
+    }, 1000);
+    const out = await GP.relaySweep(artifact, h => {
+      phase = 'pending'; extra = 'tx ' + h.slice(0, 14) + '… · explorers show it only once mined';
+    });
+    clearInterval(tick);
+    if (out && out.hash) {
+      const link = ' · <a href="https://etherscan.io/tx/' + out.hash + '" target="_blank" rel="noopener">etherscan</a>';
+      if (out.status === 'confirmed') {
+        st.innerHTML = '&#10003; confirmed' + (out.block ? ' in block ' + out.block.toLocaleString() : '') + ' · tx ' + out.hash.slice(0, 14) + '…' + link;
+        return;
+      }
+      if (out.status === 'reverted') {
+        st.textContent = 'tx REVERTED onchain · ' + out.hash + ' · the artifact stays valid: COPY ARTIFACT and retry.';
+      } else {
+        st.innerHTML = 'still pending after 10 minutes · tx ' + out.hash.slice(0, 14) + '…' + link + ' · it is in the private mempool, it usually lands within a few more minutes.';
+      }
+    } else {
+      st.textContent = 'relayer broadcast failed: ' + ((out && out.error) || 'unknown') + ' · the artifact stays valid: COPY ARTIFACT and retry via relay.mjs.';
+    }
+    bBc.disabled = false;
   };
 }
 

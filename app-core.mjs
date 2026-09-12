@@ -621,7 +621,7 @@ if ($('i-legacy')) $('i-legacy').onchange = e => { LEGACY = e.target.checked; if
 // broadcast a signed artifact via the local relayer (serve.mjs POST /sweep). The runner wallet
 // pays gas; the stealth EOA stays unfunded. MetaMask strips authorizationList from type-4 txs,
 // so in-page wallet broadcast is dead · the relayer is the only broadcast path.
-async function relaySweep(artifact) {
+async function relaySweep(artifact, onHash) {
   const st = m => $('st-broadcast').textContent = m;
   // hash-bearing lines get a clickable etherscan link; the regex guard keeps innerHTML safe
   const txLink = h => /^0x[0-9a-fA-F]{64}$/.test(h) ? ' · <a href="https://etherscan.io/tx/' + h + '" target="_blank" rel="noopener">etherscan</a>' : '';
@@ -632,6 +632,7 @@ async function relaySweep(artifact) {
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
     stHtml('pending: ' + j.hash + txLink(j.hash) + ' · waiting for confirmation…');
+    if (onHash) { try { onHash(j.hash); } catch { /* listener errors never break the relay */ } }
     for (let i = 0; i < 120; i++) {
       await new Promise(x => setTimeout(x, 5000));
       const rcpt = await jrpc('eth_getTransactionReceipt', [j.hash]);
@@ -642,15 +643,17 @@ async function relaySweep(artifact) {
           const rec = payments.find(p => p.address.toLowerCase() === String(artifact.stealthAddress || '').toLowerCase());
           if (rec) rec.swept = true;
           gpEmit('swept', { hash: j.hash, block: parseInt(rcpt.blockNumber, 16), artifact, payment: rec || null });
-        } else {
-          stHtml('tx REVERTED onchain · ' + j.hash + txLink(j.hash) + ' · copy the artifact and retry via relay.mjs if the failure was transient.');
+          return { hash: j.hash, status: 'confirmed', block: parseInt(rcpt.blockNumber, 16) };
         }
-        return;
+        stHtml('tx REVERTED onchain · ' + j.hash + txLink(j.hash) + ' · copy the artifact and retry via relay.mjs if the failure was transient.');
+        return { hash: j.hash, status: 'reverted' };
       }
     }
     stHtml('still pending after 10 minutes · ' + j.hash + txLink(j.hash) + ' · check a block explorer.');
+    return { hash: j.hash, status: 'timeout' };
   } catch (e) {
     st('relayer broadcast failed: ' + e.message + ' · artifact is still valid, COPY ARTIFACT and use relay.mjs.');
+    return { status: 'error', error: e.message };
   }
 }
 
@@ -1252,7 +1255,7 @@ window.GP = {
   scan: fromBlock => scan(Number.isFinite(fromBlock) ? { from: fromBlock } : {}),
   scanIncremental: () => scan({ append: true, quiet: true }),
   announce: () => announceRecv(),
-  relaySweep: artifact => relaySweep(artifact),
+  relaySweep: (artifact, onHash) => relaySweep(artifact, onHash),
   relayerCaps,
   fmt: { formatEth, formatUsd },
   toast,
