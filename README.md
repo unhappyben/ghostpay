@@ -15,24 +15,24 @@ Every step after payment is relayed: the recipient's wallet appears nowhere onch
 
 ## Dashboard and sessions
 
-The app is a five-step wizard that collapses into a dashboard on return visits. Opting into "remember" stores a `gp-session` entry in localStorage containing only the viewing key and the stealth meta-address: a watch-only session. The spend key is never stored, so sweeping always asks for a fresh wallet signature. With a stored session, steps 1-2 collapse into the `#gp-dash` header (session mode, active address, rescan, forget), scanning runs in the background on load and on a timer, and new payments raise toast notifications plus events on the `GP.on`/`GP.emit` module bus. A status strip (`#gp-status`) shows relayer health, the relayer fee floor, and the ETH price, refreshed every 60s. The module contract between the core page and the feature modules below is documented in `docs/GP-API.md`.
+The app is three pages. `index.html` is the homepage: two doors (OPEN APP, INVOICE SUITE) plus the PAY A LINK panel, which is the payer flow. Opening the homepage with a payment hash (`#st:eth:0x…`) jumps straight to the pay panel. `app.html` is the app itself: a four-step wizard (connect, generate, sweep, withdraw) that collapses into a dashboard on return visits. `invoices.html` is the standalone invoice suite. Both app pages share `app-core.mjs` (connect, generate, scan, sweep, withdraw, the `window.GP` module API); the homepage is self-contained. Opting into "remember" stores a `gp-session` entry in localStorage containing only the viewing key and the stealth meta-address: a watch-only session. The spend key is never stored, so sweeping always asks for a fresh wallet signature. With a stored session, steps 1-2 collapse into the `#gp-dash` header (session mode, active address, rescan, forget), scanning runs in the background on load and on a timer, and new payments raise toast notifications plus events on the `GP.on`/`GP.emit` module bus. A status strip (`#gp-status`) shows relayer health, the relayer fee floor, and the ETH price, refreshed every 60s. The module contract between the core page and the feature modules below is documented in `docs/GP-API.md`.
 
 The app is also a PWA: `manifest.json`, `sw.js` (cache-first static shell, relayer endpoints always network-only), and `icon.svg`.
 
 ## Invoice suite (`gp-invoices.mjs`)
 
-Mounted inside step 3. On top of the basic invoice link it adds:
+Its own page, `invoices.html`, mounted into `#gp-invoices` (markup: `frag-invoices.html`). The page loads the same `app-core.mjs` as the app, so connect + generate + the announcement scanner work identically and payments reconcile live. Invoice links point at the homepage, so the payer lands on the pay panel. On top of the basic invoice link it adds:
 
 - **Tracked invoices.** Create an invoice with amount, token, note, and optional expiry; the suite stores it locally and watches the derived stealth address, marking it paid when the scanner sees the payment.
 - **Encrypted memos.** The payer's note travels inside the announcement metadata, encrypted to the recipient's viewing key. Metadata format v2: `[viewTag(1)][R(33)][nonce(12)][AES-GCM ciphertext]`. R is a compressed ephemeral memo key; the AES key is `keccak256(ECDH(r, viewPub) ‖ "memo")`, so decryption needs only the viewing key. A 1-byte metadata stays a bare view tag, so old payers and scanners keep working.
 - **QR + CSV + receipts.** Receive QR for the meta-address, CSV export of the invoice ledger, and printable receipts for paid invoices.
 - **ENS publish.** Writes a `stealth` text record on your ENS name so senders can resolve it to your stealth meta-address. The meta-address is public by design: anyone can derive fresh payment addresses from it, nobody can spend from it.
 
-The suite also enhances the pay-a-ghost flow (`#payghost`) with the memo field, so a payer can attach an encrypted note when announcing. Where the payer's wallet supports EIP-5792 (`wallet_sendCalls`), the ETH payment and the announcement go out in a single batched confirmation; other wallets keep the sequential announce-only flow. The status line says which path executed.
+The suite also enhances the pay-a-ghost flow (`#payghost`) with the memo field, so a payer can attach an encrypted note when announcing. The flow lives on the homepage pay panel: where the payer's wallet supports EIP-5792 (`wallet_sendCalls`), the ETH payment and the announcement go out in a single batched confirmation; other wallets keep the sequential announce-only flow. The status line says which path executed. Coming soon: payment links will announce in the same transaction via a PayAndAnnounce contract, deploy pending (`PAY_AND_ANNOUNCE` placeholder in `index.html`).
 
 ## Inbox (`gp-inbox.mjs`)
 
-Mounted inside step 4. Turns the raw payment list into a per-payment inbox:
+Mounted inside step 3 of `app.html` (SWEEP). Turns the raw payment list into a per-payment inbox:
 
 - **Status pills.** Each payment carries a pill on the ladder `DETECTED → SWEEPING → IN POOL → ASP PENDING → WITHDRAWABLE → WITHDRAWN`, plus a terminal `SWEPT DIRECT` state for sweeps that skip the pool.
 - **Labels.** Free-text labels per stealth address, stored locally.
@@ -42,7 +42,7 @@ Mounted inside step 4. Turns the raw payment list into a per-payment inbox:
 
 ## Money safety (`gp-money.mjs`)
 
-Mounted into steps 4 and 5. A guard layer over the existing buttons; the core handlers are never edited:
+Mounted into steps 3 and 4 of `app.html`. A guard layer over the existing buttons; the core handlers are never edited:
 
 - **Sweep preview.** SIGN SWEEP is gated behind an interstitial showing from address, balance, destination, fee floor, and sweeper contract before anything is signed.
 - **Cost preview + relay progress.** Broadcast clicks open a progress view that polls `GET ./status/<hash>` until the relayed transaction confirms or fails.
@@ -163,7 +163,7 @@ SweeperV2 is deployed on mainnet (`0xCC29c7723116155ccF20C7c0b8924F4747331903`).
 1. **Set `SWEEPER_V2=0xCC29c7723116155ccF20C7c0b8924F4747331903`** and restart serve.mjs: intent sweeps come online (`GET /health` confirms, the app switches to auto-armed intents automatically).
 2. **Deploy BatchRelayer.** `forge create BatchRelayer.sol:BatchRelayer`. No constructor args. Set `BATCH_RELAYER=<address>` to enable batch sweeps.
 3. **Set `PP_RELAY=1`** (optionally `PP_FEE_BPS`, `MIN_FEE_BPS`, `BROADCAST_URLS`) to enable local Privacy Pools withdrawals via `POST /pp-withdraw`.
-4. **Fund runners from Privacy Pools.** Withdraw from the app (step 5) to one or more fresh EOAs and use their keys in `runners.local.json`. One 0.01 ETH withdrawal funds dozens of sweeps. Rotate any time: withdraw again to a new address, swap the key, restart. The runners then have no funding link to you onchain.
+4. **Fund runners from Privacy Pools.** Withdraw from the app (step 4) to one or more fresh EOAs and use their keys in `runners.local.json`. One 0.01 ETH withdrawal funds dozens of sweeps. Rotate any time: withdraw again to a new address, swap the key, restart. The runners then have no funding link to you onchain.
 
 ## Relayer privacy
 
@@ -193,7 +193,10 @@ A note on what can and cannot be fixed. ZK cannot hide a computed output from th
 
 ## Files
 
-- `index.html`: the app core (connect, generate, receive, scan, sweep, withdraw), PWA shell
+- `index.html`: homepage. The three doors (OPEN APP, INVOICE SUITE, PAY A LINK) plus the payer flow (pay-a-ghost: connect, one button, EIP-5792 batch with sequential fallback; `PAY_AND_ANNOUNCE` placeholder for the coming one-transaction path)
+- `app.html`: the app (connect, generate, receive, scan, sweep, withdraw), PWA shell
+- `invoices.html`: the invoice suite standalone (same shared core, `#gp-invoices` mount)
+- `app-core.mjs`: the shared core imported by `app.html` and `invoices.html` (connect, generate, scan, sweep, withdraw, the `window.GP` module API)
 - `gp-invoices.mjs` / `gp-inbox.mjs` / `gp-money.mjs`: invoice suite, payment inbox, money-safety layer (`frag-*.html` are their markup)
 - `serve.mjs`: static server + announce/sweep/withdraw relayer
 - `notify.mjs`: watch-only payment notifier (Telegram/webhook)

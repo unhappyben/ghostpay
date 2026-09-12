@@ -1,10 +1,11 @@
 // gp-invoices.mjs · GHOSTPAY invoice suite module (docs/GP-API.md).
-// Mounts into #gp-invoices via frag-invoices.html: four sub-tabs (OVERVIEW, INVOICES,
-// CLIENTS, PROFILE) over three localStorage registries (gp-profile, gp-clients,
-// gp-invoices). Invoices pin a pre-derived stealth address in a self-contained
-// hash-param URL; payment status reconciles from GP payment events. The pay-a-ghost
-// flow keeps its encrypted memo enhancement (memo format unchanged). Pure helpers are
-// exported so a node smoke test can exercise migration + totals math without a DOM.
+// Mounts into #gp-invoices on invoices.html (frag-invoices.html markup): four sub-tabs
+// (OVERVIEW, INVOICES, CLIENTS, PROFILE) over three localStorage registries (gp-profile,
+// gp-clients, gp-invoices). Invoices pin a pre-derived stealth address in a self-contained
+// hash-param URL pointing at the homepage pay panel; payment status reconciles from GP
+// payment events. On the homepage the same file runs without the suite mount and keeps
+// only its pay-a-ghost enhancement (memo format unchanged). Pure helpers are exported so
+// a node smoke test can exercise migration + totals math without a DOM.
 
 const GP = typeof window !== 'undefined' ? window.GP || null : null;
 
@@ -686,7 +687,8 @@ function initSuite() {
     const expiry = Number.isFinite(days) && days > 0 ? Date.now() + Math.round(days * 86400000) : null;
     const items = rows.map(r => ({ description: r.description || 'item', qty: parseFloat(r.qty), unitPrice: parseFloat(r.unitPrice) }));
     const amount = fmtAmt(t.total, token);
-    const url = location.origin + location.pathname + '#' + GP.state.meta
+    // links point at the homepage: the payer lands on the pay panel, not the app
+    const url = location.origin + '/#' + GP.state.meta
       + '?pay=' + encodeURIComponent(amount + ' ' + token + (note ? ' · ' + note : ''))
       + '&inv=' + id + '&num=' + encodeURIComponent(a.number)
       + (expiry ? '&exp=' + expiry : '')
@@ -716,7 +718,8 @@ function initSuite() {
     const d = C.derive(GP.state.meta.slice(7));
     const id = 'inv-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36);
     const amount = fmtAmt(rec.total, rec.token);
-    const url = location.origin + location.pathname + '#' + GP.state.meta
+    // links point at the homepage: the payer lands on the pay panel, not the app
+    const url = location.origin + '/#' + GP.state.meta
       + '?pay=' + encodeURIComponent(amount + ' ' + rec.token + (rec.note ? ' · ' + rec.note : ''))
       + '&inv=' + id + '&num=' + encodeURIComponent(a.number)
       + (rec.expiry && rec.expiry > Date.now() ? '&exp=' + rec.expiry : '')

@@ -1,9 +1,12 @@
 // sw.js — GHOSTPAY service worker: cache-first static shell.
 // Relayer endpoints and all non-GET traffic always go to the network.
-const CACHE = 'ghostpay-v2';
+const CACHE = 'ghostpay-v3';
 const PRECACHE = [
   './',
   './index.html',
+  './app.html',
+  './invoices.html',
+  './app-core.mjs',
   './manifest.json',
   './icon.svg',
   './gp-inbox.mjs',

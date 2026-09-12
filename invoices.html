@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>GHOSTPAY · INVOICES</title>
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon.svg" type="image/svg+xml">
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',monospace; font-size:14px; line-height:1.6; }
+  .wrap { max-width:640px; margin:0 auto; padding:48px 20px 100px; }
+  .logo { font-size:clamp(40px,10vw,72px); font-weight:700; letter-spacing:-2px; }
+  .logo span { background:#fff; color:#000; padding:0 10px; }
+  .sub { color:#888; font-size:12px; margin-top:14px; }
+  .step { border:1px solid #333; margin-top:28px; padding:22px; }
+  .step.on { border-color:#fff; }
+  .step h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin-bottom:14px; }
+  .step.on h2 { color:#fff; }
+  button { background:#fff; color:#000; border:0; padding:14px 28px; font-family:inherit;
+    font-size:13px; font-weight:700; letter-spacing:.12em; cursor:pointer; width:100%; }
+  button:disabled { background:#222; color:#555; cursor:default; }
+  button.ghost { background:#000; color:#fff; border:1px solid #444; }
+  input, select, textarea { width:100%; background:#000; color:#fff; border:1px solid #333; padding:12px 14px;
+    font-family:inherit; font-size:13px; margin-top:8px; }
+  input:focus, select:focus, textarea:focus { outline:1px solid #fff; }
+  textarea { resize:vertical; }
+  .card { background:#fff; color:#000; padding:18px; margin-top:14px; word-break:break-all; font-size:12.5px; }
+  .card b { font-weight:700; }
+  .card .lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:6px; }
+  .card button { background:#000; color:#fff; margin-top:12px; padding:10px 18px; font-size:11px; }
+  .pay { border:1px solid #333; padding:16px; margin-top:12px; }
+  .pay.armed { border-color:#fff; }
+  .pay.swept { opacity:.35; }
+  .pay.swept .addr { text-decoration:line-through; }
+  .pay .addr { font-weight:700; }
+  .pay .meta { color:#777; font-size:11px; margin:6px 0 10px; }
+  .status { color:#888; font-size:12px; margin-top:12px; }
+  .ok { color:#fff; }
+  a { color:#fff; }
+  /* status strip + returning-user dashboard (ui-core) */
+  #gp-status { border:1px solid #333; padding:8px 12px; font-size:11px; color:#888; margin-bottom:22px;
+    word-break:break-word; }
+  #gp-dash { border:1px solid #fff; padding:16px; margin-bottom:8px; }
+  #gp-dash .dashaddr { font-size:12px; word-break:break-all; }
+  #gp-dash .dashmode { color:#888; font-size:10px; letter-spacing:.2em; }
+  #gp-dash .dashbtns { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  #gp-dash .dashbtns button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  #gp-toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#fff; color:#000;
+    padding:12px 20px; font-size:12px; font-weight:700; letter-spacing:.08em; z-index:99; display:none;
+    max-width:90vw; text-align:center; }
+  /* mobile: full-width steps, 44px touch targets, 16px inputs (stops iOS auto-zoom) */
+  @media (max-width:700px) {
+    .wrap { padding:24px 12px 80px; }
+    .step { padding:16px; width:100%; }
+    button { min-height:44px; }
+    input, select, textarea { font-size:16px; }
+    #gp-dash .dashbtns { flex-direction:column; }
+    #gp-dash .dashbtns button { width:100%; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="gp-status">relayer: checking…</div>
+  <div class="logo">GHOST<span>PAY</span></div>
+  <div class="sub">INVOICE SUITE · <a href="./">GHOSTPAY HOME</a> · <a href="./app.html">OPEN APP</a></div>
+  <div class="sub" id="bootline" style="color:#fff">booting…</div>
+
+  <!-- returning-user dashboard: replaces steps 1-2 when a gp-session exists on this device -->
+  <div id="gp-dash" style="display:none">
+    <div class="dashmode" id="gp-dash-mode">WATCH-ONLY SESSION</div>
+    <div class="dashaddr" id="gp-dash-addr"></div>
+    <div class="status" style="margin-top:6px">steps 1-2 are collapsed: your keys are restored from this device's stored session. sweeping still needs a fresh wallet signature (RE-CONNECT, then GENERATE).</div>
+    <div class="dashbtns">
+      <button id="b-reconnect">RE-CONNECT</button>
+      <button class="ghost" id="b-notify">ENABLE NOTIFICATIONS</button>
+      <button class="ghost" id="b-forget">FORGET THIS DEVICE</button>
+    </div>
+  </div>
+
+  <!-- 1 -->
+  <div class="step on" id="s1">
+    <h2>1 · CONNECT WALLET</h2>
+    <button id="b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
+    <div class="status" id="st-connect"></div>
+    <div id="qrwrap" style="display:none;margin-top:16px;text-align:center">
+      <canvas id="qr" style="background:#fff;padding:14px;image-rendering:pixelated"></canvas>
+      <div class="status">scan with your wallet</div>
+      <a id="wc-link" href="#" style="display:inline-block;margin-top:12px;background:#fff;color:#000;padding:14px 28px;font-weight:700;letter-spacing:.12em;text-decoration:none">OPEN WALLET</a>
+      <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="wc-raw" style="word-break:break-all;color:#fff"></span></div>
+    </div>
+    <button class="ghost" id="b-injected" style="display:none">USE INJECTED WALLET INSTEAD</button>
+    <div class="status" style="margin-top:10px"><a href="#" id="b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
+    <input id="i-wcpid" type="hidden" value="c6c9bacd35afa3eb9e6cccf6d8464395">
+  </div>
+
+  <!-- 2 -->
+  <div class="step" id="s2">
+    <h2>2 · GENERATE ADDRESS</h2>
+    <button id="b-gen" disabled>GENERATE MY STEALTH KEYS</button>
+    <div class="status" id="st-gen">sign one message · your keys are derived from the signature. same wallet, same signature, same keys. nothing to back up.</div>
+    <div id="remember-row" style="display:none;margin-top:14px">
+      <label style="display:block;font-size:12px;color:#fff;cursor:pointer"><input type="checkbox" id="i-remember" style="width:auto;margin-right:6px">remember this device (watch-only)</label>
+      <div class="status" style="color:#666;margin-top:4px">warning: watch-only persistence reveals your payment history to anyone with access to this browser profile. the spend key is NEVER stored: sweeping always requires a fresh wallet signature.</div>
+    </div>
+    <div class="card" id="c-recv" style="display:none">
+      <div class="lbl">YOUR ONE-TIME RECEIVING ADDRESS · SHARE THIS TO GET PAID</div>
+      <b id="v-recv"></b>
+      <button id="b-copyrecv">COPY ADDRESS</button>
+      <div style="margin-top:14px;border-top:1px solid #ddd;padding-top:10px">
+        <div style="font-size:11px;color:#555;margin-bottom:8px">only needed if the payer pays the raw address outside a payment link: payment links announce automatically when the payer pays.</div>
+        <button id="b-annrecv" class="ghost" style="background:#fff;color:#000;border:1px solid #000;width:auto;padding:8px 14px;font-size:10px;margin-top:0">ANNOUNCE IT</button>
+        <div class="status" id="st-announce" style="color:#444"></div>
+      </div>
+    </div>
+    <details id="d-meta" style="display:none;margin-top:12px">
+      <summary style="cursor:pointer;color:#888;font-size:11px">advanced: stealth meta-address + pay-me link</summary>
+      <div class="card">
+        <div class="lbl">YOUR STEALTH META-ADDRESS</div>
+        <b id="v-meta"></b>
+        <button id="b-copymeta">COPY META-ADDRESS</button>
+        <button id="b-copylink" class="ghost" style="background:#000;color:#fff;border:0">COPY PAY-ME LINK</button>
+      </div>
+    </details>
+  </div>
+
+
+  <!-- the invoice suite: same connect + generate machinery as the app (app-core.mjs), then the mount -->
+  <div class="step on">
+    <h2>INVOICE SUITE</h2>
+    <div id="gp-invoices">
+<div id="gpinv-root">
+<style>
+  #gpinv-root { border:1px solid #333; margin-top:16px; padding:22px; }
+  #gpinv-root .gpinv-title { font-size:11px; letter-spacing:.25em; color:#888; margin-bottom:16px; }
+  #gpinv-root .gpinv-tabs { display:flex; border:1px solid #333; margin-bottom:20px; }
+  #gpinv-root .gpinv-tabs button { background:#000; color:#888; border:0; border-right:1px solid #333;
+    padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
+  #gpinv-root .gpinv-tabs button:last-child { border-right:0; }
+  #gpinv-root .gpinv-tabs button.on { background:#fff; color:#000; font-weight:700; }
+  #gpinv-root h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
+  #gpinv-root .gpinv-box { border:1px solid #333; padding:16px; }
+  #gpinv-root .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  #gpinv-root .gpinv-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:4px; }
+  #gpinv-root .gpinv-big { font-size:24px; font-weight:700; letter-spacing:-.5px; }
+  #gpinv-root .gpinv-unit { font-size:12px; color:#888; letter-spacing:.1em; }
+  #gpinv-root .gpinv-muted { color:#777; }
+  #gpinv-root .gpinv-mono { font-size:11px; color:#777; word-break:break-all; }
+  #gpinv-root .gpinv-mg { width:46px; height:46px; border:1px solid #fff; display:flex; flex:none;
+    align-items:center; justify-content:center; font-weight:700; letter-spacing:.1em; }
+  #gpinv-root .gpinv-tablewrap { overflow-x:auto; }
+  #gpinv-root table { width:100%; border-collapse:collapse; font-size:12px; }
+  #gpinv-root th { text-align:left; font-size:10px; letter-spacing:.2em; color:#777; font-weight:400;
+    padding:6px 10px 6px 0; border-bottom:1px solid #333; white-space:nowrap; }
+  #gpinv-root td { padding:10px 10px 10px 0; border-bottom:1px solid #222; vertical-align:top; }
+  #gpinv-root .gpinv-rowbtn { cursor:pointer; }
+  #gpinv-root .gpinv-rowbtn:hover td { background:#0d0d0d; }
+  #gpinv-root .gpinv-detail td { background:#0a0a0a; padding:16px; }
+  #gpinv-root td input { margin-top:0; padding:8px 10px; font-size:12px; }
+  #gpinv-root .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
+    letter-spacing:.15em; white-space:nowrap; }
+  #gpinv-root .gpinv-pill.dim { border-color:#444; color:#888; }
+  #gpinv-root .gpinv-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  #gpinv-root .gpinv-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  #gpinv-root .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
+  #gpinv-root .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
+    text-align:center; margin-top:4px; }
+  @media (max-width:700px) {
+    #gpinv-root { padding:16px; }
+    #gpinv-root .gpinv-grid { grid-template-columns:1fr; }
+    #gpinv-root .gpinv-actions { flex-direction:column; }
+    #gpinv-root .gpinv-actions button { width:100%; }
+    #gpinv-root .gpinv-tabs button { min-height:44px; }
+  }
+</style>
+  <div class="gpinv-title">INVOICE SUITE</div>
+  <div class="gpinv-tabs">
+    <button data-act="tab" data-tab="overview" class="on">OVERVIEW</button>
+    <button data-act="tab" data-tab="invoices">INVOICES</button>
+    <button data-act="tab" data-tab="clients">CLIENTS</button>
+    <button data-act="tab" data-tab="profile">PROFILE</button>
+  </div>
+  <div id="gpinv-view"></div>
+  <div id="gpinv-qrwrap" style="display:none;margin-top:14px;text-align:center">
+    <canvas id="gpinv-qr" style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas>
+    <div class="status" id="gpinv-qr-cap"></div>
+  </div>
+</div>
+    </div>
+  </div>
+
+  <!-- scanner stubs: the shared core scans announcements into these so the suite sees
+       payments (PAID reconciliation runs off GP payment events). c-secret lets the
+       silent auto-arm download the withdrawal secret exactly as on the app page. -->
+  <div style="display:none">
+    <div id="payments"></div>
+    <div id="st-scan"></div>
+    <input id="i-fromblock" type="number">
+    <div id="c-secret">
+      <div id="v-secret-lbl"></div>
+      <b id="v-secret"></b>
+      <button id="b-dlsecret"></button>
+    </div>
+  </div>
+
+</div>
+<div id="gp-toast"></div>
+
+<script src="./config.local.js" onerror="this.remove()"></script>
+<script type="module" src="./app-core.mjs"></script>
+<script type="module" src="./gp-invoices.mjs"></script>
+</body>
+</html>
