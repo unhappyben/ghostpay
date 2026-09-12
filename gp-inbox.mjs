@@ -3,8 +3,16 @@
 //   <script type="module" src="./gp-inbox.mjs"></script>
 // Markup comes from frag-inbox.html (pasted into #gp-inbox by the integrator, or fetched
 // and injected by this module, with an embedded copy as the offline fallback).
-const GP = window.GP;
-if (!GP || !GP.version) throw new Error('gp-inbox: window.GP missing · load this module after the core inline script');
+// app-core's static esm.sh imports can delay window.GP assembly past this module's
+// evaluation (the same race gp-invoices/gp-reports handle): wait for it instead of dying.
+const GP = await (async () => {
+  for (let i = 0; i < 60; i++) {
+    if (window.GP && window.GP.version) return window.GP;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return null;
+})();
+if (!GP) throw new Error('gp-inbox: window.GP never appeared · load this module after the core inline script');
 const ethers = GP.ethers;
 
 const TOKENS = [
