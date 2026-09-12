@@ -606,7 +606,16 @@ async function scan(opts = {}) {
 }
 
 // sweep controls exist on app.html only (invoices.html imports this core for connect/generate/scan)
-if ($('b-rescan')) $('b-rescan').onclick = () => { if (W && W.viewPriv) scan(); };
+// RESCAN with an empty from-block means a real rescan: latest − 50000, ignoring the saved
+// cursor (the cursor only drives the automatic incremental scans). A typed from-block wins.
+if ($('b-rescan')) $('b-rescan').onclick = async () => {
+  if (!(W && W.viewPriv)) return;
+  if (!Number.isFinite(parseInt($('i-fromblock').value, 10))) {
+    const latest = parseInt(await jrpc('eth_blockNumber', []), 16);
+    return scan({ from: Math.max(0, latest - 50000) });
+  }
+  scan();
+};
 if ($('i-legacy')) $('i-legacy').onchange = e => { LEGACY = e.target.checked; if (W && W.viewPriv) scan(); };
 
 // broadcast a signed artifact via the local relayer (serve.mjs POST /sweep). The runner wallet
