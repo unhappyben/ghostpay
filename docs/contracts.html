@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHOSTPAY DOCS · CONTRACTS</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace; font-size:14px; line-height:1.65; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 100px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px; align-items:center; border-bottom:1px solid #333; padding:14px 0; margin-bottom:36px; }
+  nav .logo { font-weight:700; letter-spacing:.2em; font-size:13px; color:#fff; text-decoration:none; margin-right:14px; }
+  nav a { color:#888; text-decoration:none; font-size:10px; letter-spacing:.12em; padding:6px 10px; border:1px solid transparent; }
+  nav a:hover { color:#fff; border-color:#333; }
+  nav a.on { background:#fff; color:#000; font-weight:700; }
+  h1 { font-size:clamp(24px,5vw,34px); font-weight:700; letter-spacing:-1px; }
+  h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:36px 0 12px; border-bottom:1px solid #222; padding-bottom:8px; }
+  h3 { font-size:12px; letter-spacing:.15em; color:#fff; margin:22px 0 6px; }
+  p { margin:10px 0; color:#ccc; }
+  .sub { color:#888; font-size:12px; margin-top:8px; }
+  code { background:#111; border:1px solid #2a2a2a; padding:1px 6px; font-size:12.5px; word-break:break-all; }
+  pre { background:#0a0a0a; border:1px solid #2a2a2a; padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:12px 0; color:#ddd; }
+  pre code { background:none; border:0; padding:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin:12px 0; }
+  th { text-align:left; font-size:10px; letter-spacing:.2em; color:#888; font-weight:400; padding:8px 12px 8px 0; border-bottom:1px solid #333; vertical-align:top; white-space:nowrap; }
+  td { padding:10px 12px 10px 0; border-bottom:1px solid #1c1c1c; vertical-align:top; color:#ccc; }
+  ul, ol { margin:10px 0 10px 22px; color:#ccc; }
+  li { margin:6px 0; }
+  a { color:#fff; }
+  .addr { font-size:12px; word-break:break-all; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./index.html">GHOSTPAY DOCS</a>
+  <a href="./index.html">INDEX</a>
+  <a href="./relayer.html">RELAYER</a>
+  <a href="./fees.html">FEES</a>
+  <a href="./api.html">API</a>
+  <a href="./privacy.html">PRIVACY</a>
+  <a href="./recovery.html">RECOVERY</a>
+  <a class="on" href="./contracts.html">CONTRACTS</a>
+</nav>
+
+<h1>CONTRACTS</h1>
+<p class="sub">three contracts, two deployed on mainnet, both verified on Blockscout. unaudited prototype software.</p>
+
+<h2>STEALTHSWEEPERV2 (SweeperV2.sol)</h2>
+<p class="addr"><code>0xCC29c7723116155ccF20C7c0b8924F4747331903</code> · mainnet · <a href="https://eth.blockscout.com/address/0xCC29c7723116155ccF20C7c0b8924F4747331903">verified on Blockscout</a></p>
+<p>The EIP-7702 delegation target for sweeps, a strict superset of the v1 sweeper. V1 signs a 7702 authorization but the relayer picks the calldata, so a malicious relayer could call <code>sweepETH(itsOwnAddress)</code> and take the whole balance. V2 adds <code>executeSweep(intent, sig)</code>: every parameter of the sweep comes from an EIP-712 intent signed by the stealth key itself, so third-party relaying is trustless. A relayer that tampers with anything invalidates the signature.</p>
+
+<h3>EIP-712 SPEC</h3>
+<pre><code>DOMAIN_TYPEHASH =
+  keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+
+SWEEP_INTENT_TYPEHASH =
+  keccak256("SweepIntent(uint8 action,address token,address destination,uint256 precommitment,uint256 feeBps,uint256 deadline)")
+
+NAME_HASH    = keccak256("GhostpaySweeper")
+VERSION_HASH = keccak256("1")
+
+domainSeparator() = keccak256(abi.encode(
+  DOMAIN_TYPEHASH, NAME_HASH, VERSION_HASH, block.chainid, address(this)))
+
+hashSweepIntent(intent) = keccak256(abi.encodePacked(
+  "\x19\x01",
+  domainSeparator(),
+  keccak256(abi.encode(SWEEP_INTENT_TYPEHASH,
+    intent.action, intent.token, intent.destination,
+    intent.precommitment, intent.feeBps, intent.deadline))))</code></pre>
+<p>Under 7702 the code executes as the stealth EOA, so <code>address(this)</code> is the stealth account itself: <code>verifyingContract</code> pins every intent to exactly one stealth address. The domain separator is rebuilt fresh in memory on every call: never cached, never immutable, because under 7702 neither storage nor immutables travel with the code.</p>
+
+<h3>THE INTENT STRUCT</h3>
+<table>
+  <tr><th>FIELD</th><th>TYPE</th><th>MEANING</th></tr>
+  <tr><td><code>action</code></td><td>uint8</td><td>0 = ETH to destination · 1 = Privacy Pools ETH deposit · 2 = PP token deposit · 3 = token to destination.</td></tr>
+  <tr><td><code>token</code></td><td>address</td><td>Actions 2/3 only (ignored otherwise).</td></tr>
+  <tr><td><code>destination</code></td><td>address</td><td>Actions 0/3 only (ignored otherwise).</td></tr>
+  <tr><td><code>precommitment</code></td><td>uint256</td><td>Actions 1/2 only: the Privacy Pools deposit precommitment.</td></tr>
+  <tr><td><code>feeBps</code></td><td>uint256</td><td>Relayer fee in basis points of the swept amount, paid to <code>tx.origin</code>. Onchain cap <code>MAX_FEE_BPS = 1000</code> (10%).</td></tr>
+  <tr><td><code>deadline</code></td><td>uint256</td><td>Valid while <code>block.timestamp &lt;= deadline</code>.</td></tr>
+</table>
+<p><code>executeSweep</code> (selector <code>0x89cb3125</code>) requires: not expired, fee within cap, and the recovered signer equal to <code>address(this)</code>: a valid recovery can only ever equal the executing account. The fee pays <code>tx.origin</code>, not <code>msg.sender</code>, so batched relaying still pays the runner that paid the gas, never the dispatcher contract.</p>
+
+<h2>PAYANDANNOUNCE (PayAndAnnounce.sol)</h2>
+<p class="addr"><code>0x665E5f19FFFfBa541B3314E66bBAaCD08080cC02</code> · mainnet · <a href="https://eth.blockscout.com/address/0x665E5f19FFFfBa541B3314E66bBAaCD08080cC02">verified on Blockscout</a></p>
+<p>ERC-5564 stealth payment and announcement in one transaction. <code>pay(stealth, ephPub, metadata)</code> is payable: it emits the Announcement event via the canonical singleton (<code>0x55649E01B5Df198D18D95b5cc5051630cfD45564</code>, scheme 1) and forwards the ETH to the stealth address, atomically. If the payment cannot be delivered the whole transaction reverts, so no announcement is ever left pointing at a payment that did not happen. The contract emits nothing of its own: the singleton's Announcement event is the entire output, identical in shape to what the relayer or an EIP-5792 batch produces. <code>payToken</code> pulls via <code>transferFrom</code>, so token payments need a prior approve (or a 5792 batch of approve + payToken).</p>
+
+<h2>BATCHRELAYER (BatchRelayer.sol)</h2>
+<p class="addr">not deployed · source in the repo · <a href="./relayer.html">deployment checklist in RELAYER</a></p>
+<p>Fan-out dispatcher for batched 7702 sweeps. One type-4 transaction carries up to 20 authorizations in its authorization list, then one call runs every sweep: <code>relay()</code> is all-or-nothing (any failed inner call reverts the batch, bubbling the reason), <code>relaySkipFailures()</code> is best-effort and emits one <code>RelayFailed(index, target, reason)</code> event per failure. One gas payment for N sweeps. Unlike the sweeper this contract executes as itself, so plain logic is fine. Fees still land on <code>tx.origin</code>, because <code>executeSweep</code> pays <code>tx.origin</code>, not this contract. Caveat: a batch shares one transaction, so the swept addresses are linked onchain. Deploy with no constructor args, then set <code>BATCH_RELAYER=&lt;address&gt;</code> to enable <code>eip7702-intent-batch</code>.</p>
+
+<h2>THE 7702 EXECUTION MODEL</h2>
+<p>EIP-7702 lets an EOA delegate its execution to contract code for a transaction. The mechanics that matter for the sweeper:</p>
+<ul>
+  <li><b>Code runs as the EOA.</b> <code>address(this)</code> is the delegating stealth account. Its ETH and token balances are what the sweep moves. Calls out (Privacy Pools deposit, destination transfer, fee to <code>tx.origin</code>) are indistinguishable from the EOA acting itself.</li>
+  <li><b>Storage does not travel.</b> Storage reads and writes hit the EOA's own (empty) storage, not the sweeper's. Only constants and pure code live in the bytecode, so only they survive delegation. A constructor-populated mapping would read as empty in the EOA context. This is why the pool addresses are <code>constant</code> and the EIP-712 domain separator is rebuilt in memory on every call.</li>
+  <li><b>The authorization is single-use per nonce.</b> It binds the delegation target and the EOA nonce. A replayed artifact fails on the consumed nonce, which is also what makes the reaper's rebroadcasts safe.</li>
+  <li><b>The stealth EOA never needs gas.</b> The runner sends the type-4 transaction and pays; the EOA just delegated.</li>
+</ul>
+
+<h2>SUPPORTING ADDRESSES</h2>
+<table>
+  <tr><th>CONTRACT</th><th>ADDRESS</th><th>ROLE</th></tr>
+  <tr><td>ERC-5564 announcer</td><td class="addr"><code>0x55649E01B5Df198D18D95b5cc5051630cfD45564</code></td><td>The canonical singleton every Announcement event comes from.</td></tr>
+  <tr><td>Privacy Pools entrypoint</td><td class="addr"><code>0x6818809EefCe719E480a7526D76bD3e561526b46</code></td><td>Deposits (actions 1/2) and relayed withdrawals.</td></tr>
+  <tr><td>Sweeper.sol (v1)</td><td class="addr">deployed, legacy</td><td>The fallback sweep path for relayers without SweeperV2. The relayer picks the calldata, so prefer intent sweeps.</td></tr>
+</table>
+<p>Fork tests for SweeperV2 + BatchRelayer live in <code>test/</code> (<code>forge test</code>, needs <code>MAINNET_RPC</code>).</p>
+</div>
+</body>
+</html>

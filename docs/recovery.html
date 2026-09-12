@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHOSTPAY DOCS · RECOVERY</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace; font-size:14px; line-height:1.65; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 100px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px; align-items:center; border-bottom:1px solid #333; padding:14px 0; margin-bottom:36px; }
+  nav .logo { font-weight:700; letter-spacing:.2em; font-size:13px; color:#fff; text-decoration:none; margin-right:14px; }
+  nav a { color:#888; text-decoration:none; font-size:10px; letter-spacing:.12em; padding:6px 10px; border:1px solid transparent; }
+  nav a:hover { color:#fff; border-color:#333; }
+  nav a.on { background:#fff; color:#000; font-weight:700; }
+  h1 { font-size:clamp(24px,5vw,34px); font-weight:700; letter-spacing:-1px; }
+  h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:36px 0 12px; border-bottom:1px solid #222; padding-bottom:8px; }
+  h3 { font-size:12px; letter-spacing:.15em; color:#fff; margin:22px 0 6px; }
+  p { margin:10px 0; color:#ccc; }
+  .sub { color:#888; font-size:12px; margin-top:8px; }
+  code { background:#111; border:1px solid #2a2a2a; padding:1px 6px; font-size:12.5px; word-break:break-all; }
+  pre { background:#0a0a0a; border:1px solid #2a2a2a; padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:12px 0; color:#ddd; }
+  pre code { background:none; border:0; padding:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin:12px 0; }
+  th { text-align:left; font-size:10px; letter-spacing:.2em; color:#888; font-weight:400; padding:8px 12px 8px 0; border-bottom:1px solid #333; vertical-align:top; white-space:nowrap; }
+  td { padding:10px 12px 10px 0; border-bottom:1px solid #1c1c1c; vertical-align:top; color:#ccc; }
+  ul, ol { margin:10px 0 10px 22px; color:#ccc; }
+  li { margin:6px 0; }
+  a { color:#fff; }
+  .pb { border:1px solid #333; padding:18px; margin:16px 0; }
+  .pb h3 { margin-top:0; }
+  .pb .lbl { font-size:10px; letter-spacing:.2em; color:#888; margin:12px 0 4px; }
+  .pb p { font-size:12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./index.html">GHOSTPAY DOCS</a>
+  <a href="./index.html">INDEX</a>
+  <a href="./relayer.html">RELAYER</a>
+  <a href="./fees.html">FEES</a>
+  <a href="./api.html">API</a>
+  <a href="./privacy.html">PRIVACY</a>
+  <a class="on" href="./recovery.html">RECOVERY</a>
+  <a href="./contracts.html">CONTRACTS</a>
+</nav>
+
+<h1>RECOVERY PLAYBOOKS</h1>
+<p class="sub">the failures that actually happen, and the way out of each.</p>
+
+<div class="pb">
+  <h3>DEAD TAB BEFORE THE ANNOUNCE</h3>
+  <p class="lbl">SYMPTOM</p>
+  <p>The tab died after generating a receive address but before announcing it, and the address is gone from the screen.</p>
+  <p class="lbl">WHY IT IS FINE</p>
+  <p>Every derived receive address is recorded in <code>localStorage</code> under <code>gp-recv-records</code> the moment it is generated. On reload, unannounced records surface in the <b>RECOVERY</b> banner with a count and the latest address. A restored watch-only session reuses the last pending record as its receive address, so an address you already shared stays alive.</p>
+  <p class="lbl">FIX</p>
+  <p>Reload the app, read the address from the RECOVERY banner, share or announce it again. Records prune automatically once a payment to that address is swept: funds moved, nothing left to recover.</p>
+</div>
+
+<div class="pb">
+  <h3>DROPPED / PHANTOM TRANSACTION</h3>
+  <p class="lbl">SYMPTOM</p>
+  <p>The relayer returned a hash, <code>GET /status/:hash</code> says <code>pending</code> for many minutes, and explorers show nothing at all.</p>
+  <p class="lbl">WHY</p>
+  <p>Broadcasts go to Flashbots Protect's private mempool: invisibility on explorers is normal until mined. But Protect can also silently drop a transaction it cannot include, and (before the affordability preflight) it accepted unfunded transactions that never mined, producing phantom pendings.</p>
+  <p class="lbl">FIX</p>
+  <p>Usually nothing: the relayer's reaper journals every announce and intent sweep to <code>broadcasts.jsonl</code>, waits a 6-minute grace window, and rebroadcasts with a fresh nonce, up to 4 attempts. Check the journal's <code>finalStatus</code>: <code>confirmed</code>, <code>replaced</code> (with <code>replacedBy</code> carrying the new hash), <code>reverted</code>, or <code>given-up</code>. Operator-side, keep the runner funded: the affordability preflight now refuses broadcasts the runner cannot pay for with a 400 instead of a phantom hash. A legacy sweep or withdrawal that never landed is not journaled; its artifact stays valid, so re-submit it.</p>
+</div>
+
+<div class="pb">
+  <h3>STALE AUTHORIZATION</h3>
+  <p class="lbl">SYMPTOM</p>
+  <p><code>POST /sweep</code> fails with: <code>stale authorization: stealth EOA nonce is N but the artifact was signed for M</code>.</p>
+  <p class="lbl">WHY</p>
+  <p>The 7702 authorization is bound to the stealth EOA's nonce at signing time. Something landed on that address since (another sweep, or a rebroadcast the reaper already made), so the signed nonce no longer matches.</p>
+  <p class="lbl">FIX</p>
+  <p>Re-scan and SIGN SWEEP again in the app. The fresh artifact carries the current nonce. The old artifact is dead weight; discard it.</p>
+</div>
+
+<div class="pb">
+  <h3>LOST PP-SECRET</h3>
+  <p class="lbl">SYMPTOM</p>
+  <p>The deposit is in Privacy Pools, but the pp-secret file is gone.</p>
+  <p class="lbl">WHY THERE IS NO FIX</p>
+  <p>The sweep deposits against a <code>poseidon2(nullifier, secret)</code> precommitment. The secret is generated in the browser at sweep time and downloaded as a file right then; it exists nowhere else, by design. Without it no withdrawal proof can be constructed. The funds are unrecoverable. This is the one failure in this list with no playbook.</p>
+  <p class="lbl">PREVENTION</p>
+  <p>The money-safety layer blocks further sweeps once a secret exists until you confirm the file is saved (or pass a re-upload check). The encrypted backup/restore export (PBKDF2, 600k iterations, AES-GCM) carries local state to another device. Keep copies of the secret file itself; it is the only key to the deposit.</p>
+</div>
+
+<div class="pb">
+  <h3>WRONG-WALLET SCAN</h3>
+  <p class="lbl">SYMPTOM</p>
+  <p>Connected, generated, scanned: zero payments, and the meta-address on screen does not match the one that was shared.</p>
+  <p class="lbl">WHY</p>
+  <p>Keys derive from one wallet signature. A different wallet produces a different signature, different keys, and a scanner that finds nothing: every announcement fails the meta check.</p>
+  <p class="lbl">FIX</p>
+  <p>Connect the same wallet account used when the keys were first generated, and sign again. Compare the meta-address to the one that was shared before concluding anything is lost. Watch-only sessions carry the viewing key of the original wallet, so a restored session scanning fine while a fresh connect finds nothing is the same mismatch in reverse.</p>
+</div>
+
+<div class="pb">
+  <h3>CURSOR AHEAD OF HISTORY</h3>
+  <p class="lbl">SYMPTOM</p>
+  <p>A payment is known to exist (the payer shows the transaction) but scans do not surface it, typically on a new device or a restored session.</p>
+  <p class="lbl">WHY</p>
+  <p>Incremental scans resume from the stored cursor (<code>ghostpay:lastScanned:&lt;viewPub&gt;</code>). If the cursor is ahead of the block containing the announcement, the scan never looks back far enough. A default rescan starts at latest minus 50000 blocks, which can still be too recent for an old payment.</p>
+  <p class="lbl">FIX</p>
+  <p>Use RESCAN with an explicit from-block at or before the payment's block. For announcements made before 2026-09-08, also tick the legacy scheme checkbox: those used the sha256 shared-secret scheme and derive different addresses.</p>
+</div>
+
+<p class="sub" style="margin-top:28px">relayer-side failures (journal, reaper, runner funding) are covered in <a href="./relayer.html">RELAYER</a>.</p>
+</div>
+</body>
+</html>

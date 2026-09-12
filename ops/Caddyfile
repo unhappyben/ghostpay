@@ -1,0 +1,30 @@
+# ghostpay relayer + app: Caddy terminates TLS (automatic HTTPS via Let's Encrypt)
+# and proxies to serve.mjs on 127.0.0.1:8791.
+# DNS: ghostpay.ethprivacy.tools already resolves to 80.78.19.4.
+
+ghostpay.ethprivacy.tools {
+	reverse_proxy 127.0.0.1:8791
+
+	header {
+		# the app uses inline <script> and <style> blocks and calls its RPC endpoints
+		# from the browser, so script-src/style-src need 'unsafe-inline' and connect-src
+		# must name the RPC hosts. Tighten these when the app allows it.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://rpc.flashbots.net https://eth.drpc.org https://eth.merkle.io; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+# docs site, for later: serves the docs/ directory shipped with the repo.
+# Uncomment once DNS for docs.ethprivacy.tools points at 80.78.19.4.
+#
+# docs.ethprivacy.tools {
+# 	root * /opt/ghostpay/docs
+# 	file_server
+#
+# 	header {
+# 		X-Content-Type-Options "nosniff"
+# 		Referrer-Policy "no-referrer"
+# 	}
+# }

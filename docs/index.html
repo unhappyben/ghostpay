@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHOSTPAY DOCS</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace; font-size:14px; line-height:1.65; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 100px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px; align-items:center; border-bottom:1px solid #333; padding:14px 0; margin-bottom:36px; }
+  nav .logo { font-weight:700; letter-spacing:.2em; font-size:13px; color:#fff; text-decoration:none; margin-right:14px; }
+  nav a { color:#888; text-decoration:none; font-size:10px; letter-spacing:.12em; padding:6px 10px; border:1px solid transparent; }
+  nav a:hover { color:#fff; border-color:#333; }
+  nav a.on { background:#fff; color:#000; font-weight:700; }
+  h1 { font-size:clamp(28px,6vw,42px); font-weight:700; letter-spacing:-1px; }
+  h1 span { background:#fff; color:#000; padding:0 8px; }
+  h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:36px 0 12px; border-bottom:1px solid #222; padding-bottom:8px; }
+  p { margin:10px 0; color:#ccc; }
+  .sub { color:#888; font-size:12px; margin-top:12px; }
+  code { background:#111; border:1px solid #2a2a2a; padding:1px 6px; font-size:12.5px; word-break:break-all; }
+  pre { background:#0a0a0a; border:1px solid #2a2a2a; padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:12px 0; color:#ddd; }
+  pre code { background:none; border:0; padding:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin:12px 0; }
+  th { text-align:left; font-size:10px; letter-spacing:.2em; color:#888; font-weight:400; padding:8px 12px 8px 0; border-bottom:1px solid #333; vertical-align:top; white-space:nowrap; }
+  td { padding:10px 12px 10px 0; border-bottom:1px solid #1c1c1c; vertical-align:top; color:#ccc; }
+  ul, ol { margin:10px 0 10px 22px; color:#ccc; }
+  li { margin:6px 0; }
+  a { color:#fff; }
+  .journey { list-style:none; margin:18px 0; }
+  .journey li { border:1px solid #333; padding:14px 16px; margin-top:-1px; display:flex; gap:16px; align-items:baseline; }
+  .journey .n { font-weight:700; font-size:16px; min-width:22px; }
+  .journey .t { font-weight:700; letter-spacing:.14em; font-size:12px; min-width:96px; }
+  .journey .d { color:#888; font-size:12.5px; }
+  .doors { margin-top:8px; }
+  .door { display:block; border:1px solid #333; padding:16px 18px; margin-top:-1px; color:#fff; text-decoration:none; }
+  .door:hover { border-color:#fff; }
+  .door .dt { font-weight:700; letter-spacing:.14em; font-size:12px; }
+  .door .dd { color:#888; font-size:12px; margin-top:4px; }
+  @media (max-width:700px) {
+    .wrap { padding:0 12px 80px; }
+    .journey li { flex-direction:column; gap:2px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./index.html">GHOSTPAY DOCS</a>
+  <a class="on" href="./index.html">INDEX</a>
+  <a href="./relayer.html">RELAYER</a>
+  <a href="./fees.html">FEES</a>
+  <a href="./api.html">API</a>
+  <a href="./privacy.html">PRIVACY</a>
+  <a href="./recovery.html">RECOVERY</a>
+  <a href="./contracts.html">CONTRACTS</a>
+</nav>
+
+<h1>GHOST<span>PAY</span></h1>
+<p class="sub">reference documentation · served by serve.mjs from <code>docs/</code> · no build step, no external assets</p>
+
+<h2>WHAT IT IS</h2>
+<p>ghostpay is a privacy payments app on Ethereum mainnet. It receives to one-time ERC-5564 stealth addresses, sweeps the balance into Privacy Pools through a signed EIP-7702 intent, and withdraws to an unlinked wallet after ASP approval. The stealth address never holds gas and never sends a transaction itself: a relayer carries every step after payment, so the recipient's wallet appears nowhere onchain.</p>
+
+<h2>THE JOURNEY</h2>
+<ol class="journey">
+  <li><span class="n">1</span><span class="t">GENERATE</span><span class="d">one wallet signature derives the stealth spend + view keys (ERC-5564 scheme 1). same signature, same keys, any device. nothing to back up.</span></li>
+  <li><span class="n">2</span><span class="t">SHARE</span><span class="d">the app derives a fresh one-time address. share the raw 0x address or a payment link.</span></li>
+  <li><span class="n">3</span><span class="t">PAY</span><span class="d">the payer sends ETH and the announcement in one transaction via PayAndAnnounce. the relayer announces for raw-address payments.</span></li>
+  <li><span class="n">4</span><span class="t">SCAN</span><span class="d">the viewing key scans Announcement logs and finds payments. the spend key is never needed to watch.</span></li>
+  <li><span class="n">5</span><span class="t">SWEEP</span><span class="d">the app signs an EIP-712 SweepIntent + a 7702 authorization; the relayer executes it against SweeperV2 and pays the gas. funds land in Privacy Pools.</span></li>
+  <li><span class="n">6</span><span class="t">WITHDRAW</span><span class="d">after ASP approval, a groth16 proof built in the browser withdraws to any fresh address, relayed gaslessly.</span></li>
+</ol>
+
+<h2>PAGES</h2>
+<div class="doors">
+  <a class="door" href="./relayer.html"><div class="dt">RELAYER</div><div class="dd">running serve.mjs end to end: runners, funding, RPC rotation, Tor, Flashbots Protect, the reaper, rate limits, auth, every env var.</div></a>
+  <a class="door" href="./fees.html"><div class="dt">FEES</div><div class="dd">every fee in the system: who pays, who receives, where it lands, the fee ledger, the revenue report.</div></a>
+  <a class="door" href="./api.html"><div class="dt">API</div><div class="dd">every endpoint with exact payload contracts and curl examples.</div></a>
+  <a class="door" href="./privacy.html"><div class="dt">PRIVACY</div><div class="dd">the privacy model, honestly: what the relayer sees, what it cannot do, Tor, jitter, metadata.</div></a>
+  <a class="door" href="./recovery.html"><div class="dt">RECOVERY</div><div class="dd">playbooks for the failures that actually happen: dead tabs, dropped txs, stale authorizations, lost secrets.</div></a>
+  <a class="door" href="./contracts.html"><div class="dt">CONTRACTS</div><div class="dd">SweeperV2, PayAndAnnounce, BatchRelayer: addresses, the EIP-712 spec, the 7702 execution model.</div></a>
+  <a class="door" href="./GP-API.md"><div class="dt">GP-API.md</div><div class="dd">the window.GP module contract for app feature modules (served as plain text).</div></a>
+</div>
+
+<p class="sub" style="margin-top:28px">the app itself lives one level up: <a href="../">../</a></p>
+</div>
+</body>
+</html>

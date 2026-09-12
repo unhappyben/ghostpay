@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHOSTPAY DOCS · FEES</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace; font-size:14px; line-height:1.65; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 100px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px; align-items:center; border-bottom:1px solid #333; padding:14px 0; margin-bottom:36px; }
+  nav .logo { font-weight:700; letter-spacing:.2em; font-size:13px; color:#fff; text-decoration:none; margin-right:14px; }
+  nav a { color:#888; text-decoration:none; font-size:10px; letter-spacing:.12em; padding:6px 10px; border:1px solid transparent; }
+  nav a:hover { color:#fff; border-color:#333; }
+  nav a.on { background:#fff; color:#000; font-weight:700; }
+  h1 { font-size:clamp(24px,5vw,34px); font-weight:700; letter-spacing:-1px; }
+  h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:36px 0 12px; border-bottom:1px solid #222; padding-bottom:8px; }
+  h3 { font-size:12px; letter-spacing:.15em; color:#fff; margin:22px 0 6px; }
+  p { margin:10px 0; color:#ccc; }
+  .sub { color:#888; font-size:12px; margin-top:8px; }
+  code { background:#111; border:1px solid #2a2a2a; padding:1px 6px; font-size:12.5px; word-break:break-all; }
+  pre { background:#0a0a0a; border:1px solid #2a2a2a; padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:12px 0; color:#ddd; }
+  pre code { background:none; border:0; padding:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin:12px 0; }
+  th { text-align:left; font-size:10px; letter-spacing:.2em; color:#888; font-weight:400; padding:8px 12px 8px 0; border-bottom:1px solid #333; vertical-align:top; white-space:nowrap; }
+  td { padding:10px 12px 10px 0; border-bottom:1px solid #1c1c1c; vertical-align:top; color:#ccc; }
+  ul, ol { margin:10px 0 10px 22px; color:#ccc; }
+  li { margin:6px 0; }
+  a { color:#fff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./index.html">GHOSTPAY DOCS</a>
+  <a href="./index.html">INDEX</a>
+  <a href="./relayer.html">RELAYER</a>
+  <a class="on" href="./fees.html">FEES</a>
+  <a href="./api.html">API</a>
+  <a href="./privacy.html">PRIVACY</a>
+  <a href="./recovery.html">RECOVERY</a>
+  <a href="./contracts.html">CONTRACTS</a>
+</nav>
+
+<h1>FEES</h1>
+<p class="sub">every fee in the system: who pays it, who receives it, where it lands.</p>
+
+<h2>THE FEE MAP</h2>
+<table>
+  <tr><th>FEE</th><th>WHO PAYS</th><th>WHO RECEIVES</th><th>WHERE IT LANDS</th></tr>
+  <tr>
+    <td>Sweep intent fee (<code>feeBps</code>)</td>
+    <td>The swept stealth address, deducted from the swept amount</td>
+    <td><code>tx.origin</code>: the runner EOA that broadcast the transaction</td>
+    <td>Onchain, inside the sweep transaction itself, in the swept asset (ETH for actions 0/1, the token for actions 2/3)</td>
+  </tr>
+  <tr>
+    <td>PP withdrawal relay fee (<code>relayFeeBPS</code>)</td>
+    <td>The withdrawn amount</td>
+    <td><code>feeRecipient</code> inside the withdrawal: must be one of the relayer's runners</td>
+    <td>Onchain, paid by the Privacy Pools entrypoint inside the withdrawal transaction</td>
+  </tr>
+  <tr>
+    <td>Relayer gas</td>
+    <td>The runner EOA</td>
+    <td>Block builders / validators</td>
+    <td>Burned + tipped on every relayed transaction (announces, sweeps, withdrawals, fee-forwards)</td>
+  </tr>
+  <tr>
+    <td>Announce</td>
+    <td>Nobody</td>
+    <td>Nobody</td>
+    <td>Announces carry no fee. The runner pays the gas as the cost of acquiring the later sweep fee.</td>
+  </tr>
+</table>
+
+<h2>SWEEP INTENT FEE</h2>
+<p>The intent fee is <code>feeBps</code> basis points of the swept amount, signed into the EIP-712 <code>SweepIntent</code> by the stealth key itself. SweeperV2 pays it to <code>tx.origin</code>, not <code>msg.sender</code>: in a batched relay <code>msg.sender</code> is the BatchRelayer contract, while <code>tx.origin</code> is always the runner that actually paid the gas. That is what makes third-party relaying safe to open up: any runner can carry the intent, and the fee goes to whoever pays the gas.</p>
+<ul>
+  <li><code>MIN_FEE_BPS</code> (default 30, 0.30%) is the relayer's floor: intents below it are rejected at preflight with a 400. Advertised at <code>GET /fee</code> and in <code>GET /health</code> so the app prices intents before signing.</li>
+  <li><code>MAX_FEE_BPS</code> (1000, 10%) is the onchain cap enforced by SweeperV2 against the signed intent. No relayer can take more, ever.</li>
+  <li>The fee is computed on the full balance of the swept asset at execution time, in that asset.</li>
+</ul>
+
+<h2>PRIVACY POOLS WITHDRAWAL RELAY FEE</h2>
+<p><code>relayFeeBPS</code> basis points of the withdrawn value, default maximum 25 (0.25%, <code>PP_FEE_BPS</code>). The groth16 circuit binds the fee terms into the proof itself: the context public signal commits to the withdrawal data, which contains the recipient, the fee recipient, and the fee rate. The relayer recomputes the context and rejects anything where the fee recipient is not one of its runners or the rate exceeds <code>PP_FEE_BPS</code>. The fee is not a separate transfer: the entrypoint pays it to the runner inside the withdrawal, so the exact amount is known from the <code>withdrawnValue</code> public signal.</p>
+
+<h2>RELAYER GAS COSTS</h2>
+<p>The runner pays gas on every relayed transaction. Gas pricing is a 2x bump over current network prices with a priority-fee floor (<code>MIN_PRIORITY_WEI</code>, default 0.1 gwei) so builders do not skip ultra-cheap transactions. The affordability preflight refuses broadcasts the runner cannot pay for. Fee economics in brief: the announce is free and costs the runner gas; the sweep fee and withdrawal fee are where the gas comes back.</p>
+
+<h2>THE FEE LEDGER (fees.jsonl)</h2>
+<p>Every successful fee-bearing broadcast appends one JSON line to <code>fees.jsonl</code> (gitignored, <code>FEES_FILE</code> overrides the path):</p>
+<pre><code>{"ts":"2026-09-12T…","kind":"sweep-intent","feeBps":30,"estFeeWei":"…","txHash":"0x…","runner":"0x…"}</code></pre>
+<table>
+  <tr><th>KIND</th><th>WRITTEN WHEN</th><th>estFeeWei</th></tr>
+  <tr><td><code>sweep-intent</code></td><td>An <code>eip7702-intent</code> sweep is broadcast</td><td>stealth ETH balance × feeBps / 10000, estimated at preflight. Rough for token sweeps: the stealth ETH balance is not the swept asset.</td></tr>
+  <tr><td><code>sweep-intent-batch</code></td><td>A batch sweep is broadcast</td><td>One line per swept stealth address, same estimate, all sharing one <code>txHash</code>.</td></tr>
+  <tr><td><code>pp-withdraw</code></td><td>A withdrawal is relayed</td><td>withdrawnValue (public signal) × relayFeeBPS / 10000. Exact: this is what the entrypoint pays the runner.</td></tr>
+  <tr><td><code>fee-forward</code></td><td>The auto-forwarder sweeps a runner's accrued fees to <code>FEE_OWNER</code></td><td>The forwarded amount. An outflow, not revenue: excluded from earned totals, weekly buckets, and ARR.</td></tr>
+</table>
+<p>Announces carry no fee and are never logged. A failed balance read skips the ledger line; it never blocks a broadcast. Legacy <code>eip3009</code> and <code>eip7702-sweep</code> artifacts carry no relayer fee and write no lines.</p>
+
+<h2>THE REVENUE REPORT (fees.mjs)</h2>
+<pre><code>node fees.mjs                        # report
+FEES_FILE=/path/to.jsonl node fees.mjs</code></pre>
+<p>Report fields:</p>
+<ul>
+  <li><b>totals per kind</b>: ETH and count for <code>sweep-intent</code>, <code>sweep-intent-batch</code>, <code>pp-withdraw</code>.</li>
+  <li><b>total</b>: all earned fees in ETH, converted to USD at the current CoinGecko price (same source as <code>GET /price</code>, 60s cache, fails soft to ETH-only).</li>
+  <li><b>weekly</b>: the last 8 Monday-starting weeks, ETH and count per week.</li>
+  <li><b>ARR run-rate</b>: the sum of the last 4 weeks × 13 (52 / 4: four weeks annualized). Counts fees earned, not fees held.</li>
+  <li><b>fee-forward</b>: total forwarded to the owner, forward count, timestamp of the last forward.</li>
+  <li><b>runner holdings</b>: earned minus forwarded: what is still sitting on the runners.</li>
+</ul>
+<p>Malformed ledger lines are skipped. Sweep fees are estimates; withdrawal fees are exact. For onchain truth, the runner balances and the <code>FEE_OWNER</code> address are the ledger of record.</p>
+</div>
+</body>
+</html>

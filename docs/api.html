@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHOSTPAY DOCS · API</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace; font-size:14px; line-height:1.65; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 100px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px; align-items:center; border-bottom:1px solid #333; padding:14px 0; margin-bottom:36px; }
+  nav .logo { font-weight:700; letter-spacing:.2em; font-size:13px; color:#fff; text-decoration:none; margin-right:14px; }
+  nav a { color:#888; text-decoration:none; font-size:10px; letter-spacing:.12em; padding:6px 10px; border:1px solid transparent; }
+  nav a:hover { color:#fff; border-color:#333; }
+  nav a.on { background:#fff; color:#000; font-weight:700; }
+  h1 { font-size:clamp(24px,5vw,34px); font-weight:700; letter-spacing:-1px; }
+  h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:36px 0 12px; border-bottom:1px solid #222; padding-bottom:8px; }
+  h3 { font-size:12px; letter-spacing:.15em; color:#fff; margin:22px 0 6px; }
+  p { margin:10px 0; color:#ccc; }
+  .sub { color:#888; font-size:12px; margin-top:8px; }
+  code { background:#111; border:1px solid #2a2a2a; padding:1px 6px; font-size:12.5px; word-break:break-all; }
+  pre { background:#0a0a0a; border:1px solid #2a2a2a; padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:12px 0; color:#ddd; }
+  pre code { background:none; border:0; padding:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin:12px 0; }
+  th { text-align:left; font-size:10px; letter-spacing:.2em; color:#888; font-weight:400; padding:8px 12px 8px 0; border-bottom:1px solid #333; vertical-align:top; white-space:nowrap; }
+  td { padding:10px 12px 10px 0; border-bottom:1px solid #1c1c1c; vertical-align:top; color:#ccc; }
+  ul, ol { margin:10px 0 10px 22px; color:#ccc; }
+  li { margin:6px 0; }
+  a { color:#fff; }
+  .ep { border:1px solid #333; padding:6px 12px; display:inline-block; font-size:12px; letter-spacing:.1em; margin-bottom:4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./index.html">GHOSTPAY DOCS</a>
+  <a href="./index.html">INDEX</a>
+  <a href="./relayer.html">RELAYER</a>
+  <a href="./fees.html">FEES</a>
+  <a class="on" href="./api.html">API</a>
+  <a href="./privacy.html">PRIVACY</a>
+  <a href="./recovery.html">RECOVERY</a>
+  <a href="./contracts.html">CONTRACTS</a>
+</nav>
+
+<h1>RELAYER API</h1>
+<p class="sub">serve.mjs, same origin as the app. mainnet only (chainId 1). all bodies are JSON; all errors are <code>{"error":"…"}</code>, never stack traces.</p>
+
+<h2>CONVENTIONS</h2>
+<ul>
+  <li>Write endpoints (<code>/announce</code>, <code>/sweep</code>, <code>/pp-withdraw</code>) are rate limited per IP and may require <code>Authorization: Bearer &lt;token&gt;</code>: see <a href="./relayer.html">RELAYER</a>.</li>
+  <li>Broadcasts are delayed by a random jitter (announce 2-15s, sweeps and withdrawals 5-45s). A 200 means the transaction was accepted by the broadcast endpoint, not that it is mined. Poll <code>GET /status/:hash</code>.</li>
+  <li>Successful broadcast responses share a shape: <code>{"hash":"0x…","runner":"0x…","delayedSec":12}</code>.</li>
+  <li>Without a configured runner the write endpoints return 503. Static serving is unaffected.</li>
+</ul>
+
+<h2><span class="ep">POST /announce</span></h2>
+<p>Announces a stealth payment on the ERC-5564 announcer (<code>0x55649E01B5Df198D18D95b5cc5051630cfD45564</code>, scheme 1) from a runner wallet. Calls <code>announce(1, stealth, ephPub, metadata)</code>.</p>
+<table>
+  <tr><th>FIELD</th><th>TYPE</th><th>RULES</th></tr>
+  <tr><td><code>stealth</code></td><td>address</td><td>Required. The one-time stealth address being announced.</td></tr>
+  <tr><td><code>ephPub</code></td><td>0x-hex</td><td>Required. 33-byte compressed secp256k1 point: <code>0x</code> + 66 hex chars.</td></tr>
+  <tr><td><code>viewTag</code></td><td>number</td><td>Required when <code>metadata</code> is absent. Integer 0-255. The metadata then defaults to the 1-byte view tag.</td></tr>
+  <tr><td><code>metadata</code></td><td>0x-hex</td><td>Optional. 1-1024 bytes, used verbatim (packed view tag + encrypted memo). When present, <code>viewTag</code> is ignored.</td></tr>
+</table>
+<pre><code>curl -X POST http://localhost:8791/announce \
+  -H 'content-type: application/json' \
+  -d '{"stealth":"0x…","ephPub":"0x02…","viewTag":137}'
+# → {"hash":"0x…","runner":"0x…","delayedSec":7}</code></pre>
+
+<h2><span class="ep">POST /sweep</span></h2>
+<p>Relays a signed sweep artifact. The runner pays the gas; the stealth EOA never needs funding. The <code>kind</code> field selects one of four artifact shapes.</p>
+
+<h3>kind: eip3009</h3>
+<p>Executes USDC <code>transferWithAuthorization</code> (gasless for the holder).</p>
+<table>
+  <tr><th>FIELD</th><th>RULES</th></tr>
+  <tr><td><code>kind</code></td><td><code>"eip3009"</code></td></tr>
+  <tr><td><code>token</code></td><td>Token contract address (the call target).</td></tr>
+  <tr><td><code>from</code>, <code>to</code></td><td>Addresses. <code>from</code> is the stealth address, <code>to</code> the destination.</td></tr>
+  <tr><td><code>value</code>, <code>validAfter</code>, <code>validBefore</code></td><td>uint256 values, as accepted by the token contract.</td></tr>
+  <tr><td><code>nonce</code></td><td>bytes32 EIP-3009 nonce.</td></tr>
+  <tr><td><code>signature</code></td><td>65-byte 0x-hex signature, split into v/r/s by the relayer.</td></tr>
+</table>
+
+<h3>kind: eip7702-sweep (legacy v1)</h3>
+<p>Type-4 transaction: the stealth EOA delegates to the v1 sweeper and the relayer-chosen calldata runs as the EOA. Trust assumption: the relayer picks the calldata, so use intent sweeps where available.</p>
+<table>
+  <tr><th>FIELD</th><th>RULES</th></tr>
+  <tr><td><code>kind</code></td><td><code>"eip7702-sweep"</code></td></tr>
+  <tr><td><code>stealthAddress</code></td><td>The stealth EOA. Transaction target.</td></tr>
+  <tr><td><code>authorization</code></td><td>EIP-7702 authorization: <code>{chainId, address, nonce, yParity, r, s}</code>. <code>address</code> is the sweeper contract; <code>nonce</code> must equal the stealth EOA's current nonce or the request 400s as stale.</td></tr>
+  <tr><td><code>data</code></td><td>Calldata executed as the EOA (e.g. a sweeper call). Privacy Pools deposits below the 0.01 ETH pool minimum are rejected at preflight.</td></tr>
+  <tr><td><code>sweeper</code>, <code>precommitment</code></td><td>Informational, echoed back to the operator in logs.</td></tr>
+</table>
+
+<h3>kind: eip7702-intent</h3>
+<p>The default flow. Type-4 transaction executing <code>executeSweep(intent, sig)</code> on the stealth EOA delegated to SweeperV2. Requires <code>SWEEPER_V2</code> configured on the relayer (else 503). Every parameter of the sweep comes from the signed intent: the relayer can deliver or censor, never redirect.</p>
+<table>
+  <tr><th>FIELD</th><th>RULES</th></tr>
+  <tr><td><code>kind</code></td><td><code>"eip7702-intent"</code></td></tr>
+  <tr><td><code>stealthAddress</code></td><td>The stealth EOA. Also the EIP-712 <code>verifyingContract</code> and the transaction target.</td></tr>
+  <tr><td><code>authorization</code></td><td>EIP-7702 authorization delegating the EOA to SweeperV2: <code>{chainId, address, nonce, yParity, r, s}</code>.</td></tr>
+  <tr><td><code>intent.action</code></td><td>uint8: 0 = ETH to destination · 1 = Privacy Pools ETH deposit · 2 = PP token deposit · 3 = token to destination.</td></tr>
+  <tr><td><code>intent.token</code></td><td>address. Actions 2/3 only; ignored otherwise.</td></tr>
+  <tr><td><code>intent.destination</code></td><td>address. Actions 0/3 only; ignored otherwise.</td></tr>
+  <tr><td><code>intent.precommitment</code></td><td>uint256. Actions 1/2 only: <code>poseidon2(nullifier, secret)</code> for the Privacy Pools deposit.</td></tr>
+  <tr><td><code>intent.feeBps</code></td><td>uint256. Relayer fee in basis points, paid to <code>tx.origin</code>. Must be &gt;= the relayer floor (<code>MIN_FEE_BPS</code>, default 30) and &lt;= the onchain cap (1000).</td></tr>
+  <tr><td><code>intent.deadline</code></td><td>uint256 unix seconds. Expired intents are rejected with a 400: sign a fresh sweep in the app.</td></tr>
+  <tr><td><code>signature</code></td><td>65-byte 0x-hex EIP-712 signature by the stealth key (see below).</td></tr>
+</table>
+<p>The signed payload, verified at preflight before any gas is spent:</p>
+<pre><code>domain:  { name: "GhostpaySweeper", version: "1", chainId: 1,
+           verifyingContract: &lt;stealthAddress&gt; }
+struct:  SweepIntent(uint8 action,address token,address destination,
+                     uint256 precommitment,uint256 feeBps,uint256 deadline)</code></pre>
+<p>Preflight rejects: a signature that does not recover to <code>stealthAddress</code>, an expired deadline, a fee below the floor, and any broadcast the runner cannot afford. Failed gas estimation is a hard error: a malformed intent never burns runner gas onchain.</p>
+<pre><code>curl -X POST http://localhost:8791/sweep \
+  -H 'content-type: application/json' \
+  -d '{"kind":"eip7702-intent","stealthAddress":"0x…",
+       "authorization":{"chainId":1,"address":"0xCC29c7723116155ccF20C7c0b8924F4747331903","nonce":0,"yParity":0,"r":"0x…","s":"0x…"},
+       "intent":{"action":1,"token":"0x0000000000000000000000000000000000000000","destination":"0x0000000000000000000000000000000000000000","precommitment":"…","feeBps":"30","deadline":"…"},
+       "signature":"0x…"}'</code></pre>
+
+<h3>kind: eip7702-intent-batch</h3>
+<p>One type-4 transaction to BatchRelayer sweeping up to 20 stealth EOAs: cheaper per sweep, one gas payment. Requires <code>BATCH_RELAYER</code> configured (else 503; BatchRelayer is not deployed yet). Each entry of <code>sweeps</code> is a full <code>eip7702-intent</code> artifact minus the <code>kind</code> field and is verified independently.</p>
+<table>
+  <tr><th>FIELD</th><th>RULES</th></tr>
+  <tr><td><code>kind</code></td><td><code>"eip7702-intent-batch"</code></td></tr>
+  <tr><td><code>sweeps</code></td><td>Array of 1-20 <code>{stealthAddress, intent, signature, authorization}</code> entries.</td></tr>
+</table>
+<p>Semantics: the authorization list delegates every EOA to SweeperV2, then one <code>relay(targets, datas)</code> call runs each <code>executeSweep</code>, all-or-nothing. Fees still land on <code>tx.origin</code>, not the BatchRelayer contract. Caveat: a batch shares one transaction, so the swept addresses are linked onchain.</p>
+
+<h2><span class="ep">POST /pp-withdraw</span></h2>
+<p>Privacy Pools withdrawal relay. Requires <code>PP_RELAY=1</code> (else 503). Same payload shape the app sends fastrelay.xyz, so client code is interchangeable.</p>
+<table>
+  <tr><th>FIELD</th><th>RULES</th></tr>
+  <tr><td><code>chainId</code></td><td>Must be 1.</td></tr>
+  <tr><td><code>scope</code></td><td>Decimal string. Must equal the mainnet ETH Privacy Pool scope; other pools are refused.</td></tr>
+  <tr><td><code>withdrawal.processooor</code></td><td>Must be the Privacy Pools entrypoint <code>0x6818809EefCe719E480a7526D76bD3e561526b46</code>.</td></tr>
+  <tr><td><code>withdrawal.data</code></td><td>0x-hex <code>abi.encode(address recipient, address feeRecipient, uint256 relayFeeBPS)</code>.</td></tr>
+  <tr><td><code>proof</code></td><td>snarkjs groth16/bn128 JSON: <code>{protocol:"groth16", curve:"bn128", pi_a, pi_b, pi_c}</code>, all decimal strings.</td></tr>
+  <tr><td><code>publicSignals</code></td><td>Exactly 8 decimal strings, each below the snark scalar field.</td></tr>
+  <tr><td><code>feeCommitment</code></td><td>Optional, ignored by this relay (present for fastrelay.xyz compatibility).</td></tr>
+</table>
+<p>Validation, in order: chainId and scope pin the deployment; the decoded <code>feeRecipient</code> must be one of this server's runners (re-quote against <code>GET /health</code> and re-prove otherwise); <code>relayFeeBPS</code> must not exceed <code>PP_FEE_BPS</code> (default 25); the context public signal (<code>publicSignals[7]</code>) must match the keccak of the withdrawal struct + scope reduced mod the snark field, which binds the proof to exactly these fee terms; <code>withdrawnValue</code> must be nonzero. Gas estimation then simulates the full withdrawal including proof verification, so a bad proof fails here with a clean error instead of reverting onchain.</p>
+<pre><code>curl -X POST http://localhost:8791/pp-withdraw \
+  -H 'content-type: application/json' \
+  -d '{"chainId":1,"scope":"4916…","withdrawal":{"processooor":"0x6818…","data":"0x…"},
+       "proof":{"protocol":"groth16","curve":"bn128","pi_a":["…","…"],"pi_b":[["…","…"],["…","…"]],"pi_c":["…","…"]},
+       "publicSignals":["…","…","…","…","…","…","…","…"]}'
+# → {"hash":"0x…","txHash":"0x…","runner":"0x…","delayedSec":31,
+#    "recipient":"0x…","feeBps":25,"feeWei":"…"}</code></pre>
+
+<h2><span class="ep">GET /health</span></h2>
+<p>Relayer status. Never keys, never the API token.</p>
+<table>
+  <tr><th>FIELD</th><th>MEANING</th></tr>
+  <tr><td><code>ok</code></td><td><code>true</code>.</td></tr>
+  <tr><td><code>chainId</code></td><td><code>1</code>.</td></tr>
+  <tr><td><code>runners</code></td><td>Runner addresses (public onchain anyway).</td></tr>
+  <tr><td><code>runnerCount</code></td><td>Pool size.</td></tr>
+  <tr><td><code>runnerBalances</code></td><td>Map of runner address to ETH balance (number), 30s cache. Per-runner best-effort: an RPC failure yields <code>null</code> for that runner, never a failed health check.</td></tr>
+  <tr><td><code>sweeperV2</code></td><td>Configured SweeperV2 address, or <code>null</code>. Non-null means the relayer accepts <code>eip7702-intent</code>.</td></tr>
+  <tr><td><code>batchRelayer</code></td><td>Configured BatchRelayer address, or <code>null</code>.</td></tr>
+  <tr><td><code>minFeeBps</code></td><td>Fee floor for intent sweeps.</td></tr>
+  <tr><td><code>ppRelay</code></td><td><code>true</code> when <code>POST /pp-withdraw</code> is enabled.</td></tr>
+  <tr><td><code>ppFeeBps</code></td><td>Withdrawal relay fee in bps. Present only when <code>ppRelay</code> is true.</td></tr>
+  <tr><td><code>feeOwner</code></td><td>Auto-forward owner address, or <code>null</code> when the forwarder is disabled.</td></tr>
+  <tr><td><code>rateLimited</code></td><td>Always <code>true</code>: the write endpoints are rate limited per IP.</td></tr>
+  <tr><td><code>authRequired</code></td><td>Present and <code>true</code> only when <code>GHOSTPAY_API_TOKEN</code> is set.</td></tr>
+  <tr><td><code>tor</code></td><td><code>true</code> when JSON-RPC routes over <code>TOR_PROXY</code>.</td></tr>
+  <tr><td><code>endpoints</code></td><td>Hostnames of the read RPC rotation.</td></tr>
+</table>
+<pre><code>curl http://localhost:8791/health
+# → {"ok":true,"chainId":1,"runners":["0x…"],"runnerCount":1,
+#    "runnerBalances":{"0x…":0.042},"sweeperV2":"0xCC29…","batchRelayer":null,
+#    "minFeeBps":30,"ppRelay":true,"ppFeeBps":25,"feeOwner":"0x…",
+#    "rateLimited":true,"authRequired":true,"tor":true,"endpoints":["rpc.flashbots.net",…]}</code></pre>
+
+<h2><span class="ep">GET /fee</span></h2>
+<p>The relayer fee floor for intent sweeps.</p>
+<pre><code>curl http://localhost:8791/fee
+# → {"minFeeBps":30}</code></pre>
+
+<h2><span class="ep">GET /price</span></h2>
+<p>ETH + USDC USD prices, proxied from CoinGecko with a 60s cache so the price fetch stays out of the user's browser. 503 when the feed is unavailable.</p>
+<pre><code>curl http://localhost:8791/price
+# → {"ethereum":{"usd":3123.45},"usd-coin":{"usd":1.0}}</code></pre>
+
+<h2><span class="ep">GET /status/:hash</span></h2>
+<p>Transaction receipt status. Broadcasts go to Flashbots Protect's private mempool, so <code>pending</code> here means "no receipt yet": explorers will show nothing until mined.</p>
+<pre><code>curl http://localhost:8791/status/0x…64hex…
+# → {"status":"pending"}
+# → {"status":"confirmed","blockNumber":23501234}
+# → {"status":"failed"}</code></pre>
+<p>A malformed hash (not <code>0x</code> + 64 hex) gets a 400.</p>
+</div>
+</body>
+</html>

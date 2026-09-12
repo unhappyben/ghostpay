@@ -16,3 +16,5 @@ cache/
 out/
 foundry.lock
 ghostpay.local.env
+monitor.local.json
+monitor-state.json

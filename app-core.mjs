@@ -1105,7 +1105,7 @@ const formatUsd = (eth, usd) => {
 
 // status strip (#gp-status): relayer health + min fee + ETH price, refreshed every 60s.
 // every endpoint is optional: static-only serving shows "relayer: offline", a failed
-// /price simply hides the price.
+// /price hides the price.
 async function pollStatus() {
   const el = $('gp-status'); if (!el) return;
   const parts = [];

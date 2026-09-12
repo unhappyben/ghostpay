@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHOSTPAY DOCS · RELAYER</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace; font-size:14px; line-height:1.65; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 100px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px; align-items:center; border-bottom:1px solid #333; padding:14px 0; margin-bottom:36px; }
+  nav .logo { font-weight:700; letter-spacing:.2em; font-size:13px; color:#fff; text-decoration:none; margin-right:14px; }
+  nav a { color:#888; text-decoration:none; font-size:10px; letter-spacing:.12em; padding:6px 10px; border:1px solid transparent; }
+  nav a:hover { color:#fff; border-color:#333; }
+  nav a.on { background:#fff; color:#000; font-weight:700; }
+  h1 { font-size:clamp(24px,5vw,34px); font-weight:700; letter-spacing:-1px; }
+  h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:36px 0 12px; border-bottom:1px solid #222; padding-bottom:8px; }
+  h3 { font-size:12px; letter-spacing:.15em; color:#fff; margin:22px 0 6px; }
+  p { margin:10px 0; color:#ccc; }
+  .sub { color:#888; font-size:12px; margin-top:8px; }
+  code { background:#111; border:1px solid #2a2a2a; padding:1px 6px; font-size:12.5px; word-break:break-all; }
+  pre { background:#0a0a0a; border:1px solid #2a2a2a; padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:12px 0; color:#ddd; }
+  pre code { background:none; border:0; padding:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin:12px 0; }
+  th { text-align:left; font-size:10px; letter-spacing:.2em; color:#888; font-weight:400; padding:8px 12px 8px 0; border-bottom:1px solid #333; vertical-align:top; white-space:nowrap; }
+  td { padding:10px 12px 10px 0; border-bottom:1px solid #1c1c1c; vertical-align:top; color:#ccc; }
+  ul, ol { margin:10px 0 10px 22px; color:#ccc; }
+  li { margin:6px 0; }
+  a { color:#fff; }
+  .warn { border:1px solid #fff; padding:14px 16px; margin:14px 0; font-size:12.5px; color:#ddd; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./index.html">GHOSTPAY DOCS</a>
+  <a href="./index.html">INDEX</a>
+  <a class="on" href="./relayer.html">RELAYER</a>
+  <a href="./fees.html">FEES</a>
+  <a href="./api.html">API</a>
+  <a href="./privacy.html">PRIVACY</a>
+  <a href="./recovery.html">RECOVERY</a>
+  <a href="./contracts.html">CONTRACTS</a>
+</nav>
+
+<h1>RUNNING A RELAYER</h1>
+<p class="sub">serve.mjs: static file server plus the announce / sweep / withdraw relayer. the relayer is the business.</p>
+
+<h2>WHAT THE RELAYER DOES</h2>
+<p>Every step of ghostpay after the payment itself is relayed. The relayer holds one or more funded runner wallets and uses them to broadcast three kinds of user payload: ERC-5564 announcements, signed sweep artifacts (type-4 EIP-7702 transactions and EIP-3009 transfers), and Privacy Pools withdrawals. The runner pays the gas on all of them. Users pay for this through the fees documented in <a href="./fees.html">FEES</a>.</p>
+<p>Static serving works without any runner. Without a runner the write endpoints return 503 and the app falls back to wallet-side announcing.</p>
+
+<h2>BOOT</h2>
+<pre><code>npm install          # ethers, snarkjs, poseidon-lite
+node serve.mjs       # http://localhost:8791/ (static only, no runner)
+
+RUNNER_PK=0x… RPC_URLS=https://your-rpc node serve.mjs</code></pre>
+<p>A production boot with intent sweeps, withdrawals, and fee forwarding:</p>
+<pre><code>SWEEPER_V2=0xCC29c7723116155ccF20C7c0b8924F4747331903 \
+PP_RELAY=1 \
+FEE_OWNER=0x… \
+TOR_PROXY=socks5://127.0.0.1:9050 \
+node serve.mjs</code></pre>
+
+<h2>RUNNERS</h2>
+<p>Runners are plain EOAs that sign and pay for every broadcast. Two ways to configure them:</p>
+<ul>
+  <li><code>RUNNER_PK</code>: a single runner private key in the environment.</li>
+  <li><code>runners.local.json</code> (gitignored): a pool, <code>[{"address":"0x…","key":"0x…"},…]</code>. Each request picks a random runner, preferring a different one than the previous request. Entries with unparseable keys are skipped with a warning.</li>
+</ul>
+<p>Keys are never logged. <code>GET /health</code> reports runner addresses and balances only.</p>
+
+<h3>FUNDING RUNNERS FROM PRIVACY POOLS</h3>
+<p>The recommended funding path keeps the runner unlinked from the operator onchain:</p>
+<ol>
+  <li>Withdraw from Privacy Pools in the app (step 4, WITHDRAW) to one or more fresh EOAs.</li>
+  <li>Put those keys in <code>runners.local.json</code>. One 0.01 ETH withdrawal funds dozens of sweeps.</li>
+  <li>Rotate any time: withdraw again to a new address, swap the key, restart.</li>
+</ol>
+<p>A runner funded this way has no funding link to the operator onchain. See <a href="./privacy.html">PRIVACY</a> for why this matters.</p>
+
+<h2>NETWORKING</h2>
+<h3>RPC ROTATION</h3>
+<p>Every JSON-RPC read (nonce, balance, gas, receipts) goes through <code>rpcCall()</code>, which shuffles <code>RPC_URLS</code> and tries endpoints in random order per call. No single endpoint sees the full read pattern. Broadcasts are different: signed transactions go only to <code>BROADCAST_URLS</code> (also random order per broadcast), never to the read rotation.</p>
+<h3>TOR</h3>
+<p>With <code>TOR_PROXY</code> set, all JSON-RPC routes over Tor via a socks agent (plain node https; fetch has no socks support). No RPC provider then sees both the relayer's IP and its broadcasts. The <code>/price</code> CoinGecko fetch routes over Tor too.</p>
+<pre><code>brew install tor &amp;&amp; tor &amp;
+TOR_PROXY=socks5://127.0.0.1:9050 RPC_URLS=https://rpc.flashbots.net,https://eth.drpc.org node serve.mjs</code></pre>
+
+<h2>BROADCASTING</h2>
+<h3>FLASHBOTS PROTECT</h3>
+<p>The default broadcast endpoint is <code>https://rpc.flashbots.net?fast=true</code>: Flashbots Protect in fast mode. Transactions go to a private mempool. Explorers show nothing until the transaction is mined, which breaks the link between the HTTP request and a publicly visible pending transaction. Reads never go through Protect.</p>
+<h3>LOCAL NONCE TRACKING</h3>
+<p>Protect's private mempool is invisible to public endpoints, so their <code>pending</code> nonce goes stale after the first in-flight transaction and would hand out the same nonce twice. The relayer seeds each runner's nonce from the network once, then increments locally on every accepted send. Two announces were lost to the stale-nonce failure before this existed (2026-09-12).</p>
+<h3>JITTER</h3>
+<p>Broadcasts wait a random delay so the browser request and the onchain transaction are not trivially time-correlated: 2-15 seconds for announces, 5-45 seconds for sweeps and withdrawals. Fee-forward sweeps skip the jitter: they are the operator's own money movement, not user traffic.</p>
+<h3>FEES AND THE PRIORITY FLOOR</h3>
+<p>Gas is a 2x bump over current network prices (<code>feeBump()</code>): sweeps must land even in a fee spike. <code>eth_gasPrice</code> and the fee-history reward may come from different endpoints in the rotation, so both max fee and priority fee are based on the larger value and clamped. <code>MIN_PRIORITY_WEI</code> (default 100000000 wei, 0.1 gwei) floors the priority fee: at ultra-low gas prices an unfloored 2x bump produces a tip so small that builders skip the transaction entirely. Protect dropped two announces and a sweep that way on 2026-09-12. The floor costs cents per transaction and buys prompt inclusion.</p>
+<h3>AFFORDABILITY PREFLIGHT</h3>
+<p>Protect accepts unfunded transactions: it returns a hash, then never includes them, producing phantom pendings explorers never find. Before broadcasting, the relayer checks the runner's balance against <code>gasLimit * maxFeePerGas + value</code> and refuses with a loud 400 instead of broadcasting into the void.</p>
+<h3>GAS ESTIMATION</h3>
+<p>Every broadcast runs <code>eth_estimateGas</code> with 50% headroom. Intent sweeps hard-fail when estimation fails: a malformed intent must never burn runner gas on a reverting transaction. The fixed 500k fallback applies only to the proven legacy <code>eip7702-sweep</code> flow, where estimation against a not-yet-delegated EOA under-measures.</p>
+
+<h2>THE REAPER</h2>
+<p>Protect can silently drop a transaction it cannot include. The reaper is the backstop:</p>
+<ul>
+  <li>Every announce and intent sweep is journaled to <code>broadcasts.jsonl</code> (gitignored) with its full payload.</li>
+  <li>Every 5 minutes (first tick 10 minutes after boot) the reaper checks each open entry for a receipt.</li>
+  <li>After a 6-minute grace window with no receipt, the payload is rebuilt and rebroadcast with a fresh nonce. Announces are deterministic from <code>(stealth, ephPub, metadata)</code>; an intent sweep rebroadcast is safe because a doubly-landed original fails on the consumed authorization nonce.</li>
+  <li>Maximum 4 attempts per payload, then the entry is marked <code>given-up</code> and kept in the journal for a manual look. A reverted transaction is logged loudly, never silently dropped.</li>
+  <li>Completed entries age out of the journal after a week.</li>
+</ul>
+<p>Legacy sweeps and withdrawals are not journaled: their artifacts stay valid in the app and retrying is a user decision.</p>
+
+<h2>ABUSE PROTECTION</h2>
+<p>The write endpoints cost the runner gas, so a public relayer needs a brake.</p>
+<h3>RATE LIMITS</h3>
+<table>
+  <tr><th>ENDPOINT</th><th>LIMIT</th><th>SCOPE</th></tr>
+  <tr><td><code>POST /announce</code></td><td>10 / min</td><td>per IP</td></tr>
+  <tr><td><code>POST /sweep</code></td><td>5 / min</td><td>per IP</td></tr>
+  <tr><td><code>POST /pp-withdraw</code></td><td>5 / min</td><td>per IP</td></tr>
+</table>
+<p>In-memory token buckets keyed by endpoint + IP, refilled lazily, reset on restart: a brake, not a quota. A limited request gets a clean 429 JSON error with a <code>Retry-After</code> header.</p>
+<h3>BEARER AUTH</h3>
+<p>With <code>GHOSTPAY_API_TOKEN</code> set, <code>POST /sweep</code> and <code>POST /pp-withdraw</code> additionally require <code>Authorization: Bearer &lt;token&gt;</code>. The compare is constant-time over sha256 hashes of both sides, so neither length leaks. <code>/announce</code> and the GET endpoints stay open. <code>GET /health</code> reports <code>authRequired: true</code> when the token is set, never the token itself.</p>
+
+<h2>PRIVACY POOLS WITHDRAWAL RELAY</h2>
+<p><code>POST /pp-withdraw</code> is gated behind <code>PP_RELAY=1</code>; otherwise it returns 503. When enabled:</p>
+<ul>
+  <li>The payload shape matches what the app sends fastrelay.xyz, so the same client code works against both.</li>
+  <li>The groth16 circuit binds the fee terms into the proof: the context public signal is recomputed from the withdrawal data and scope, and must match. The fee recipient must be one of this server's runner addresses, and <code>relayFeeBPS</code> must not exceed <code>PP_FEE_BPS</code> (default 25).</li>
+  <li>The runner pays the gas. The fee accrues onchain to the runner inside the withdrawal itself (Entrypoint.relay pays <code>feeRecipient</code>).</li>
+  <li><code>GET /health</code> advertises <code>ppRelay: true</code> and <code>ppFeeBps</code> so the app can discover the relay and price proofs before building one.</li>
+</ul>
+<p>Only the mainnet ETH Privacy Pool is served: chainId 1, the canonical entrypoint, the ETH pool scope. Gas estimation simulates the full withdrawal including proof verification, so an invalid proof fails with a clean error instead of burning gas onchain.</p>
+
+<h2>FEE AUTO-FORWARD</h2>
+<p>Relayer fees accrue onchain to the runner: <code>tx.origin</code> on intent sweeps, <code>feeRecipient</code> inside withdrawals. With <code>FEE_OWNER</code> set, a forwarder consolidates them:</p>
+<ul>
+  <li>Every <code>FEE_SWEEP_MINUTES</code> (default 60; first sweep 5 minutes after boot) each runner sends its ETH balance above <code>FEE_RESERVE_ETH</code> (default 0.005) to <code>FEE_OWNER</code> as a plain type-2 transfer.</li>
+  <li>Forwards ride the same broadcast machinery as user transactions (RPC rotation, fee bump, <code>BROADCAST_URLS</code>) but skip the jitter.</li>
+  <li>Every forward is logged to <code>fees.jsonl</code> as <code>kind: "fee-forward"</code> so the ledger sees the outflow.</li>
+  <li>Unset <code>FEE_OWNER</code> disables the forwarder entirely. A bad address fails boot. A failed forward logs one line and waits for the next tick; it never crashes the server.</li>
+</ul>
+
+<h2>ENVIRONMENT VARIABLES</h2>
+<table>
+  <tr><th>VAR</th><th>DEFAULT</th><th>PURPOSE</th></tr>
+  <tr><td><code>PORT</code></td><td><code>8791</code></td><td>Listen port.</td></tr>
+  <tr><td><code>RUNNER_PK</code></td><td>unset</td><td>Single runner key. Alternative: <code>runners.local.json</code> for a pool.</td></tr>
+  <tr><td><code>RPC_URLS</code></td><td>flashbots / drpc / merkle</td><td>Comma-separated read endpoints, random order per call. <code>RPC_URL</code> is accepted as a single-endpoint fallback.</td></tr>
+  <tr><td><code>BROADCAST_URLS</code></td><td><code>https://rpc.flashbots.net?fast=true</code></td><td>Comma-separated endpoints used only for <code>eth_sendRawTransaction</code>.</td></tr>
+  <tr><td><code>TOR_PROXY</code></td><td>unset</td><td>Route all JSON-RPC (and the price fetch) over Tor, e.g. <code>socks5://127.0.0.1:9050</code>.</td></tr>
+  <tr><td><code>GHOSTPAY_API_TOKEN</code></td><td>unset</td><td>Bearer auth on <code>/sweep</code> and <code>/pp-withdraw</code> when set.</td></tr>
+  <tr><td><code>MIN_FEE_BPS</code></td><td><code>30</code></td><td>Fee floor for intent sweeps, advertised at <code>GET /fee</code>.</td></tr>
+  <tr><td><code>MIN_PRIORITY_WEI</code></td><td><code>100000000</code></td><td>Priority-fee floor in wei for the 2x fee bump (0.1 gwei).</td></tr>
+  <tr><td><code>SWEEPER_V2</code></td><td>unset</td><td>Deployed SweeperV2 address: gates <code>eip7702-intent</code> sweeps.</td></tr>
+  <tr><td><code>BATCH_RELAYER</code></td><td>unset</td><td>Deployed BatchRelayer address: gates <code>eip7702-intent-batch</code> sweeps.</td></tr>
+  <tr><td><code>PP_RELAY</code></td><td>unset</td><td>Set to <code>1</code> to enable <code>POST /pp-withdraw</code>.</td></tr>
+  <tr><td><code>PP_FEE_BPS</code></td><td><code>25</code></td><td>Max relay fee the withdrawal relay accepts, advertised at <code>GET /health</code>.</td></tr>
+  <tr><td><code>FEE_OWNER</code></td><td>unset</td><td>Owner address for the fee auto-forwarder; unset disables it. Invalid address fails boot.</td></tr>
+  <tr><td><code>FEE_RESERVE_ETH</code></td><td><code>0.005</code></td><td>Gas reserve kept on each runner when fees are forwarded.</td></tr>
+  <tr><td><code>FEE_SWEEP_MINUTES</code></td><td><code>60</code></td><td>Minutes between fee-forward sweeps (first sweep 5 min after boot).</td></tr>
+  <tr><td><code>FEES_FILE</code></td><td><code>./fees.jsonl</code></td><td>Ledger path override, read by both serve.mjs and fees.mjs.</td></tr>
+</table>
+
+<h2>OPERATING NOTES</h2>
+<ul>
+  <li>Errors are clean JSON (<code>{"error": "…"}</code>), never stack traces.</li>
+  <li>Needs ethers &gt;= 6.14 for type-4 transactions; the server refuses to boot on older versions.</li>
+  <li><code>relay.mjs</code> remains a standalone dumb broadcaster for saved artifacts: <code>RUNNER_PK=0x… node relay.mjs artifact.json</code>. It writes no ledger entries.</li>
+  <li>Fee revenue reporting: <code>node fees.mjs</code>. See <a href="./fees.html">FEES</a>.</li>
+  <li>Endpoint payload contracts: <a href="./api.html">API</a>.</li>
+</ul>
+</div>
+</body>
+</html>

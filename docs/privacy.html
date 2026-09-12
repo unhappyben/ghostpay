@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHOSTPAY DOCS · PRIVACY</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#fff; font-family:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace; font-size:14px; line-height:1.65; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px 100px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px; align-items:center; border-bottom:1px solid #333; padding:14px 0; margin-bottom:36px; }
+  nav .logo { font-weight:700; letter-spacing:.2em; font-size:13px; color:#fff; text-decoration:none; margin-right:14px; }
+  nav a { color:#888; text-decoration:none; font-size:10px; letter-spacing:.12em; padding:6px 10px; border:1px solid transparent; }
+  nav a:hover { color:#fff; border-color:#333; }
+  nav a.on { background:#fff; color:#000; font-weight:700; }
+  h1 { font-size:clamp(24px,5vw,34px); font-weight:700; letter-spacing:-1px; }
+  h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:36px 0 12px; border-bottom:1px solid #222; padding-bottom:8px; }
+  h3 { font-size:12px; letter-spacing:.15em; color:#fff; margin:22px 0 6px; }
+  p { margin:10px 0; color:#ccc; }
+  .sub { color:#888; font-size:12px; margin-top:8px; }
+  code { background:#111; border:1px solid #2a2a2a; padding:1px 6px; font-size:12.5px; word-break:break-all; }
+  pre { background:#0a0a0a; border:1px solid #2a2a2a; padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:12px 0; color:#ddd; }
+  pre code { background:none; border:0; padding:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin:12px 0; }
+  th { text-align:left; font-size:10px; letter-spacing:.2em; color:#888; font-weight:400; padding:8px 12px 8px 0; border-bottom:1px solid #333; vertical-align:top; white-space:nowrap; }
+  td { padding:10px 12px 10px 0; border-bottom:1px solid #1c1c1c; vertical-align:top; color:#ccc; }
+  ul, ol { margin:10px 0 10px 22px; color:#ccc; }
+  li { margin:6px 0; }
+  a { color:#fff; }
+  .math { list-style:none; margin:14px 0; }
+  .math li { border:1px solid #333; padding:12px 16px; margin-top:-1px; display:flex; gap:14px; align-items:baseline; }
+  .math .t { font-weight:700; letter-spacing:.14em; font-size:11px; min-width:92px; flex:none; }
+  .math .d { color:#aaa; font-size:12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./index.html">GHOSTPAY DOCS</a>
+  <a href="./index.html">INDEX</a>
+  <a href="./relayer.html">RELAYER</a>
+  <a href="./fees.html">FEES</a>
+  <a href="./api.html">API</a>
+  <a class="on" href="./privacy.html">PRIVACY</a>
+  <a href="./recovery.html">RECOVERY</a>
+  <a href="./contracts.html">CONTRACTS</a>
+</nav>
+
+<h1>THE PRIVACY MODEL</h1>
+<p class="sub">honest version: what each party learns, and what is cryptographically out of its reach.</p>
+
+<h2>THE STEALTH MATH</h2>
+<p>ERC-5564 scheme 1, secp256k1 with view tags, keccak256 shared secret (sha256 for announcements made before 2026-09-08).</p>
+<ul class="math">
+  <li><span class="t">GENERATE</span><span class="d">one wallet signature derives <code>spendPriv</code> and <code>viewPriv</code>; the meta-address is <code>spendPub ‖ viewPub</code>. same signature regenerates the same keys on any device.</span></li>
+  <li><span class="t">DERIVE</span><span class="d">the sender picks ephemeral <code>r</code>, computes shared secret <code>sh = keccak256(ECDH(r, viewPub))</code>, and pays <code>stealth = address(spendPub + sh·G)</code>.</span></li>
+  <li><span class="t">ANNOUNCE</span><span class="d">the network sees <code>(stealth, ephPub = r·G, viewTag = sh[0])</code>. nobody can link stealth to the meta-address without <code>viewPriv</code>.</span></li>
+  <li><span class="t">SCAN</span><span class="d">the recipient recomputes <code>sh = keccak256(ECDH(viewPriv, ephPub))</code> per announcement; the view tag filters 255/256 of them cheaply. watching needs only the viewing key.</span></li>
+  <li><span class="t">SPEND</span><span class="d">the stealth private key is <code>spendPriv + sh</code>. it exists only in the session that re-derives it, signs the sweep, and is never stored.</span></li>
+</ul>
+
+<h2>WHAT THE RELAYER SEES</h2>
+<table>
+  <tr><th>IT SEES</th><th>DETAIL</th></tr>
+  <tr><td>Your IP</td><td>Every HTTP request to it. Gone entirely when the app is served as an onion service (below).</td></tr>
+  <tr><td>Your timing</td><td>When you announce, sweep, withdraw. Blurred by broadcast jitter, not erased.</td></tr>
+  <tr><td>The runner address</td><td>Public onchain: it pays the gas on your relayed transactions.</td></tr>
+  <tr><td>Payload contents</td><td>The announced stealth address, the signed intent (destination or precommitment, fee, deadline), the withdrawal proof and recipient. This is inherent: the relayer must carry the bytes.</td></tr>
+</table>
+
+<h2>WHAT THE RELAYER CANNOT DO</h2>
+<p>The sweep artifact is two signatures. The EIP-712 <code>SweepIntent</code>, signed by the stealth key, binds the action, token, destination, Privacy Pools precommitment, fee, and deadline. The EIP-7702 authorization binds the delegation target and the nonce. Change any byte and a signature stops verifying: the relayer's only options are to deliver the payload as signed or to censor it. It cannot redirect funds, raise the fee, or reuse the artifact. The withdrawal relay is bound the same way by the circuit: the context signal commits the proof to the exact recipient, fee recipient, and fee rate.</p>
+<p>Censorship is still possible. The mitigation is that any 7702-capable broadcaster can carry the same signed artifact: <code>relay.mjs</code> broadcasts a saved artifact from any funded key, and nothing about the artifact is tied to this relayer.</p>
+
+<h2>SHRINKING THE FOOTPRINT</h2>
+<h3>FUND THE RUNNER FROM PRIVACY POOLS</h3>
+<p>A runner funded from an operator wallet links every relayed transaction to the operator onchain. Funded from a Privacy Pools withdrawal instead, the runner has no funding link to anyone. Rotate runners by withdrawing again to a fresh address. Procedure: <a href="./relayer.html">RELAYER</a>.</p>
+<h3>JITTER</h3>
+<p>Every broadcast waits a random delay (announce 2-15s, sweeps and withdrawals 5-45s) so the browser request and the onchain transaction are not trivially time-correlated. This weakens timing analysis; it does not defeat a patient observer.</p>
+<h3>FLASHBOTS PROTECT</h3>
+<p>Broadcasts default to Protect's private mempool: pending transactions are invisible to explorers and public mempool watchers until mined. There is no public pending transaction to correlate with your request.</p>
+<h3>TOR + RPC ROTATION</h3>
+<p>Relayer-side, every JSON-RPC call goes to a random endpoint from <code>RPC_URLS</code>, and <code>TOR_PROXY</code> routes all of it over Tor: no single RPC provider sees both the relayer's IP and its broadcasts.</p>
+<h3>ONION SERVICE</h3>
+<p>The strongest option: serve the app itself as a Tor onion service, so the browser-to-relayer hop is Tor too and the relayer never sees your IP at all.</p>
+<pre><code># torrc
+HiddenServiceDir /var/lib/tor/ghostpay/
+HiddenServicePort 80 127.0.0.1:8791</code></pre>
+<p>Restart tor, read the hostname from <code>/var/lib/tor/ghostpay/hostname</code>, open that .onion address in Tor Browser.</p>
+
+<h2>METADATA AND MEMOS</h2>
+<p>The announcement metadata is public calldata, forever. The default is one byte: the view tag. The invoice suite's encrypted memo format (<code>[viewTag(1)][R(33)][nonce(12)][AES-GCM ciphertext]</code>) decrypts only with the recipient's viewing key; the AES key is <code>keccak256(ECDH(r, viewPub) ‖ "memo")</code>. The relayer and the chain see ciphertext and its length. The length is the leak: a long metadata betrays that a memo exists. Never put plaintext identifying information in metadata.</p>
+
+<h2>ZK PROVES, IT DOES NOT HIDE FROM THE PROVER</h2>
+<p>A zero-knowledge proof hides the witness from the verifier, not from the machine that computed the proof. The withdrawal proof is built in the browser for exactly this reason: server-side proving would hand the server the nullifier and secret. The same argument kills server-side stealth-address generation: the server would hold the keys. The correct construction is the one this repo has: client-side generation and proving, payer-side announce, anonymous transport (Tor) on the remaining relayer hops, and blind-signature metering if request counts ever need hiding from the relayer. For private scanning and metering respectively, see <a href="https://eprint.iacr.org/2021/1256">ePrint 2021/1256</a> (Oblivious Message Retrieval) and <a href="https://www.rfc-editor.org/rfc/rfc9576">RFC 9576</a> (Privacy Pass, Anonymous Rate-Limited Credentials).</p>
+
+<h2>RESIDUAL LEAKS, PLAINLY</h2>
+<ul>
+  <li>The relayer sees IP + timing unless you reach it over Tor. That is one party, and it is the party you chose to run or use.</li>
+  <li>Batch sweeps share one transaction: the swept stealth addresses are linked onchain. Sweep individually when linkage matters.</li>
+  <li>The payer's payment to the stealth address is a normal public transfer. Stealth addresses hide the recipient's identity, not the existence of the payment; the companion essay (<i>How Much Stealth Does a Stealth Address Get You?</i>) covers what leaks at spend time, which is what the Privacy Pools sweep fixes.</li>
+  <li>Withdrawals wait on ASP approval. The ASP is a compliance gate operated by the Privacy Pools deployment, not by ghostpay.</li>
+  <li>The stealth crypto follows the ERC-5564 reference but is hand-rolled, and the sweeper contracts are unaudited. Prototype software.</li>
+</ul>
+</div>
+</body>
+</html>

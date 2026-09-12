@@ -373,7 +373,7 @@ export function reminderText(rec, profile) {
   const lines = [
     'hi ' + (rec.clientName || 'there') + ',',
     '',
-    'a friendly reminder: invoice ' + rec.number + ' for ' + fmtAmt(rec.total, rec.token) + ' ' + rec.token
+    'reminder: invoice ' + rec.number + ' for ' + fmtAmt(rec.total, rec.token) + ' ' + rec.token
       + (rec.expiry ? ' was due on ' + fmtDate(rec.expiry) + ' and is still open.' : ' is still open.'),
     '',
   ];

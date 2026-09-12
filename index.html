@@ -112,7 +112,7 @@
   <div id="gp-status">relayer: checking…</div>
   <div class="logo">GHOST<span>PAY</span></div>
 
-  <!-- ══ GET PAID (default tab) ══ the homepage receive journey, unchanged -->
+  <!-- ══ GET PAID (default tab) ══ the homepage receive flow, unchanged -->
   <section class="gp-route" id="route-get-paid">
     <div class="sub">RECEIVE-ONLY STEALTH · ERC-5564 · KEYS DERIVED FROM YOUR WALLET SIGNATURE · v1.3</div>
     <div class="sub" style="color:#bbb">get paid to one-time stealth addresses, sweep into Privacy Pools, withdraw to an unlinked wallet: your wallet never appears onchain. the invoice suite adds tracked invoices with private payment links and encrypted memos.</div>
@@ -413,7 +413,7 @@
     links.forEach(a => a.classList.toggle('on', a.dataset.route === r));
     const $ = id => document.getElementById(id);
     if (isPayLink()) {
-      // payer chrome: the receive journey steps aside (the homepage inline module's
+      // payer chrome: the receive flow steps aside (the homepage inline module's
       // enterPayMode repeats this and fills in the address + handlers).
       ['getpaid', 'r-recovery', 'doors'].forEach(id => { const el = $(id); if (el) el.style.display = 'none'; });
       ['payflow', 'payghost'].forEach(id => { const el = $(id); if (el) el.style.display = 'block'; });
@@ -451,7 +451,7 @@
 <script type="module" src="./gp-invoices.mjs"></script>
 <script type="module" src="./gp-reports.mjs"></script>
 <script type="module">
-// ══ homepage inline module: the GET PAID journey + the PAY tab's payer flow ══
+// ══ homepage inline module: the GET PAID flow + the PAY tab's payer flow ══
 // Loads LAST, after app-core.mjs and the feature modules, so it can reconcile window.GP
 // (see the merge block below) instead of being overwritten by app-core.
 import { secp256k1 } from './vendor/noble-curves-secp256k1.mjs';
@@ -884,7 +884,7 @@ $('b-paylink').onclick = () => {
 
 $('i-paylink').onkeydown = e => { if (e.key === 'Enter') $('b-paylink').click(); };
 
-// ── GET PAID: the easy receive flow (CONNECT → GENERATE → AMOUNT → COPY) ──
+// ── GET PAID: the receive flow (CONNECT → GENERATE → AMOUNT → COPY) ──
 // Key derivation, record format, session format, and announce pruning are byte-identical
 // with app-core.mjs, so keys, sessions, and recovery interlock with the FUNDS tab.
 
@@ -1108,7 +1108,7 @@ async function announceRecv(rec, setSt) {
 }
 $('r-b-ann').onclick = async () => { $('r-b-ann').disabled = true; await announceRecv(); $('r-b-ann').disabled = false; };
 
-// ── PAYMENTS: the journey after generate ──
+// ── PAYMENTS: the flow after generate ──
 // Scan ported from app-core.mjs EXACTLY: announcer topic, chunked eth_getLogs with the
 // same split/retry workers, cursor 'ghostpay:lastScanned:<viewPub>' (default latest −
 // 50000), view-tag prefilter + check(). Only the rendering differs (rows, not app cards).
@@ -1461,7 +1461,7 @@ function openDirectSweep(row, bal) {
   };
 }
 
-// the seamless journey kicks off the moment keys exist: PAYMENTS section + first scan
+// the receive flow kicks off the moment keys exist: PAYMENTS section + first scan
 // + the background auto-announce for raw-address payers.
 function startJourney() {
   $('r-watch-note').style.display = 'none';
