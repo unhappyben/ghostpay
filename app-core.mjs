@@ -392,8 +392,22 @@ async function announceRecv(rec) {
     const r = await fetch('/announce', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stealth, ephPub, viewTag }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
-    st('announced: ' + j.hash + ' · your scanner will now find payments to this address. share it and get paid.');
-    dropRecvRecord(stealth); // announced onchain: the scanner covers recovery from here
+    st('broadcast via relayer: ' + j.hash + ' · waiting for confirmation (private mempool: explorers will not show it until it is mined)…');
+    (async () => {
+      for (let i = 0; i < 120; i++) {
+        await new Promise(x => setTimeout(x, 5000));
+        try {
+          const s = await fetch('/status/' + j.hash).then(r => r.json());
+          if (s.status === 'confirmed') {
+            st('announced: ' + j.hash + ' · your scanner will now find payments to this address. share it and get paid.');
+            dropRecvRecord(stealth); // confirmed onchain: the scanner covers recovery from here
+            return;
+          }
+          if (s.status === 'failed') { st('announce tx REVERTED onchain · ' + j.hash + ' · hit ANNOUNCE IT to retry.'); return; }
+        } catch { /* keep polling */ }
+      }
+      st('still pending after 10 minutes · ' + j.hash + ' · it is in the private mempool, it usually lands within a few more minutes.');
+    })();
     return { hash: j.hash, via: 'relayer' };
   } catch (e) {
     st('relayer unreachable (' + e.message + ') · falling back to announcing from your wallet…');

@@ -41,6 +41,14 @@
   a.door:hover .door-d { color:#333; }
   .door-t { font-size:20px; font-weight:700; letter-spacing:.15em; }
   .door-d { color:#888; font-size:12px; margin-top:8px; }
+  /* GET PAID card: four-tab stepper */
+  .r-tabs { display:flex; gap:6px; margin-bottom:16px; }
+  .r-tab { width:auto; flex:1 1 0; background:#000; color:#888; border:1px solid #333;
+    padding:10px 4px; font-size:10px; letter-spacing:.06em; font-weight:400; min-height:36px; }
+  .r-tab.on { border-color:#fff; color:#fff; font-weight:700; }
+  .r-tab.done { color:#fff; border-color:#555; }
+  .r-panel { display:none; }
+  .r-panel.on { display:block; }
   /* status strip + toast (same as the app) */
   #gp-status { border:1px solid #333; padding:8px 12px; font-size:11px; color:#888; margin-bottom:22px;
     word-break:break-word; }
@@ -70,6 +78,72 @@
   <div class="logo">GHOST<span>PAY</span></div>
   <div class="sub">RECEIVE-ONLY STEALTH · ERC-5564 · KEYS DERIVED FROM YOUR WALLET SIGNATURE · v1.3</div>
   <div class="sub" style="color:#bbb">get paid to one-time stealth addresses, sweep into Privacy Pools, withdraw to an unlinked wallet: your wallet never appears onchain. the invoice suite adds tracked invoices with private payment links and encrypted memos.</div>
+
+  <div class="step on" id="getpaid">
+    <h2>GET PAID</h2>
+    <div class="r-tabs">
+      <button class="r-tab on" id="r-tab-0">1 · CONNECT</button>
+      <button class="r-tab" id="r-tab-1">2 · GENERATE</button>
+      <button class="r-tab" id="r-tab-2">3 · AMOUNT</button>
+      <button class="r-tab" id="r-tab-3">4 · COPY</button>
+    </div>
+
+    <div class="r-panel on" id="r-p0">
+      <button id="r-b-connect">CONNECT · WALLETCONNECT VIA LATRINE</button>
+      <div class="status" id="r-st-connect"></div>
+      <div id="r-qrwrap" style="display:none;margin-top:16px;text-align:center">
+        <canvas id="r-qr" style="background:#fff;padding:14px;image-rendering:pixelated"></canvas>
+        <div class="status">scan with your wallet</div>
+        <a id="r-wc-link" href="#" style="display:inline-block;margin-top:12px;background:#fff;color:#000;padding:14px 28px;font-weight:700;letter-spacing:.12em;text-decoration:none">OPEN WALLET</a>
+        <div class="status">or paste the link into your wallet's WalletConnect screen: <span id="r-wc-raw" style="word-break:break-all;color:#fff"></span></div>
+      </div>
+      <button class="ghost" id="r-b-injected" style="display:none">USE INJECTED WALLET INSTEAD</button>
+      <div class="status" style="margin-top:10px"><a href="#" id="r-b-forcelatrine" style="color:#888">prefer WalletConnect (latrine)? force it here</a> · used automatically when no wallet extension is present.</div>
+    </div>
+
+    <div class="r-panel" id="r-p1">
+      <div class="status" id="r-acct"></div>
+      <div class="status">one wallet signature derives your stealth keys. it spends nothing and never leaves your wallet.</div>
+      <button id="r-b-gen" style="margin-top:12px">SIGN · GENERATE STEALTH KEYS</button>
+      <div class="status" id="r-st-gen"></div>
+    </div>
+
+    <div class="r-panel" id="r-p2">
+      <div class="status">optional: ask for a specific amount. the payer can always change it.</div>
+      <input id="r-i-amount" type="number" min="0" step="any" placeholder="amount (optional)">
+      <select id="r-i-token"><option>ETH</option><option>USDC</option></select>
+      <input id="r-i-note" placeholder="note (optional)">
+      <div style="display:flex;gap:10px;margin-top:12px">
+        <button class="ghost" id="r-b-skip" style="width:auto;flex:1">SKIP</button>
+        <button id="r-b-amtnext" style="width:auto;flex:1">NEXT</button>
+      </div>
+    </div>
+
+    <div class="r-panel" id="r-p3">
+      <div class="card">
+        <div class="lbl">YOUR ONE-TIME STEALTH ADDRESS</div>
+        <b id="r-v-addr"></b>
+        <button id="r-b-copyaddr">COPY ADDRESS</button>
+      </div>
+      <div class="card">
+        <div class="lbl">PAYMENT LINK · ANNOUNCES AUTOMATICALLY WHEN PAID</div>
+        <b id="r-v-link"></b>
+        <button id="r-b-copylink">COPY LINK</button>
+        <div id="r-qrlink-wrap" style="display:none;margin-top:14px;text-align:center">
+          <canvas id="r-qrlink" style="padding:10px;image-rendering:pixelated"></canvas>
+        </div>
+      </div>
+      <div class="status" id="r-st-ann" style="margin-top:14px">payment links announce automatically when the payer pays. a raw-address payment needs one announce:</div>
+      <button class="ghost" id="r-b-ann">ANNOUNCE ADDRESS</button>
+    </div>
+
+    <div id="r-remember-row" style="display:none;margin-top:14px">
+      <label style="font-size:12px;color:#888;display:flex;gap:8px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="r-i-remember" style="width:auto;margin:0"> remember this device (watch-only: viewing key + meta-address, never the spend key)
+      </label>
+    </div>
+  </div>
+  <div id="r-recovery" style="display:none;border:1px solid #fff;padding:14px;margin-top:14px;font-size:12px;line-height:1.7"></div>
 
   <div id="doors">
     <a class="door" href="./app.html">
@@ -140,6 +214,7 @@ function buf(h){ h = h.replace(/^0x/, ''); const u = new Uint8Array(h.length/2);
 const N = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141');
 const mod = x => ((x % N) + N) % N;
 const bint = b => BigInt(hex(b));
+const cat = (...as) => { const u = new Uint8Array(as.reduce((s,a)=>s+a.length,0)); let o=0; for (const a of as){u.set(a,o);o+=a.length;} return u; };
 
 // ERC-5564 scheme 1, payer side: derive a fresh one-time address from a meta-address.
 const addrOf = P => '0x' + [...keccak_256(P.toRawBytes(false).slice(1)).slice(-20)].map(x=>x.toString(16).padStart(2,'0')).join('');
@@ -154,6 +229,11 @@ function derive(metaHex) {
 
 // state
 let W = null; // { account, prov, eip1193 } or { account, session }
+// connect UI sink: the pay-a-ghost panel by default. The GET PAID card points the same
+// connect machinery at its own elements while its connect step is active.
+const PAY_CTX = { st: 'st-connect', qr: 'qr', qrwrap: 'qrwrap', wclink: 'wc-link', wcraw: 'wc-raw', binj: 'b-injected' };
+const RECV_CTX = { st: 'r-st-connect', qr: 'r-qr', qrwrap: 'r-qrwrap', wclink: 'r-wc-link', wcraw: 'r-wc-raw', binj: 'r-b-injected' };
+let CTX = PAY_CTX;
 const ANNOUNCER = '0x55649E01B5Df198D18D95b5cc5051630cfD45564';
 const CHAIN_ID = 1;
 // PayAndAnnounce contract (pay(stealth, ephPub, metadata) payable: announces + forwards the
@@ -173,8 +253,8 @@ function toast(msg) {
 }
 
 // ── loud failure mode: any error, anywhere, lands in the status line ──
-window.addEventListener('error', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load · check network (esm.sh CDN) and reload'); });
-window.addEventListener('unhandledrejection', e => { const s = $('st-connect'); if (s) s.textContent = 'error: ' + ((e.reason && e.reason.message) || e.reason || 'unknown'); });
+window.addEventListener('error', e => { const s = $(CTX.st); if (s) s.textContent = 'error: ' + (e.message || 'script failed to load · check network (esm.sh CDN) and reload'); });
+window.addEventListener('unhandledrejection', e => { const s = $(CTX.st); if (s) s.textContent = 'error: ' + ((e.reason && e.reason.message) || e.reason || 'unknown'); });
 
 // ── EIP-6963 wallet discovery: finds every installed wallet even when extensions fight over window.ethereum ──
 const PROVIDERS = []; // {info, provider}
@@ -192,27 +272,27 @@ async function connectInjected() {
   } else if (window.ethereum) {
     provider = window.ethereum;
   }
-  if (!provider) { $('st-connect').textContent = 'no injected wallet found · use the WalletConnect path below.'; return; }
+  if (!provider) { $(CTX.st).textContent = 'no injected wallet found · use the WalletConnect path below.'; return; }
   const prov = new ethers.BrowserProvider(provider);
   const accounts = await prov.send('eth_requestAccounts', []);
   W = { account: accounts[0], prov, eip1193: provider };
-  $('qrwrap').style.display = 'none';
-  $('st-connect').innerHTML = 'connected via ' + name + ': <span class="ok">' + W.account + '</span>';
+  $(CTX.qrwrap).style.display = 'none';
+  $(CTX.st).innerHTML = 'connected via ' + name + ': <span class="ok">' + W.account + '</span>';
 }
 
 // ── connect (latrine = privacy-hardened WalletConnect client) ──
 function showQr(text) {
   const qr = qrcode(0, 'M'); qr.addData(text); qr.make();
-  const cv = $('qr'), ctx = cv.getContext('2d');
+  const cv = $(CTX.qr), ctx = cv.getContext('2d');
   const n = qr.getModuleCount(), scale = 4;
   cv.width = cv.height = n * scale;
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height);
   ctx.fillStyle = '#000';
   for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) ctx.fillRect(c * scale, r * scale, scale, scale);
-  $('qrwrap').style.display = 'block';
+  $(CTX.qrwrap).style.display = 'block';
 }
 async function connectLatrine() {
-  const st = m => $('st-connect').textContent = m;
+  const st = m => $(CTX.st).textContent = m;
   const pid = $('i-wcpid').value.trim();
   st('signing relay identity…');
   const jwk = crypto.getRandomValues(new Uint8Array(32));
@@ -224,8 +304,8 @@ async function connectLatrine() {
   const url = pairing.url;
   // show everything FIRST so nothing can vanish the evidence
   showQr(url);
-  $('wc-link').href = url;
-  $('wc-raw').textContent = url;
+  $(CTX.wclink).href = url;
+  $(CTX.wcraw).textContent = url;
   st('pairing ready · open your wallet and approve. (on mobile your wallet opens by itself)');
   // mobile: auto-open wallet app via the wc: uri (WalletConnect-recommended); desktop: user clicks OPEN WALLET
   if (/Android|iPhone|iPad/i.test(navigator.userAgent)) window.location.href = url;
@@ -261,28 +341,30 @@ async function connectLatrine() {
   return { session, account };
 }
 $('b-connect').onclick = async () => {
+  CTX = PAY_CTX;
   // 6963/injected wallet (Ambire extension, …) pops instantly; latrine/WC when nothing is injected.
   if (PROVIDERS.length || window.ethereum) return connectInjected();
   try {
     const { session, account } = await connectLatrine();
     W = { session, account };
-    $('qrwrap').style.display = 'none';
-    $('st-connect').innerHTML = 'connected: <span class="ok">' + account + '</span>';
+    $(CTX.qrwrap).style.display = 'none';
+    $(CTX.st).innerHTML = 'connected: <span class="ok">' + account + '</span>';
   } catch (e) {
-    $('st-connect').textContent = 'pairing failed: ' + e.message;
-    $('b-injected').style.display = 'block';
+    $(CTX.st).textContent = 'pairing failed: ' + e.message;
+    $(CTX.binj).style.display = 'block';
   }
 };
-$('b-injected').onclick = connectInjected;
+$('b-injected').onclick = () => { CTX = PAY_CTX; connectInjected(); };
 $('b-forcelatrine').onclick = async e => {
   e.preventDefault();
+  CTX = PAY_CTX;
   try {
     const { session, account } = await connectLatrine();
     W = { session, account };
-    $('qrwrap').style.display = 'none';
-    $('st-connect').innerHTML = 'connected: <span class="ok">' + account + '</span>';
+    $(CTX.qrwrap).style.display = 'none';
+    $(CTX.st).innerHTML = 'connected: <span class="ok">' + account + '</span>';
   } catch (err) {
-    $('st-connect').textContent = 'pairing failed: ' + err.message;
+    $(CTX.st).textContent = 'pairing failed: ' + err.message;
   }
 };
 
@@ -373,6 +455,8 @@ if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
 function enterPayMode() {
   const metaMatch = location.hash.match(/st:eth:0x[0-9a-fA-F]{132}/);
   if (!metaMatch) return false;
+  $('getpaid').style.display = 'none';
+  $('r-recovery').style.display = 'none';
   $('doors').style.display = 'none';
   $('payflow').style.display = 'block';
   $('payghost').style.display = 'block';
@@ -476,6 +560,255 @@ $('b-paylink').onclick = () => {
 };
 
 $('i-paylink').onkeydown = e => { if (e.key === 'Enter') $('b-paylink').click(); };
+
+// ── GET PAID: the easy receive flow (CONNECT → GENERATE → AMOUNT → COPY) ──
+// Key derivation, record format, session format, and announce pruning are byte-identical
+// with app-core.mjs, so homepage-generated keys, sessions, and recovery interlock with app.html.
+
+// gp-session: ONLY the viewing key + stealth meta-address (watch-only). The spend key is
+// never stored, so sweeping always needs a fresh wallet signature.
+const SESSION_KEY = 'gp-session';
+const loadGpSession = () => { try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch { return null; } };
+function saveGpSession() {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ v: 1, viewPriv: W.viewPriv, meta: W.meta, ts: Date.now() }));
+  } catch { /* storage blocked/full: persistence is best-effort, the session still works */ }
+}
+
+// ephemeral receive records: a generated address is recoverable only while its record
+// exists. Persist until announced (app-core's format and pruning rule, cap 10).
+const RECV_KEY = 'gp-recv-records';
+const loadRecvRecords = () => { try { const r = JSON.parse(localStorage.getItem(RECV_KEY) || '[]'); return Array.isArray(r) ? r : []; } catch { return []; } };
+const saveRecvRecords = rs => { try { localStorage.setItem(RECV_KEY, JSON.stringify(rs.slice(-10))); } catch { /* storage full: recovery line just shows fewer */ } };
+function recordRecv(rec) {
+  const rs = loadRecvRecords().filter(x => x.stealth.toLowerCase() !== rec.stealth.toLowerCase());
+  rs.push({ stealth: rec.stealth, ephPub: rec.ephPub, viewTag: rec.viewTag, created: Date.now() });
+  saveRecvRecords(rs);
+  renderRecvRecovery();
+}
+function dropRecvRecord(stealth) {
+  saveRecvRecords(loadRecvRecords().filter(x => x.stealth.toLowerCase() !== stealth.toLowerCase()));
+  renderRecvRecovery();
+}
+
+// same signature scheme as app-core's ghostSign: hex-encoded personal_sign over
+// WalletConnect, signMessage on the injected path. The same signature must regenerate
+// the same keys on app.html, so this must not drift.
+async function ghostSign(message) {
+  if (W.session) {
+    const hexMsg = ethers.hexlify(new TextEncoder().encode(message));
+    return await W.session.request({ chainId: 'eip155:1', request: { method: 'personal_sign', params: [hexMsg, W.account] } });
+  }
+  return await (await W.prov.getSigner()).signMessage(message);
+}
+// byte-identical with app-core.mjs generate. The message (em dash included) is
+// load-bearing: changing it changes every derived key.
+const GEN_MESSAGE = 'GHOSTPAY v1 — derive stealth keys. This signature spends nothing.';
+function deriveKeysFromSig(sig) {
+  const spendPriv = '0x' + hex(keccak_256(cat(buf(sig), new TextEncoder().encode('|spend')))).slice(2);
+  const viewPriv  = '0x' + hex(keccak_256(cat(buf(sig), new TextEncoder().encode('|view')))).slice(2);
+  W.spendPriv = spendPriv; W.viewPriv = viewPriv;
+  W.spendPub = hex(secp256k1.getPublicKey(buf(spendPriv), true));
+  W.viewPub = hex(secp256k1.getPublicKey(buf(viewPriv), true));
+  W.meta = 'st:eth:0x' + (W.spendPub + W.viewPub).replace(/0x/g, '');
+  // fresh one-time receiving address off our own meta-address (same derive() as pay-a-ghost mode)
+  W.recv = derive(W.meta.slice(7));
+  recordRecv(W.recv);
+}
+
+// tab stepper: auto-advance on completion, completed tabs get a ✓ and stay clickable.
+const R_NAMES = ['CONNECT', 'GENERATE', 'AMOUNT', 'COPY'];
+const rDone = [false, false, false, false];
+let rStep = 0;
+function rGoto(n) {
+  rStep = n;
+  for (let i = 0; i < 4; i++) {
+    const t = $('r-tab-' + i);
+    t.classList.toggle('on', i === n);
+    t.classList.toggle('done', rDone[i] && i !== n);
+    t.textContent = (rDone[i] ? '✓ ' : (i + 1) + ' · ') + R_NAMES[i];
+    $('r-p' + i).classList.toggle('on', i === n);
+  }
+  if (n === 3 && W && W.meta) refreshCopyPanel();
+}
+function rAdvance(i) { rDone[i] = true; rGoto(i < 3 ? i + 1 : i); }
+R_NAMES.forEach((_, i) => { $('r-tab-' + i).onclick = () => { if (i === rStep || rDone[i] || (i > 0 && rDone[i - 1])) rGoto(i); }; });
+
+// 1 · CONNECT: the homepage's existing connect machinery, pointed at this card's elements.
+function rOnConnected() {
+  $('r-acct').innerHTML = 'wallet: <span class="ok">' + W.account.slice(0, 6) + '…' + W.account.slice(-4) + '</span>';
+  rAdvance(0);
+}
+$('r-b-connect').onclick = async () => {
+  CTX = RECV_CTX;
+  // 6963/injected wallet pops instantly; latrine/WC when nothing is injected.
+  if (PROVIDERS.length || window.ethereum) {
+    try { await connectInjected(); if (W && W.account) rOnConnected(); } catch (e) { $(CTX.st).textContent = 'connect failed: ' + ((e && e.message) || e); }
+    return;
+  }
+  try {
+    const { session, account } = await connectLatrine();
+    W = { session, account };
+    $(CTX.qrwrap).style.display = 'none';
+    $(CTX.st).innerHTML = 'connected: <span class="ok">' + account + '</span>';
+    rOnConnected();
+  } catch (e) {
+    $(CTX.st).textContent = 'pairing failed: ' + e.message;
+    $(CTX.binj).style.display = 'block';
+  }
+};
+$('r-b-injected').onclick = async () => {
+  CTX = RECV_CTX;
+  try { await connectInjected(); if (W && W.account) rOnConnected(); } catch (e) { $(CTX.st).textContent = 'connect failed: ' + ((e && e.message) || e); }
+};
+$('r-b-forcelatrine').onclick = async e => {
+  e.preventDefault();
+  CTX = RECV_CTX;
+  try {
+    const { session, account } = await connectLatrine();
+    W = { session, account };
+    $(CTX.qrwrap).style.display = 'none';
+    $(CTX.st).innerHTML = 'connected: <span class="ok">' + account + '</span>';
+    rOnConnected();
+  } catch (err) {
+    $(CTX.st).textContent = 'pairing failed: ' + err.message;
+  }
+};
+
+// 2 · GENERATE: one wallet signature derives the keys (exactly as app-core does).
+$('r-b-gen').onclick = async () => {
+  if (!W || !W.account) { $('r-st-gen').textContent = 'connect a wallet first.'; return; }
+  const btn = $('r-b-gen');
+  btn.disabled = true;
+  try {
+    $('r-st-gen').textContent = 'check your wallet: one signature, spends nothing.';
+    const sig = await ghostSign(GEN_MESSAGE);
+    deriveKeysFromSig(sig);
+    $('r-st-gen').textContent = 'done. your keys regenerate from the same signature any time, any device.';
+    $('r-remember-row').style.display = 'block';
+    $('r-i-remember').checked = !!loadGpSession();
+    if ($('r-i-remember').checked) saveGpSession();
+    rAdvance(1);
+  } catch (e) {
+    $('r-st-gen').textContent = 'signing failed: ' + ((e && e.message) || e);
+  } finally { btn.disabled = false; }
+};
+$('r-i-remember').onchange = e => {
+  if (e.target.checked) {
+    if (W && W.viewPriv && W.meta) { saveGpSession(); toast('session saved on this device (watch-only)'); }
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+    toast('session removed from this device');
+  }
+};
+
+// 3 · AMOUNT: optional, skippable. Both buttons advance.
+$('r-b-skip').onclick = () => rAdvance(2);
+$('r-b-amtnext').onclick = () => rAdvance(2);
+
+// 4 · COPY: stealth address, payment link, QR of the link, and the raw-address announce.
+function buildPayLink() {
+  const amt = $('r-i-amount').value.trim();
+  const token = $('r-i-token').value;
+  const note = $('r-i-note').value.trim();
+  return location.origin + '/#' + W.meta + (amt ? '?pay=' + encodeURIComponent(amt + ' ' + token + (note ? ' · ' + note : '')) : '');
+}
+// qrcode-generator: same esm.sh import gp-invoices.mjs uses, loaded lazily. The QR is
+// optional and hides quietly if the import fails.
+let qrLinkLib = null;
+async function drawLinkQr(text) {
+  const wrap = $('r-qrlink-wrap');
+  try {
+    qrLinkLib ??= (await import('https://esm.sh/qrcode-generator@1.4.4')).default;
+    const q = qrLinkLib(0, 'M'); q.addData(text); q.make();
+    const cv = $('r-qrlink'), ctx = cv.getContext('2d');
+    const n = q.getModuleCount(), scale = 4;
+    cv.width = cv.height = n * scale;
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = '#000';
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) ctx.fillRect(c * scale, r * scale, scale, scale);
+    wrap.style.display = 'block';
+  } catch { wrap.style.display = 'none'; }
+}
+function refreshCopyPanel() {
+  $('r-v-addr').textContent = W.recv.stealth;
+  const link = buildPayLink();
+  $('r-v-link').textContent = link;
+  drawLinkQr(link);
+}
+$('r-b-copyaddr').onclick = e => copy(W.recv.stealth, e.target);
+$('r-b-copylink').onclick = e => copy($('r-v-link').textContent, e.target);
+
+// raw-address payments only: payment links announce automatically when the payer pays.
+// Relayer announce (POST /announce); a successful announce prunes the record, as app-core does.
+async function announceRecv(rec, setSt) {
+  const st = setSt || (m => $('r-st-ann').textContent = m);
+  const src = rec || (W && W.recv);
+  if (!src) { st('generate your stealth keys first.'); return null; }
+  const { stealth, ephPub, viewTag } = src;
+  try {
+    st('announcing via relayer… (deliberate privacy delay before broadcast: hold on)');
+    const r = await fetch('/announce', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stealth, ephPub, viewTag }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
+    st('announced: ' + j.hash + ' · your scanner will now find payments to this address.');
+    dropRecvRecord(stealth); // announced onchain: the scanner covers recovery from here
+    return { hash: j.hash };
+  } catch (e) {
+    st('announce failed: ' + ((e && e.message) || e) + ' · payment links announce automatically, raw addresses need this announce.');
+    return null;
+  }
+}
+$('r-b-ann').onclick = async () => { $('r-b-ann').disabled = true; await announceRecv(); $('r-b-ann').disabled = false; };
+
+// recovery line under the card: unannounced addresses from dead tabs stay recoverable.
+// Same rule as app-core: anything in gp-recv-records that is not the current session's recv.
+function renderRecvRecovery() {
+  const el = $('r-recovery'); if (!el) return;
+  if ($('payflow').style.display === 'block') { el.style.display = 'none'; return; }
+  const cur = W && W.recv && W.recv.stealth.toLowerCase();
+  const pending = loadRecvRecords().filter(x => x.stealth.toLowerCase() !== cur);
+  if (!pending.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  el.innerHTML = '';
+  const r = pending[pending.length - 1];
+  const txt = document.createElement('div');
+  txt.textContent = 'RECOVERY · ' + pending.length + ' unannounced address' + (pending.length > 1 ? 'es' : '') + ' · latest ' + r.stealth
+    + ': any payment to it is invisible to your scanner until you announce it.';
+  el.appendChild(txt);
+  const row = document.createElement('div');
+  row.style.cssText = 'margin-top:10px;display:flex;gap:10px';
+  const bAnn = document.createElement('button');
+  bAnn.textContent = 'ANNOUNCE NOW';
+  bAnn.style.cssText = 'width:auto;padding:8px 16px;font-size:11px';
+  bAnn.onclick = async () => { bAnn.disabled = true; await announceRecv(r, m => { txt.textContent = m; }); bAnn.disabled = false; };
+  const bDrop = document.createElement('button');
+  bDrop.textContent = 'FORGET';
+  bDrop.className = 'ghost';
+  bDrop.style.cssText = 'width:auto;padding:8px 16px;font-size:11px';
+  bDrop.onclick = () => dropRecvRecord(r.stealth);
+  row.appendChild(bAnn); row.appendChild(bDrop);
+  el.appendChild(row);
+}
+renderRecvRecovery();
+
+if (location.search.includes('gentest')) setTimeout(() => {
+  // wallet-free test of the generate path: fake 65-byte sig in place of personal_sign output.
+  // Same fake signature as app-core.mjs gentest, so the meta-address must match app.html's.
+  const bl = document.createElement('div');
+  bl.id = 'bootline';
+  bl.style.display = 'none';
+  try {
+    W = { account: '0x0000000000000000000000000000000000000001' };
+    rOnConnected();
+    const sig = hex(keccak_256(new TextEncoder().encode('fake-signature-for-test'))) + 'ab'.repeat(32) + '1b';
+    deriveKeysFromSig(sig);
+    $('r-remember-row').style.display = 'block';
+    rAdvance(1);
+    bl.textContent = 'GENTEST OK · ' + W.meta + ' · recv ' + W.recv.stealth;
+  } catch (e) { bl.textContent = 'GENTEST FAIL: ' + ((e && e.message) || e); }
+  document.body.appendChild(bl);
+}, 700);
 
 // opened with a payment hash: jump straight to the pay panel.
 enterPayMode();

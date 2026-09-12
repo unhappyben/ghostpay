@@ -71,7 +71,7 @@ const ROOT = fileURLToPath(new URL('.', import.meta.url));
 const PORT = parseInt(process.env.PORT || '8791', 10);
 const RPC_URLS = (process.env.RPC_URLS || process.env.RPC_URL || 'https://rpc.flashbots.net,https://eth.drpc.org,https://eth.merkle.io')
   .split(',').map(s => s.trim()).filter(Boolean);
-const BROADCAST_URLS = (process.env.BROADCAST_URLS || 'https://rpc.flashbots.net')
+const BROADCAST_URLS = (process.env.BROADCAST_URLS || 'https://rpc.flashbots.net?fast=true')
   .split(',').map(s => s.trim()).filter(Boolean);
 const TOR_PROXY = process.env.TOR_PROXY || null;
 const ANNOUNCER = '0x55649E01B5Df198D18D95b5cc5051630cfD45564'; // ERC-5564 announcer, mainnet (ANNOUNCER const in index.html)
@@ -223,15 +223,26 @@ async function estimateGas(from, tx) {
 }
 
 // ── broadcast: populate via rpcCall, sign locally, jitter, eth_sendRawTransaction ──
+// Runner nonces are tracked locally: our broadcasts go to Flashbots Protect's PRIVATE
+// mempool, which public endpoints cannot see, so their 'pending' nonce goes stale after
+// the first in-flight tx and would hand out the same nonce twice (two announces lost to
+// this on 2026-09-12). Seed once from the network, then increment on every accepted send.
+const nonceCache = new Map(); // runner address (lowercase) -> next nonce
+async function nextNonce(runner) {
+  const a = runner.address.toLowerCase();
+  if (!nonceCache.has(a)) nonceCache.set(a, await getNonce(runner.address));
+  return nonceCache.get(a);
+}
 async function broadcast(runner, tx, jitterRange, label) {
   tx.chainId = CHAIN_ID;
-  tx.nonce = await getNonce(runner.address);
+  tx.nonce = await nextNonce(runner);
   Object.assign(tx, await feeBump());
   if (!tx.gasLimit) tx.gasLimit = await estimateGas(runner.address, tx);
   const signed = await runner.signTransaction(tx);
   const delayedSec = Math.round(jitterRange[0] + Math.random() * (jitterRange[1] - jitterRange[0]));
   await new Promise(r => setTimeout(r, delayedSec * 1000));
   const { hash, host } = await broadcastRawTx(signed);
+  nonceCache.set(runner.address.toLowerCase(), tx.nonce + 1); // only after the send was accepted
   console.log(`broadcast ${label}: broadcast=${host} runner=${runner.address} delay=${delayedSec}s hash=${hash}`);
   return { hash, runner: runner.address, delayedSec };
 }
