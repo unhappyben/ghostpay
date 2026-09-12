@@ -595,7 +595,7 @@ async function scan(opts = {}) {
     // advance the cursor only on a fully clean scan, so unreachable ranges are never skipped for good
     if (!failed) localStorage.setItem(cursorKey, String(latest));
     if (!quiet || found) {
-      $('st-scan').textContent = (found ? found + (append ? ' new ' : ' ') + 'payment(s) found. sweep when ready.' : 'nothing yet. share your address, get paid, come back.')
+      $('st-scan').textContent = (found ? found + (append ? ' new ' : ' ') + 'payment(s) found. sweep when ready.' : 'nothing in this range. if you expected older payments, type an earlier from-block below and rescan.')
         + ' (blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ')'
         + (failed ? ' (' + failed + ' block range(s) unreachable · rescan to retry)' : '')
         + (failed ? '' : ' · cursor saved · next scan resumes from block ' + latest.toLocaleString() + '. type a from-block above to rescan earlier.');
@@ -738,9 +738,23 @@ function queueArm(rec) {
   return armChain;
 }
 
-function sweepUI(addr, ephPub, card) {
+async function sweepUI(addr, ephPub, card) {
   // (re)arm: clicking SWEEP THIS on another card moves the arming to that address.
   document.querySelectorAll('.pay.armed').forEach(d => d.classList.remove('armed'));
+  // sub-minimum guard: the Privacy Pools entrypoint (and this relayer's preflight) rejects
+  // deposits under 0.01 ETH, so arming a pool sweep for dust only produces a failed broadcast
+  // and a scary secret file for a deposit that can never happen. Point at the inbox instead.
+  try {
+    const bal = BigInt(await jrpc('eth_getBalance', [addr, 'latest']));
+    if (bal > 0n && bal < 10000000000000000n) {
+      $('st-armed').textContent = addr + ' holds ' + ethers.formatEther(bal) + ' ETH, below the 0.01 ETH Privacy Pools minimum. Use SWEEP DIRECT on this payment\'s inbox row below: it sends the balance (minus the relayer fee) straight to an address you choose, skipping the pool.';
+      $('sweeper-ui').style.display = 'block';
+      $('c-secret').style.display = 'none';
+      $('b-sweep').textContent = 'BELOW POOL MINIMUM';
+      $('b-sweep').onclick = () => { $('st-armed').textContent = addr + ' is below the 0.01 ETH pool minimum · use SWEEP DIRECT in the inbox instead.'; };
+      return;
+    }
+  } catch { /* balance check failed: fall through to normal arming */ }
   if (card) card.classList.add('armed');
   $('st-armed').textContent = 'sweeping ' + addr + ' into Privacy Pools';
   $('sweeper-ui').style.display = 'block';
