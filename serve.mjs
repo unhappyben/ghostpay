@@ -20,7 +20,8 @@
 //                                                 addresses and relayFeeBPS must not exceed PP_FEE_BPS
 //                                                 (default 25). The runner pays gas; the fee accrues
 //                                                 onchain to the runner inside the withdrawal itself.
-//   GET  /health    relayer status JSON (runners, sweeperV2, batchRelayer, tor, endpoints; never keys).
+//   GET  /health    relayer status JSON (runners, sweeperV2, batchRelayer, feeOwner, tor,
+//                                                 endpoints; never keys).
 //                                                 With PP_RELAY=1 it also advertises ppRelay + ppFeeBps
 //                                                 so the app can discover this relay and price proofs.
 //   GET  /fee       {minFeeBps}: relayer fee floor for intent sweeps (MIN_FEE_BPS, default 30).
@@ -31,6 +32,10 @@
 // Fee ledger: every successful fee-bearing broadcast appends one JSON line to fees.jsonl
 // ({ts, kind, feeBps, estFeeWei, txHash, runner}; see fees.mjs, run `node fees.mjs` for the
 // revenue report). Announce requests carry no fee and are never logged.
+//
+// Fee auto-forward (FEE_OWNER): every FEE_SWEEP_MINUTES (default 60, first sweep 5 min after
+// boot) each runner sends its ETH balance above FEE_RESERVE_ETH (default 0.005) to FEE_OWNER
+// as a type-2 transfer, logged to fees.jsonl as kind "fee-forward". Unset disables it.
 //
 // Networking: every JSON-RPC call goes through rpcCall() with per-call random endpoint
 // rotation (RPC_URLS, comma-separated) and optional Tor routing (TOR_PROXY, via
@@ -72,6 +77,16 @@ const TOR_PROXY = process.env.TOR_PROXY || null;
 const ANNOUNCER = '0x55649E01B5Df198D18D95b5cc5051630cfD45564'; // ERC-5564 announcer, mainnet (ANNOUNCER const in index.html)
 const CHAIN_ID = 1;
 const MIN_FEE_BPS = Number.isFinite(parseInt(process.env.MIN_FEE_BPS, 10)) ? parseInt(process.env.MIN_FEE_BPS, 10) : 30;
+// fee auto-forward: runner fees accrue onchain (tx.origin on intent sweeps, feeRecipient on
+// pp withdrawals). Unset FEE_OWNER disables the forwarder entirely; a bad address fails boot.
+const FEE_OWNER = (() => {
+  const v = process.env.FEE_OWNER;
+  if (!v) return null;
+  if (!ethers.isAddress(v)) { console.error('FEE_OWNER is set but not a valid 0x address.'); process.exit(1); }
+  return ethers.getAddress(v);
+})();
+const FEE_RESERVE_ETH = Number(process.env.FEE_RESERVE_ETH) > 0 ? Number(process.env.FEE_RESERVE_ETH) : 0.005;
+const FEE_SWEEP_MINUTES = parseInt(process.env.FEE_SWEEP_MINUTES, 10) > 0 ? parseInt(process.env.FEE_SWEEP_MINUTES, 10) : 60;
 const SWEEPER_V2 = process.env.SWEEPER_V2 || null;    // SweeperV2 deployed: gates eip7702-intent sweeps
 const BATCH_RELAYER = process.env.BATCH_RELAYER || null; // BatchRelayer deployed: gates eip7702-intent-batch
 const PP_RELAY = process.env.PP_RELAY === '1';        // gates POST /pp-withdraw (Privacy Pools withdrawal relay)
@@ -541,6 +556,41 @@ async function serveStatic(req, res, pathname) {
   }
 }
 
+// ── fee auto-forward: every FEE_SWEEP_MINUTES each runner sends its ETH balance above
+// FEE_RESERVE_ETH to FEE_OWNER as a plain type-2 transfer via the broadcast machinery
+// (rpcCall rotation, feeBump, BROADCAST_URLS). No jitter: fee sweeps are the operator's
+// own money movement, not user traffic. Errors log one line and wait for the next tick;
+// a failed sweep never crashes the server. ──
+async function forwardRunnerFees(runner) {
+  const reserveWei = ethers.parseEther(String(FEE_RESERVE_ETH));
+  const bal = await getBalance(runner.address);
+  if (bal <= reserveWei) {
+    console.log(`fee-forward: runner=${runner.address} balance=${ethers.formatEther(bal)} ETH at/below reserve ${FEE_RESERVE_ETH} ETH (nothing to forward)`);
+    return;
+  }
+  const amount = bal - reserveWei;
+  const tx = { to: FEE_OWNER, value: amount, gasLimit: 21000n, chainId: CHAIN_ID, nonce: await getNonce(runner.address) };
+  Object.assign(tx, await feeBump());
+  const signed = await runner.signTransaction(tx);
+  const { hash, host } = await broadcastRawTx(signed);
+  console.log(`fee-forward: runner=${runner.address} amount=${ethers.formatEther(amount)} ETH broadcast=${host} hash=${hash}`);
+  await logFee({ kind: 'fee-forward', estFeeWei: amount.toString(), txHash: hash, runner: runner.address });
+}
+async function feeSweepTick() {
+  for (const runner of runners) {
+    try { await forwardRunnerFees(runner); }
+    catch (e) { console.error(`fee-forward failed: runner=${runner.address} ${errMsg(e)}`); }
+  }
+}
+if (FEE_OWNER && runners.length) {
+  const first = setTimeout(() => {
+    feeSweepTick();
+    setInterval(feeSweepTick, FEE_SWEEP_MINUTES * 60 * 1000).unref();
+  }, 5 * 60 * 1000);
+  first.unref();
+  console.log(`fee auto-forward on: owner=${FEE_OWNER} reserve=${FEE_RESERVE_ETH} ETH every=${FEE_SWEEP_MINUTES}min (first sweep 5 min after boot)`);
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
@@ -567,6 +617,7 @@ const server = createServer(async (req, res) => {
           runners: runners.map(w => w.address), runnerCount: runners.length,
           sweeperV2: SWEEPER_V2, batchRelayer: BATCH_RELAYER, minFeeBps: MIN_FEE_BPS,
           ppRelay: PP_RELAY, ...(PP_RELAY ? { ppFeeBps: PP_FEE_BPS } : {}),
+          feeOwner: FEE_OWNER,
           tor: !!TOR_PROXY, endpoints: RPC_URLS.map(u => new URL(u).hostname),
         });
       }

@@ -9,6 +9,9 @@
 //     ETH balance is not the swept asset, so the estimate is rough.
 //   pp-withdraw: estFeeWei = withdrawnValue (public signal) * relayFeeBPS / 10000, the fee
 //     the Privacy Pools entrypoint pays the runner inside the withdrawal itself.
+//   fee-forward: written by the serve.mjs auto-forwarder when a runner sweeps its accrued
+//     fees to FEE_OWNER; estFeeWei is the forwarded amount (an outflow, not revenue). These
+//     lines feed the forward totals below and are excluded from the revenue + ARR math.
 // Announce requests carry no fee and are never logged.
 //
 //   node fees.mjs                  report
@@ -86,9 +89,14 @@ async function main() {
     } catch { /* skip malformed lines */ }
   }
 
+  // fee-forward lines are outflows to the owner, not revenue: they feed the forward
+  // totals at the end and stay out of the earned totals, weekly buckets, and ARR.
+  const forwards = entries.filter(e => e.kind === 'fee-forward');
+  const earned = entries.filter(e => e.kind !== 'fee-forward');
+
   const byKind = new Map();
   let total = 0n;
-  for (const e of entries) {
+  for (const e of earned) {
     const k = byKind.get(e.kind) || { wei: 0n, n: 0 };
     k.wei += BigInt(e.estFeeWei); k.n++;
     byKind.set(e.kind, k);
@@ -103,7 +111,7 @@ async function main() {
     m.setDate(m.getDate() - i * 7);
     weeks.push({ start: m, wei: 0n, n: 0 });
   }
-  for (const e of entries) {
+  for (const e of earned) {
     const t = Date.parse(e.ts);
     if (!Number.isFinite(t)) continue;
     const m = mondayOf(t);
@@ -127,6 +135,14 @@ async function main() {
   console.log('weekly (last 8 weeks, week starting):');
   for (const w of weeks) console.log(`  ${dateStr(w.start)}: ${formatEth(w.wei)} ETH (${w.n})`);
   console.log(`ARR run-rate (last 4 weeks x 13): ${formatEth(arr)} ETH` + (usd == null ? '' : ` ≈ ${usdOf(arr)}`));
+
+  let fwdTotal = 0n, fwdLast = null;
+  for (const e of forwards) {
+    fwdTotal += BigInt(e.estFeeWei);
+    if (!fwdLast || e.ts > fwdLast) fwdLast = e.ts;
+  }
+  console.log(`fee-forward: ${formatEth(fwdTotal)} ETH forwarded to owner (${forwards.length})` + (fwdLast ? ` · last ${fwdLast}` : ''));
+  console.log(`runner holdings (earned minus forwarded): ${formatEth(total - fwdTotal)} ETH` + (usd == null ? '' : ` ≈ ${usdOf(total - fwdTotal)}`));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

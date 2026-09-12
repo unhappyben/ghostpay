@@ -96,7 +96,7 @@ node notify.mjs /path/to/conf.json
 | `POST /announce` | `{stealth, ephPub, viewTag, metadata?}` → announce on the ERC-5564 announcer from a runner wallet. `metadata` is optional 0x-hex, 1-1024 bytes (view tag + encrypted memo); default is the 1-byte view tag. |
 | `POST /sweep` | Relay a signed sweep artifact: `eip3009`, `eip7702-sweep`, `eip7702-intent`, or `eip7702-intent-batch`. |
 | `POST /pp-withdraw` | Privacy Pools withdrawal relay (`PP_RELAY=1` only, else 503). Same payload shape the app sends fastrelay.xyz. The groth16 context signal binds the fee terms into the proof: the fee recipient must be one of this server's runners and `relayFeeBPS` must not exceed `PP_FEE_BPS`. The runner pays gas; the fee accrues to the runner inside the withdrawal itself. |
-| `GET /health` | Relayer status JSON: runners (addresses only, never keys), sweeperV2, batchRelayer, tor, endpoints. With `PP_RELAY=1` also `ppRelay: true` and `ppFeeBps`, so the app can discover the relay and price proofs. |
+| `GET /health` | Relayer status JSON: runners (addresses only, never keys), sweeperV2, batchRelayer, feeOwner, tor, endpoints. With `PP_RELAY=1` also `ppRelay: true` and `ppFeeBps`, so the app can discover the relay and price proofs. |
 | `GET /fee` | `{minFeeBps}`: the relayer fee floor for intent sweeps. |
 | `GET /price` | ETH + USDC USD prices, CoinGecko proxied with a 60s cache so the price fetch stays out of the browser. |
 | `GET /status/:hash` | Transaction receipt status: `confirmed`, `failed`, or `pending`. |
@@ -115,18 +115,23 @@ Environment variables:
 | `BATCH_RELAYER` | unset | Deployed BatchRelayer address: gates `eip7702-intent-batch` sweeps. |
 | `PP_RELAY` | unset | Set to `1` to enable `POST /pp-withdraw`. |
 | `PP_FEE_BPS` | `25` | Max relay fee the withdrawal relay accepts, advertised at `GET /health`. |
+| `FEE_OWNER` | unset | Owner address for the fee auto-forwarder; unset disables it. |
+| `FEE_RESERVE_ETH` | `0.005` | Gas reserve kept on each runner when fees are forwarded. |
+| `FEE_SWEEP_MINUTES` | `60` | Minutes between fee-forward sweeps (first sweep 5 min after boot). |
 
 Broadcasts wait a random jitter (announce 2-15s, sweep 5-45s) so the browser request and the onchain transaction are not trivially time-correlated.
 
+**Collecting fees.** Relayer fees accrue onchain to the runner: `tx.origin` on intent sweeps, `feeRecipient` inside Privacy Pools withdrawals. With `FEE_OWNER` set, a forwarder runs every `FEE_SWEEP_MINUTES` (default hourly): each runner keeps `FEE_RESERVE_ETH` for gas and sweeps the rest to `FEE_OWNER` as a plain type-2 transfer. Sweeps ride the same broadcast machinery as user transactions (endpoint rotation, fee bump, `BROADCAST_URLS`) but skip the jitter. Every forward is logged to `fees.jsonl` as `kind: "fee-forward"` so the ledger sees the outflow. `GET /health` shows the configured `feeOwner` (an address is public onchain anyway).
+
 ## Fee ledger (`fees.mjs`)
 
-Every successful fee-bearing broadcast appends one JSON line to `fees.jsonl` (gitignored): `{ts, kind, feeBps, estFeeWei, txHash, runner}` where kind is `sweep-intent`, `sweep-intent-batch`, or `pp-withdraw`. Sweep fees are estimated at preflight from the stealth balance; withdrawal fees are exact, computed from the withdrawnValue public signal. Announce requests carry no fee and are never logged. Run the revenue report with:
+Every successful fee-bearing broadcast appends one JSON line to `fees.jsonl` (gitignored): `{ts, kind, feeBps, estFeeWei, txHash, runner}` where kind is `sweep-intent`, `sweep-intent-batch`, or `pp-withdraw`. Sweep fees are estimated at preflight from the stealth balance; withdrawal fees are exact, computed from the withdrawnValue public signal. Announce requests carry no fee and are never logged. The auto-forwarder appends `{ts, kind: "fee-forward", estFeeWei, txHash, runner}` lines for each sweep to `FEE_OWNER`. Run the revenue report with:
 
 ```sh
 node fees.mjs          # FEES_FILE=/path/to.jsonl to override
 ```
 
-The report totals per kind and converts to USD at the current price (same CoinGecko source as `GET /price`, fail soft).
+The report totals per kind and converts to USD at the current price (same CoinGecko source as `GET /price`, fail soft). Fee-forward lines are reported separately (total forwarded, last forward time, and runner holdings as earned minus forwarded); the ARR run-rate counts fees earned, not fees held.
 
 ## Run it
 
