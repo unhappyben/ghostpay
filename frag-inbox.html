@@ -1,0 +1,25 @@
+<!-- GHOSTPAY inbox fragment · rendered by gp-inbox.mjs into the #gp-inbox mount (step 4, after the sweeper UI).
+     Either paste this block inside <div id="gp-inbox"></div>, or let gp-inbox.mjs fetch + inject it itself. -->
+<style>
+  #gp-inbox-root h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:28px 0 6px; }
+  .gp-row { border:1px solid #333; padding:16px; margin-top:12px; }
+  .gp-row .gp-addr { font-weight:700; font-size:12px; word-break:break-all; }
+  .gp-row .gp-meta { color:#777; font-size:11px; margin:6px 0 4px; }
+  .gp-row .gp-tokens { font-size:12px; margin-top:6px; }
+  .gp-row .gp-note { color:#666; font-size:11px; margin-top:6px; }
+  .gp-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px; letter-spacing:.15em; margin-top:8px; }
+  .gp-pill.dim { border-color:#444; color:#888; }
+  .gp-label { border-bottom:1px dashed #444; cursor:text; }
+  .gp-label:hover { color:#fff; }
+  .gp-actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  .gp-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  .gp-panel { border:1px solid #444; padding:12px; margin-top:10px; }
+  .gp-panel .gp-note:first-child { margin-top:0; }
+  .gp-panel button { margin-top:8px; }
+  @media (max-width:700px) { .gp-actions { flex-direction:column; } .gp-actions button { width:100%; } }
+</style>
+<div id="gp-inbox-root" style="display:none">
+  <h2>PAYMENT INBOX</h2>
+  <div class="status" id="gp-inbox-status" style="margin-top:0"></div>
+  <div id="gp-inbox-rows"></div>
+</div>

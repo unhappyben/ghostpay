@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 // Privacy Pools gasless withdrawal CLI (mainnet, 0xbow).
 //
-//   node pp-withdraw.mjs <secret-file.json> <recipient-address> [amount-eth] [--broadcast|--dry-run]
+//   node pp-withdraw.mjs <secret-file.json> <recipient-address> [amount-eth] [--relay <url>] [--broadcast|--dry-run]
 //
 // Default is --dry-run: everything up to and including groth16 proof generation,
-// prints the relay payload it WOULD submit, but never POSTs to /relayer/request.
+// prints the relay payload it WOULD submit, but never POSTs to the relayer.
 // Only --broadcast submits.
+//
+// Default relayer is fastrelay.xyz. --relay <url> switches to a ghostpay relayer
+// (serve.mjs started with PP_RELAY=1): no /quote round-trip, the fee terms come from
+// the relayer's GET /health (runners + ppFeeBps) and the withdrawal data is built
+// locally with the runner as fee recipient, then POSTed to <url>/pp-withdraw.
 //
 // Flow (ported from ept-privacy-pools/src/adapters/privacy-pools-withdraw.ts):
 //   locate deposit onchain by precommitmentHash -> spent-nullifier guard ->
@@ -61,15 +66,27 @@ const fail = (msg) => {
 function parseArgs(argv) {
   const positional = [];
   let broadcast = false;
-  for (const a of argv) {
+  let relay = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
     if (a === "--broadcast") broadcast = true;
     else if (a === "--dry-run") broadcast = false;
-    else if (a.startsWith("--")) fail(`unknown flag: ${a}`);
+    else if (a === "--relay") {
+      relay = argv[++i];
+      if (!relay || relay.startsWith("--")) fail("--relay needs a URL (e.g. --relay http://localhost:8791)");
+    } else if (a.startsWith("--")) fail(`unknown flag: ${a}`);
     else positional.push(a);
   }
   if (positional.length < 2 || positional.length > 3)
-    fail("usage: node pp-withdraw.mjs <secret-file.json> <recipient-address> [amount-eth] [--broadcast|--dry-run]");
-  return { secretFile: positional[0], recipient: positional[1], amountEth: positional[2] ?? null, broadcast };
+    fail("usage: node pp-withdraw.mjs <secret-file.json> <recipient-address> [amount-eth] [--relay <url>] [--broadcast|--dry-run]");
+  if (relay) {
+    try {
+      const u = new URL(relay);
+      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error();
+    } catch { fail(`--relay is not a valid http(s) URL: ${relay}`); }
+    relay = relay.replace(/\/+$/, "");
+  }
+  return { secretFile: positional[0], recipient: positional[1], amountEth: positional[2] ?? null, broadcast, relay };
 }
 
 // ---- Deposit lookup: Deposited events, newest-first, narrow chunks ----
@@ -101,7 +118,7 @@ async function findDeposit(provider, precommitmentHash) {
 }
 
 async function main() {
-  const { secretFile, recipient, amountEth, broadcast } = parseArgs(process.argv.slice(2));
+  const { secretFile, recipient, amountEth, broadcast, relay } = parseArgs(process.argv.slice(2));
 
   if (!ethers.isAddress(recipient)) fail(`recipient is not a valid address: ${recipient}`);
   const recipientCk = ethers.getAddress(recipient);
@@ -173,28 +190,48 @@ async function main() {
       (changeValue > 0n ? ` (change ${ethers.formatEther(changeValue)} ETH stays in the pool).` : " (full balance, no change)."),
   );
 
-  // 3. Relayer fee commitment.
-  say("Getting relayer quote…");
-  const quoteRes = await fetch(`${RELAYER}/quote`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chainId: CHAIN_ID,
-      amount: withdrawnValue.toString(),
-      asset: PP_ETH_ASSET,
-      recipient: recipientCk,
-      extraGas: false,
-    }),
-  });
-  if (!quoteRes.ok) {
-    const text = await quoteRes.text().catch(() => "");
-    fail(`Relayer quote failed (${quoteRes.status}): ${text.slice(0, 300)}`);
+  // 3. Relayer fee commitment: fastrelay /quote, or local terms from a ghostpay relayer's /health.
+  let withdrawalData, feeCommitment, submitUrl;
+  if (relay) {
+    say(`Querying ghostpay relayer ${relay}…`);
+    const hRes = await fetch(`${relay}/health`);
+    if (!hRes.ok) fail(`relayer health check failed (${hRes.status}): ${(await hRes.text().catch(() => "")).slice(0, 300)}`);
+    const health = await hRes.json();
+    if (!health.ppRelay) fail(`${relay} does not advertise ppRelay: start serve.mjs with PP_RELAY=1.`);
+    if (!Array.isArray(health.runners) || !health.runners.length) fail("relayer has no runner addresses.");
+    const feeBps = Number.isFinite(health.ppFeeBps) ? health.ppFeeBps : 25;
+    const feeRecipient = health.runners[0];
+    withdrawalData = ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address", "address", "uint256"],
+      [recipientCk, feeRecipient, feeBps],
+    );
+    feeCommitment = { withdrawalData, feeBps, feeRecipient };
+    submitUrl = `${relay}/pp-withdraw`;
+    say(`Relayer terms: ${feeBps} bps to runner ${feeRecipient} (from /health).`);
+  } else {
+    say("Getting relayer quote…");
+    const quoteRes = await fetch(`${RELAYER}/quote`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chainId: CHAIN_ID,
+        amount: withdrawnValue.toString(),
+        asset: PP_ETH_ASSET,
+        recipient: recipientCk,
+        extraGas: false,
+      }),
+    });
+    if (!quoteRes.ok) {
+      const text = await quoteRes.text().catch(() => "");
+      fail(`Relayer quote failed (${quoteRes.status}): ${text.slice(0, 300)}`);
+    }
+    const quote = await quoteRes.json();
+    feeCommitment = quote.feeCommitment ?? quote;
+    withdrawalData = feeCommitment.withdrawalData;
+    if (!withdrawalData) fail("Relayer did not return withdrawalData in the fee commitment.");
+    submitUrl = `${RELAYER}/request`;
+    say(`Relayer quote: ${JSON.stringify(quote, null, 2)}`);
   }
-  const quote = await quoteRes.json();
-  const feeCommitment = quote.feeCommitment ?? quote;
-  const withdrawalData = feeCommitment.withdrawalData;
-  if (!withdrawalData) fail("Relayer did not return withdrawalData in the fee commitment.");
-  say(`Relayer quote: ${JSON.stringify(quote, null, 2)}`);
 
   // 4. Circuit inputs (existingValue = NET onchain value).
   const { newNullifier, newSecret } = deriveChangeKeys(nullifier, secret);
@@ -253,7 +290,7 @@ async function main() {
   };
 
   if (!broadcast) {
-    say("DRY RUN (default). Proof is ready; NOT submitting. Payload that WOULD be POSTed to /relayer/request:");
+    say(`DRY RUN (default). Proof is ready; NOT submitting. Payload that WOULD be POSTed to ${submitUrl}:`);
     console.log(JSON.stringify(payload, null, 2));
     say("Re-run with --broadcast to submit for real.");
     return;
@@ -261,7 +298,7 @@ async function main() {
 
   // 6. Submit (only with --broadcast).
   say("Submitting to relayer…");
-  const relayRes = await fetch(`${RELAYER}/request`, {
+  const relayRes = await fetch(submitUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
