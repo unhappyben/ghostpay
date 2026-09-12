@@ -98,6 +98,59 @@ function toast(msg) {
 // never stored, so sweeping always needs a fresh wallet signature.
 const SESSION_KEY = 'gp-session';
 const loadGpSession = () => { try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch { return null; } };
+
+// ── ephemeral receive records: the safety net ──
+// A generated receive address is recoverable only while its ephemeral record exists, and
+// derive() rolls a fresh random ephemeral key every time (previously the record lived in
+// the live tab's memory only: a closed tab stranded any unannounced payment forever).
+// Persist every generated address until it is announced (scanner can find payments from
+// the onchain announcement alone) or swept (funds moved). Records carry exactly what an
+// announcement publishes, never spend-key material.
+const RECV_KEY = 'gp-recv-records';
+const loadRecvRecords = () => { try { const r = JSON.parse(localStorage.getItem(RECV_KEY) || '[]'); return Array.isArray(r) ? r : []; } catch { return []; } };
+const saveRecvRecords = rs => { try { localStorage.setItem(RECV_KEY, JSON.stringify(rs.slice(-10))); } catch { /* storage full: recovery banner just shows fewer */ } };
+function recordRecv(rec) {
+  const rs = loadRecvRecords().filter(x => x.stealth.toLowerCase() !== rec.stealth.toLowerCase());
+  rs.push({ stealth: rec.stealth, ephPub: rec.ephPub, viewTag: rec.viewTag, created: Date.now() });
+  saveRecvRecords(rs);
+  renderRecvRecovery();
+}
+function dropRecvRecord(stealth) {
+  saveRecvRecords(loadRecvRecords().filter(x => x.stealth.toLowerCase() !== stealth.toLowerCase()));
+  renderRecvRecovery();
+}
+function renderRecvRecovery() {
+  const host = $('s2'); if (!host) return;
+  let el = $('recv-recovery');
+  const cur = W && W.recv && W.recv.stealth.toLowerCase();
+  const pending = loadRecvRecords().filter(x => x.stealth.toLowerCase() !== cur);
+  if (!pending.length) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'recv-recovery';
+    el.style.cssText = 'border:1px solid #fff;padding:14px;margin:12px 0;font-size:12px;line-height:1.7';
+    host.insertBefore(el, host.children[1] || null);
+  }
+  el.innerHTML = '';
+  const r = pending[pending.length - 1];
+  const txt = document.createElement('div');
+  txt.textContent = 'RECOVERY · ' + pending.length + ' unannounced address' + (pending.length > 1 ? 'es' : '') + ' · latest: ' + r.stealth
+    + ' · any payment to it is invisible to your scanner until you announce it:';
+  el.appendChild(txt);
+  const row = document.createElement('div');
+  row.style.cssText = 'margin-top:10px;display:flex;gap:10px';
+  const bAnn = document.createElement('button');
+  bAnn.textContent = 'ANNOUNCE NOW';
+  bAnn.style.cssText = 'width:auto;padding:8px 16px;font-size:11px';
+  bAnn.onclick = async () => { bAnn.disabled = true; await announceRecv(r); bAnn.disabled = false; };
+  const bDrop = document.createElement('button');
+  bDrop.textContent = 'FORGET IT';
+  bDrop.className = 'ghost';
+  bDrop.style.cssText = 'width:auto;padding:8px 16px;font-size:11px';
+  bDrop.onclick = () => dropRecvRecord(r.stealth);
+  row.appendChild(bAnn); row.appendChild(bDrop);
+  el.appendChild(row);
+}
 function saveGpSession() {
   try {
     localStorage.setItem(SESSION_KEY, JSON.stringify({ v: 1, viewPriv: W.viewPriv, meta: W.meta, ts: Date.now() }));
@@ -291,6 +344,7 @@ $('b-gen').onclick = async () => {
   // fresh one-time receiving address off our own meta-address (same derive() as pay-a-ghost mode).
   // share the 0x address; the announcement is what lets the scanner below find the payment.
   W.recv = derive(W.meta.slice(7));
+  recordRecv(W.recv);
   $('c-recv').style.display = 'block';
   $('v-recv').textContent = W.recv.stealth;
   $('st-announce').textContent = 'share this 0x address to get paid. payment links announce automatically when the payer pays; ANNOUNCE IT is only needed for raw-address payments.';
@@ -327,10 +381,11 @@ $('b-copyrecv').onclick = e => copy(W.recv.stealth, e.target);
 $('b-copymeta').onclick = e => copy(W.meta, e.target);
 // pay-me links point at the homepage: the payer flow (pay-a-ghost) lives there
 $('b-copylink').onclick = e => copy(location.origin + '/#' + W.meta, e.target);
-async function announceRecv() {
+async function announceRecv(rec) {
   const st = m => $('st-announce').textContent = m;
-  if (!W || !W.recv) { st('generate your stealth keys first (or restore a session).'); return null; }
-  const { stealth, ephPub, viewTag } = W.recv;
+  const src = rec || (W && W.recv);
+  if (!src) { st('generate your stealth keys first (or restore a session).'); return null; }
+  const { stealth, ephPub, viewTag } = src;
   // primary path: the local relayer announces (runner wallet pays gas).
   try {
     st('announcing via relayer… (deliberate 2–15s privacy delay before broadcast · hold on)');
@@ -338,6 +393,7 @@ async function announceRecv() {
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || ('http ' + r.status));
     st('announced: ' + j.hash + ' · your scanner will now find payments to this address. share it and get paid.');
+    dropRecvRecord(stealth); // announced onchain: the scanner covers recovery from here
     return { hash: j.hash, via: 'relayer' };
   } catch (e) {
     st('relayer unreachable (' + e.message + ') · falling back to announcing from your wallet…');
@@ -350,13 +406,14 @@ async function announceRecv() {
     const ann = new ethers.Contract(ANNOUNCER, ['function announce(uint256,address,bytes,bytes)'], signer);
     const tx = await ann.announce(1, stealth, ephPub, Uint8Array.from([viewTag]));
     st('announced from your wallet: ' + tx.hash + ' · your scanner will now find payments to this address.');
+    dropRecvRecord(stealth);
     return { hash: tx.hash, via: 'wallet' };
   } catch (e) {
     st('announce failed: ' + (e.shortMessage || e.message) + ' · retry. without an announcement your scanner cannot find payments to this address.');
     return null;
   }
 }
-$('b-annrecv').onclick = announceRecv;
+$('b-annrecv').onclick = () => announceRecv();
 
 // invoices: the quick-link form is gone with the old step 3. The full invoice suite
 // (tracked invoices, clients, memos) is its own page now: invoices.html + gp-invoices.mjs.
@@ -1066,7 +1123,11 @@ function enterDashboard(sess) {
     localStorage.removeItem(SESSION_KEY);
     return;
   }
-  W.recv = derive(W.meta.slice(7));
+  // reuse the persisted un-announced record as the receive address: that is exactly the
+  // address a previous session may have shared, so restoring keeps it alive (and visible).
+  const pendingRecv = loadRecvRecords();
+  W.recv = pendingRecv.length ? pendingRecv[pendingRecv.length - 1] : derive(W.meta.slice(7));
+  if (!pendingRecv.length) recordRecv(W.recv);
   $('c-recv').style.display = 'block';
   $('v-recv').textContent = W.recv.stealth;
   $('st-announce').textContent = 'share this 0x address to get paid. payment links announce automatically when the payer pays; ANNOUNCE IT is only needed for raw-address payments.';
@@ -1099,6 +1160,9 @@ $('b-notify').onclick = async () => {
 };
 // one Notification per newly detected payment (fresh = found by the background poll, so a
 // full rescan of old history never spam-notifies).
+// swept payments prune their ephemeral receive record (funds moved: nothing left to recover)
+gpOn('swept', e => { const a = e && e.artifact && e.artifact.stealthAddress; if (a) dropRecvRecord(a); });
+renderRecvRecovery();
 gpOn('payment', async p => {
   if (p.fresh !== true) return;
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
