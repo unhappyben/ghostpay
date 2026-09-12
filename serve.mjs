@@ -300,6 +300,14 @@ async function broadcast(runner, tx, jitterRange, label) {
   tx.nonce = await nextNonce(runner);
   Object.assign(tx, await feeBump());
   if (!tx.gasLimit) tx.gasLimit = await estimateGas(runner.address, tx, label);
+  // affordability preflight: Flashbots Protect ACCEPTS unfunded transactions (returns a
+  // hash, then never includes them), so an empty runner produces phantom "pending" txs
+  // that explorers never find. Refuse loudly instead of broadcasting into the void.
+  const cost = tx.gasLimit * tx.maxFeePerGas + BigInt(tx.value || 0);
+  const bal = await getBalance(runner.address);
+  if (bal < cost) {
+    throw Object.assign(new Error(`runner ${runner.address} cannot afford this broadcast: balance ${ethers.formatEther(bal)} ETH, needs ~${ethers.formatEther(cost)} ETH for gas · fund the runner and retry`), { status: 400 });
+  }
   const signed = await runner.signTransaction(tx);
   const delayedSec = Math.round(jitterRange[0] + Math.random() * (jitterRange[1] - jitterRange[0]));
   await new Promise(r => setTimeout(r, delayedSec * 1000));
