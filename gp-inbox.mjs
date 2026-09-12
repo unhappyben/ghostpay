@@ -367,7 +367,9 @@ function openUsdcSweep(row) {
   };
 }
 
-// dust ETH (< 0.01): cannot enter Privacy Pools, so offer a plain sweepETH via the sweeper.
+// dust ETH (< 0.01): cannot enter Privacy Pools, so offer a direct sweep to a destination.
+// With a sweeperV2 relayer this is a signed intent (action 0); older relayers get the
+// legacy eip7702-sweep artifact (sweepETH calldata picked by the app, carried by the relayer).
 function openDirectSweep(row) {
   const rec = row.rec;
   const { panel, amt, dest, st } = panelBase(row,
@@ -380,16 +382,33 @@ function openDirectSweep(row) {
       if (!ethers.isAddress(dest.value.trim())) throw new Error('bad destination address');
       const to = ethers.getAddress(dest.value.trim());
       const w = stealthWallet(rec);
-      const data = SWEEPETH_IFACE.encodeFunctionData('sweepETH', [to]);
       const nonce = parseInt(await GP.jrpc('eth_getTransactionCount', [rec.address, 'latest']), 16);
-      const artifact = {
-        kind: 'eip7702-sweep', chainId: GP.const.CHAIN_ID, stealthAddress: rec.address,
-        sweeper: GP.const.SWEEPER, data,
-        authorization: GP.crypto.sign7702(w.privateKey, GP.const.CHAIN_ID, GP.const.SWEEPER, nonce),
-      };
+      const caps = GP.relayerCaps ? await GP.relayerCaps() : { sweeperV2: false, minFeeBps: 30 };
+      let artifact, summary;
+      if (caps.sweeperV2 && GP.const.SWEEPER_V2 && GP.crypto.intentDomain) {
+        const intent = {
+          action: 0, token: ethers.ZeroAddress, destination: to, precommitment: 0,
+          feeBps: caps.minFeeBps, deadline: Math.floor(Date.now() / 1000) + 86400,
+        };
+        const signature = await w.signTypedData(GP.crypto.intentDomain(rec.address), GP.crypto.INTENT_TYPES, intent);
+        artifact = {
+          kind: 'eip7702-intent', chainId: GP.const.CHAIN_ID, stealthAddress: rec.address,
+          sweeper: GP.const.SWEEPER_V2,
+          authorization: GP.crypto.sign7702(w.privateKey, GP.const.CHAIN_ID, GP.const.SWEEPER_V2, nonce),
+          intent, signature,
+        };
+        summary = GP.fmt.formatEth(row.ethBal) + ' ETH → ' + short(to) + ' · direct intent (no pool) · fee ' + caps.minFeeBps + ' bps';
+      } else {
+        const data = SWEEPETH_IFACE.encodeFunctionData('sweepETH', [to]);
+        artifact = {
+          kind: 'eip7702-sweep', chainId: GP.const.CHAIN_ID, stealthAddress: rec.address,
+          sweeper: GP.const.SWEEPER, data,
+          authorization: GP.crypto.sign7702(w.privateKey, GP.const.CHAIN_ID, GP.const.SWEEPER, nonce),
+        };
+        summary = GP.fmt.formatEth(row.ethBal) + ' ETH → ' + short(to) + ' · direct (no pool)';
+      }
       b.remove();
-      previewAndBroadcast(row, panel, st, artifact,
-        GP.fmt.formatEth(row.ethBal) + ' ETH → ' + short(to) + ' · direct (no pool)',
+      previewAndBroadcast(row, panel, st, artifact, summary,
         () => putPill(rec.address, { stage: 'sweeping', sweepTx: null, direct: true }));
     } catch (e) { st.textContent = 'error: ' + e.message; }
   };

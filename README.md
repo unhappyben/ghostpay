@@ -8,7 +8,7 @@ Built as the companion prototype to the essay *How Much Stealth Does a Stealth A
 
 1. **Connect + generate.** Stealth keys derive from one wallet signature (ERC-5564 scheme 1, keccak256 shared secret, ScopeLift/Rust-reference compatible). Same signature regenerates the same keys on any device.
 2. **Receive.** The app derives a fresh one-time address. Share the `0x` address. The Announcement (what your scanner needs to find the payment) is broadcast by the relayer, so your wallet never touches the announcer.
-3. **Sweep.** Payments are found by scanning Announcement logs with the viewing key. Sweeping signs an EIP-7702 authorization delegating the stealth EOA to `Sweeper.sol`, which deposits the full balance into Privacy Pools (0xbow entrypoint) under a `poseidon2(nullifier, secret)` precommitment. The relayer broadcasts the type-4 transaction and pays the gas. The withdrawal secret downloads as a JSON file: lose it and the deposit is gone.
+3. **Sweep.** Payments are found by scanning Announcement logs with the viewing key. The moment a payment is found (and the session holds the spend key), the app silently arms a signed intent: it generates the Privacy Pools secret + `poseidon2(nullifier, secret)` precommitment (the secret file downloads right then: lose it and the deposit is gone), signs an EIP-712 `SweepIntent` with the stealth key, and signs an EIP-7702 authorization delegating the stealth EOA to `SweeperV2.sol`. SIGN SWEEP just broadcasts the pre-armed artifact through the relayer, which executes `executeSweep` and pays the gas. Relayers without SweeperV2 (`GET /health` shows `sweeperV2: null`) get the legacy `eip7702-sweep` flow instead, unchanged.
 4. **Withdraw.** After ASP approval, withdraw gaslessly from the app (groth16 proof in the browser) to any fresh address. The app first checks the same-origin relayer (`GET ./health`): if it advertises `ppRelay`, the withdrawal is built and submitted locally (`POST ./pp-withdraw`, fee from `ppFeeBps`). Otherwise it falls back to the fastrelay.xyz public relayer, unchanged.
 
 Every step after payment is relayed: the recipient's wallet appears nowhere onchain.
@@ -28,7 +28,7 @@ Mounted inside step 3. On top of the basic invoice link it adds:
 - **QR + CSV + receipts.** Receive QR for the meta-address, CSV export of the invoice ledger, and printable receipts for paid invoices.
 - **ENS publish.** Writes a `stealth` text record on your ENS name so senders can resolve it to your stealth meta-address. The meta-address is public by design: anyone can derive fresh payment addresses from it, nobody can spend from it.
 
-The suite also enhances the pay-a-ghost flow (`#payghost`) with the memo field, so a payer can attach an encrypted note when announcing.
+The suite also enhances the pay-a-ghost flow (`#payghost`) with the memo field, so a payer can attach an encrypted note when announcing. Where the payer's wallet supports EIP-5792 (`wallet_sendCalls`), the ETH payment and the announcement go out in a single batched confirmation; other wallets keep the sequential announce-only flow. The status line says which path executed.
 
 ## Inbox (`gp-inbox.mjs`)
 
@@ -38,7 +38,7 @@ Mounted inside step 4. Turns the raw payment list into a per-payment inbox:
 - **Labels.** Free-text labels per stealth address, stored locally.
 - **Token detection.** Checks each detected stealth address for USDC, USDT, DAI, and WETH balances, not just ETH.
 - **USDC eip3009 sweep.** USDC can move gaslessly with a signed `transferWithAuthorization` (EIP-3009); the inbox builds and submits that artifact through the relayer.
-- **Dust direct-sweep.** Amounts below the Privacy Pools minimum (0.01 ETH) cannot enter the pool; the inbox offers a direct sweep to a destination instead.
+- **Dust direct-sweep.** Amounts below the Privacy Pools minimum (0.01 ETH) cannot enter the pool; the inbox offers a direct sweep to a destination instead (a signed `SweepIntent` with `action: 0` on sweeperV2 relayers, the legacy `sweepETH` artifact otherwise).
 
 ## Money safety (`gp-money.mjs`)
 
@@ -85,7 +85,7 @@ node notify.mjs /path/to/conf.json
 
 `BatchRelayer.sol` fans out one type-4 transaction across up to 20 stealth EOAs: the authorization list delegates every EOA to SweeperV2, then one call to `relay()` (all-or-nothing) or `relaySkipFailures()` (best-effort, `RelayFailed` events) runs each `executeSweep`. One gas payment for N sweeps. Fees still land on `tx.origin`, not on the BatchRelayer contract. Caveat: a batch shares one transaction, so the swept addresses are linked onchain.
 
-`test/` covers both contracts with 11 mainnet fork tests (`forge test`, see `foundry.toml`; needs `MAINNET_RPC`). Neither contract is deployed yet: see the deployment checklist.
+`test/` covers both contracts with 11 mainnet fork tests (`forge test`, see `foundry.toml`; needs `MAINNET_RPC`). SweeperV2 is deployed on mainnet at `0xCC29c7723116155ccF20C7c0b8924F4747331903` (bytecode verified against the fork-tested artifact); the app arms intents against it by default. BatchRelayer is not deployed yet: see the deployment checklist.
 
 ## Relayer endpoints
 
@@ -153,11 +153,11 @@ The withdrawal also works as a CLI: `node pp-withdraw.mjs <pp-secret.json> <reci
 
 ## Deployment checklist
 
-SweeperV2 and BatchRelayer are written and fork-tested but not deployed. To take the relayer fully self-hosted:
+SweeperV2 is deployed on mainnet (`0xCC29c7723116155ccF20C7c0b8924F4747331903`). To take the relayer fully self-hosted:
 
-1. **Deploy SweeperV2.** `forge create SweeperV2.sol:StealthSweeperV2` against mainnet (see `foundry.toml`; verify the PP_ENTRYPOINT and RAILGUN constants for other chains).
-2. **Deploy BatchRelayer.** `forge create BatchRelayer.sol:BatchRelayer`. No constructor args.
-3. **Configure the relayer.** Set `SWEEPER_V2=<address>`, `BATCH_RELAYER=<address>`, and `PP_RELAY=1` (optionally `PP_FEE_BPS`, `MIN_FEE_BPS`, `BROADCAST_URLS`) and restart serve.mjs. Intent sweeps, batch sweeps, and local withdrawals all come online; `GET /health` confirms.
+1. **Set `SWEEPER_V2=0xCC29c7723116155ccF20C7c0b8924F4747331903`** and restart serve.mjs: intent sweeps come online (`GET /health` confirms, the app switches to auto-armed intents automatically).
+2. **Deploy BatchRelayer.** `forge create BatchRelayer.sol:BatchRelayer`. No constructor args. Set `BATCH_RELAYER=<address>` to enable batch sweeps.
+3. **Set `PP_RELAY=1`** (optionally `PP_FEE_BPS`, `MIN_FEE_BPS`, `BROADCAST_URLS`) to enable local Privacy Pools withdrawals via `POST /pp-withdraw`.
 4. **Fund runners from Privacy Pools.** Withdraw from the app (step 5) to one or more fresh EOAs and use their keys in `runners.local.json`. One 0.01 ETH withdrawal funds dozens of sweeps. Rotate any time: withdraw again to a new address, swap the key, restart. The runners then have no funding link to you onchain.
 
 ## Relayer privacy
@@ -193,8 +193,8 @@ A note on what can and cannot be fixed. ZK cannot hide a computed output from th
 - `serve.mjs`: static server + announce/sweep/withdraw relayer
 - `notify.mjs`: watch-only payment notifier (Telegram/webhook)
 - `fees.mjs`: relayer fee ledger + revenue report
-- `Sweeper.sol`: 7702 sweep target (deployed on mainnet, the UI uses the Privacy Pools path only)
-- `SweeperV2.sol` / `BatchRelayer.sol`: signed-intent sweeper + batch fan-out (fork-tested, not deployed)
+- `Sweeper.sol`: legacy 7702 sweep target (deployed on mainnet; the fallback path when a relayer has no SweeperV2)
+- `SweeperV2.sol` / `BatchRelayer.sol`: signed-intent sweeper (deployed on mainnet) + batch fan-out (not deployed)
 - `relay.mjs`: standalone sweep-artifact broadcaster
 - `pp-withdraw.mjs` / `pp-crypto.mjs`: standalone Privacy Pools withdrawal CLI + crypto
 - `sw.js` / `manifest.json` / `icon.svg`: PWA

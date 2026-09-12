@@ -191,8 +191,14 @@ async function runPreview() {
   const eth = bal != null ? GP.fmt.formatEth(bal) : null;
   row(body, 'BALANCE', eth != null ? eth + ' ETH' + usdOf(eth) : 'unknown (RPC unreachable)');
   row(body, 'DESTINATION', 'Privacy Pools ETH deposit · 0xbow entrypoint ' + short(GP.pp.PP_ENTRYPOINT));
-  let pre = null;
-  try {
+  let pre = null, sweeper = GP.const.SWEEPER, isIntent = false;
+  const armedArt = GP.state.armedIntent ? GP.state.armedIntent(addr) : null;
+  if (armedArt) {
+    if (armedArt.sweeper) sweeper = armedArt.sweeper;
+    isIntent = armedArt.kind === 'eip7702-intent';
+    if (armedArt.precommitment) pre = armedArt.precommitment;
+  }
+  if (!pre) try {
     const a = JSON.parse($('v-artifact').textContent);
     if (a && a.precommitment && String(a.stealthAddress || '').toLowerCase() === addr.toLowerCase()) pre = a.precommitment;
   } catch { /* no live artifact */ }
@@ -203,12 +209,15 @@ async function runPreview() {
     ? feeBps + ' bps (' + (feeBps / 100).toFixed(2) + '%)'
       + (bal != null ? ' = ' + GP.fmt.formatEth(bal * BigInt(feeBps) / 10000n) + ' ETH' : '')
     : 'unknown (relayer offline)');
-  row(body, 'SWEEPER CONTRACT', GP.const.SWEEPER + ' · etherscan.io/address/' + GP.const.SWEEPER);
+  row(body, 'SWEEPER CONTRACT', sweeper + ' · etherscan.io/address/' + sweeper);
   const note = document.createElement('div');
   note.className = 'gm-note';
   note.style.color = '#444';
-  note.textContent = 'the v1 sweep deposits the full balance; the fee floor applies to intent sweeps. '
-    + 'gas is paid by the relayer. the pp-secret file downloads the moment you sign: it is the only way to withdraw later.';
+  note.textContent = isIntent
+    ? 'signed intent sweep (SweeperV2): destination, fee and deadline come from your signature, the relayer cannot change them. '
+      + 'gas is paid by the relayer. the pp-secret file already downloaded when this payment was armed: it is the only way to withdraw later.'
+    : 'the v1 sweep deposits the full balance; the fee floor applies to intent sweeps. '
+      + 'gas is paid by the relayer. the pp-secret file downloads the moment you sign: it is the only way to withdraw later.';
   body.appendChild(note);
 
   return new Promise(res => {

@@ -39,6 +39,7 @@ read at any time; they reflect the current session.
 | `GP.state.recv` | `object \| null` | Current one-time receiving address: `{ stealth, ephPub, viewTag, sh }` as produced by `GP.crypto.derive`. |
 | `GP.state.ethPriceUsd` | `number \| null` | Last ETH price seen by the status strip (`GET /price`). Null until a price poll succeeds. |
 | `GP.state.payments` | `Array<Payment>` | Live array of every payment card rendered this session (see Payment below). Mutated in place by scans; do not replace the array. |
+| `GP.state.armedIntent(addr)` | `artifact \| null` | The auto-armed `eip7702-intent` artifact for a stealth address (secret downloaded, SweepIntent + 7702 authorization signed at detection time). Null when nothing is armed: watch-only session, a relayer without `sweeperV2`, or a balance below the 0.01 ETH pool minimum. |
 
 `Payment`: `{ address: string, ephPub: string, block: number, tx: string, swept: boolean, fresh: boolean }`.
 `fresh` is true only when the payment was discovered by an incremental background scan
@@ -71,6 +72,10 @@ wallet signature in the current session.
 - `GP.relaySweep(artifact: object): Promise<void>` : broadcasts a signed sweep artifact
   via `POST /sweep` and updates the broadcast status line through confirmation. Emits
   `swept` on success.
+- `GP.relayerCaps(): Promise<{ sweeperV2: boolean, sweeperV2Addr: string | null, minFeeBps: number }>` :
+  the relayer's capabilities, fetched once per session from `GET ./health` + `GET ./fee`
+  and cached. `sweeperV2` true means the relayer accepts `eip7702-intent` artifacts;
+  `minFeeBps` is the fee floor intents must pay (default 30 when the relayer is offline).
 
 ## Formatting
 
@@ -117,6 +122,14 @@ Vendored, no network. BigInt in, BigInt out for poseidon.
   address. Never store the result.
 - `sign7702(priv, chainId, sweeper, nonce): { chainId, address, nonce, yParity, r, s }` :
   EIP-7702 authorization signature.
+- `intentDomain(stealthAddress: string): object` : the EIP-712 domain for SweeperV2 sweep
+  intents (`{ name: 'GhostpaySweeper', version: '1', chainId: 1, verifyingContract: stealthAddress }`;
+  the verifying contract is the stealth EOA itself, since SweeperV2 executes as the EOA
+  under 7702). Pair with `signTypedData` from an ethers Wallet over `INTENT_TYPES`.
+- `INTENT_TYPES` : the EIP-712 types object for
+  `SweepIntent(uint8 action,address token,address destination,uint256 precommitment,uint256 feeBps,uint256 deadline)`.
+  Actions: 0 = ETH to destination, 1 = Privacy Pools ETH deposit, 2 = PP token deposit,
+  3 = token to destination.
 - `poseidon1`, `poseidon2`, `poseidon3` : `(bigint[]) => bigint`, vendored.
 - `ppCommitment(value, label, precommitment): bigint`
 - `spentNullifierHash(nullifier: bigint): bigint`
@@ -141,7 +154,9 @@ Constants and helpers for the withdrawal flow:
 - `GP.jrpc(method: string, params: any[]): Promise<any>` : browser-side JSON-RPC with
   endpoint rotation and 15s timeout per endpoint.
 - `GP.ethers` : the ethers v6 module namespace.
-- `GP.const` : `{ ANNOUNCER, CHAIN_ID, SWEEPER, RPC }` (chainId 1, mainnet only).
+- `GP.const` : `{ ANNOUNCER, CHAIN_ID, SWEEPER, SWEEPER_V2, RPC }` (chainId 1, mainnet only).
+  `SWEEPER` is the legacy v1 sweeper; `SWEEPER_V2` is the deployed signed-intent sweeper
+  (use it when `GP.relayerCaps().sweeperV2` is true, fall back to `SWEEPER` otherwise).
 
 ## DOM contract
 

@@ -292,6 +292,15 @@ const RPC = window.GHOSTPAY_RPC || 'https://eth.drpc.org'; // paid/private RPC g
 const ANNOUNCER = '0x55649E01B5Df198D18D95b5cc5051630cfD45564';
 const CHAIN_ID = 1;
 const SWEEPER = '0x749d2c0e9Ffb57102Aa9f5424e94216791f6467B'; // StealthSweeper, mainnet, tx 0xb0630930
+const SWEEPER_V2 = '0xCC29c7723116155ccF20C7c0b8924F4747331903'; // StealthSweeperV2 (signed intents), mainnet
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+const PP_MIN_SWEEP = 10000000000000000n; // 0.01 ETH: below this a deposit cannot enter Privacy Pools
+const INTENT_TYPES = { SweepIntent: [
+  { name: 'action', type: 'uint8' }, { name: 'token', type: 'address' }, { name: 'destination', type: 'address' },
+  { name: 'precommitment', type: 'uint256' }, { name: 'feeBps', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
+] };
+// EIP-712 domain: verifyingContract is the stealth EOA itself (SweeperV2 executes AS the EOA under 7702)
+const intentDomain = stealth => ({ name: 'GhostpaySweeper', version: '1', chainId: CHAIN_ID, verifyingContract: stealth });
 const SWEEPER_IFACE = new ethers.Interface([
   'function sweepToPrivacyPoolsETH(uint256 precommitment)'
 ]);
@@ -739,6 +748,7 @@ async function scan(opts = {}) {
       const rec = { address: addr, ephPub, block: parseInt(l.blockNumber, 16), tx: l.transactionHash, swept: false, fresh: append };
       payments.push(rec);
       gpEmit('payment', rec);
+      queueArm(rec); // silent auto-arm: intent signed + secret downloaded the moment a payment is found
       // lifecycle state line: LIVE / SWEPT / PP deposit / ASP / WITHDRAWN (async, best-effort)
       cardState(div, b, addr, parseInt(l.blockNumber, 16), mySeq, getAsp);
     }
@@ -794,6 +804,99 @@ async function relaySweep(artifact) {
   }
 }
 
+// ── SweeperV2 signed intents + auto-arm ──
+// When the relayer advertises sweeperV2 (GET ./health), every detected payment with a
+// pool-sized balance is armed the moment it is found: PP secret + precommitment generated
+// (and downloaded, same as the legacy arm did at click time), the EIP-712 SweepIntent
+// signed by the stealth key, and the 7702 authorization delegating the stealth EOA to
+// SweeperV2. SIGN SWEEP then only re-validates and broadcasts the pre-armed artifact.
+// Relayers with sweeperV2 null keep the legacy eip7702-sweep flow below, untouched.
+
+// relayer capabilities: fetched once per session, then cached.
+let capsPromise = null;
+function relayerCaps() {
+  capsPromise ??= (async () => {
+    let health = null, minFeeBps = 30;
+    try { const r = await fetch('./health'); if (r.ok) health = await r.json(); } catch { /* relayer offline: legacy flow */ }
+    try { const r = await fetch('./fee'); if (r.ok) { const j = await r.json(); if (Number.isFinite(j.minFeeBps)) minFeeBps = j.minFeeBps; } } catch { /* keep the 30 bps default */ }
+    return { sweeperV2: !!(health && health.sweeperV2), sweeperV2Addr: (health && health.sweeperV2) || null, minFeeBps };
+  })();
+  return capsPromise;
+}
+
+// armed intent artifacts by lowercase stealth address: { artifact, nonce, deadline }
+const armedIntents = new Map();
+
+async function armIntent(rec) {
+  if (!W || !W.spendPriv || !W.viewPriv || !rec || !rec.ephPub) return null;
+  const key = rec.address.toLowerCase();
+  const prev = armedIntents.get(key);
+  if (prev && prev.deadline > Math.floor(Date.now() / 1000) + 300) return prev; // still valid: arm once per payment
+  const caps = await relayerCaps();
+  if (!caps.sweeperV2) return null; // old relayer: the legacy arm flow runs at SIGN SWEEP time
+  const addr = rec.address;
+  const bal = BigInt(await jrpc('eth_getBalance', [addr, 'latest']));
+  if (bal < PP_MIN_SWEEP) return null; // below the pool minimum: the inbox dust path handles those
+  const { sh } = check(W.viewPriv, W.spendPub, rec.ephPub, addr);
+  const sPriv = stealthKey(W.spendPriv, sh);
+  const wallet = new ethers.Wallet(sPriv);
+  if (wallet.address.toLowerCase() !== addr.toLowerCase()) return null;
+  // same secret construction as the legacy arm (poseidon2 precommitment, 31-byte values);
+  // the downloaded file works in the standard withdrawal flow (v2.privacypools.com).
+  const nullifier = crypto.getRandomValues(new Uint8Array(31));
+  const ppsecret = crypto.getRandomValues(new Uint8Array(31));
+  const pre = poseidon2([BigInt(hex(nullifier)), BigInt(hex(ppsecret))]);
+  const preHex = '0x' + pre.toString(16).padStart(64, '0');
+  const secretFile = {
+    note: 'GHOSTPAY Privacy Pools withdrawal secret. KEEP SAFE. Anyone with this file can withdraw the deposit.',
+    nullifier: hex(nullifier),
+    secret: hex(ppsecret),
+    precommitment: preHex,
+    amount: bal.toString(),
+    chainId: CHAIN_ID,
+    sweeper: SWEEPER_V2,
+    stealthAddress: addr,
+    timestamp: new Date().toISOString(),
+    pool: 'ETH mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
+  };
+  // non-secret tracking record so the scanner can show this deposit's lifecycle
+  // (PP deposit / ASP / WITHDRAWN) on the payment card. The secret itself is NEVER
+  // stored anywhere: the downloaded file remains the only place it exists.
+  try {
+    localStorage.setItem('ghostpay:ppnote:' + key, JSON.stringify({
+      nullifier: hex(nullifier), precommitment: preHex, amount: bal.toString(), ts: Date.now()
+    }));
+  } catch { /* storage blocked/full: tracking is best-effort, the sweep is unaffected */ }
+  showSecret(
+    'PRIVACY POOLS WITHDRAWAL SECRET · KEEP this file: it is your withdrawal secret. lose it and the deposit is gone forever.'
+      + ' the app keeps a local tracking key (nullifier only · it cannot withdraw) so the scanner can show this deposit\'s state.',
+    JSON.stringify(secretFile, null, 2),
+    'pp-secret-' + addr.slice(2, 10) + '.json',
+    JSON.stringify(secretFile, null, 2)
+  );
+  const deadline = Math.floor(Date.now() / 1000) + 86400;
+  const intent = { action: 1, token: ZERO_ADDR, destination: ZERO_ADDR, precommitment: preHex, feeBps: caps.minFeeBps, deadline };
+  const signature = await wallet.signTypedData(intentDomain(addr), INTENT_TYPES, intent);
+  const nonce = parseInt(await jrpc('eth_getTransactionCount', [addr, 'latest']), 16);
+  const artifact = {
+    kind: 'eip7702-intent', chainId: CHAIN_ID, stealthAddress: addr, sweeper: SWEEPER_V2,
+    authorization: sign7702(sPriv, CHAIN_ID, SWEEPER_V2, nonce),
+    intent, signature,
+    precommitment: preHex,
+    warning: 'KEEP the downloaded secret file: it is your withdrawal secret',
+  };
+  const armed = { artifact, nonce, deadline };
+  armedIntents.set(key, armed);
+  return armed;
+}
+
+// arms are serialized: several payments found in one scan must not race downloads or RPC.
+let armChain = Promise.resolve();
+function queueArm(rec) {
+  armChain = armChain.then(() => armIntent(rec)).catch(e => console.warn('auto-arm failed for ' + (rec && rec.address) + ': ' + e.message));
+  return armChain;
+}
+
 function sweepUI(addr, ephPub, card) {
   // (re)arm: clicking SWEEP THIS on another card moves the arming to that address.
   document.querySelectorAll('.pay.armed').forEach(d => d.classList.remove('armed'));
@@ -806,6 +909,32 @@ function sweepUI(addr, ephPub, card) {
     try {
       $('c-secret').style.display = 'none';
       if (!W.spendPriv) throw new Error('watch-only session: your spend key is never stored on this device, so sweeping needs a fresh wallet signature. hit RE-CONNECT above, connect, GENERATE MY STEALTH KEYS (same wallet, same keys), then retry.');
+      // intent path: use the artifact auto-armed at detection time, re-arming silently if
+      // the deadline passed or the stealth nonce moved. Falls through to the legacy arm
+      // below when nothing is armed (old relayer, or a below-minimum balance).
+      let armed = armedIntents.get(addr.toLowerCase()) || null;
+      if (armed) {
+        let stale = armed.deadline <= Math.floor(Date.now() / 1000) + 60;
+        if (!stale) {
+          const nonceNow = parseInt(await jrpc('eth_getTransactionCount', [addr, 'latest']), 16);
+          stale = nonceNow !== armed.nonce;
+        }
+        if (stale) {
+          armedIntents.delete(addr.toLowerCase());
+          armed = await armIntent({ address: addr, ephPub });
+          if (!armed) throw new Error('the pre-signed intent expired and re-arming failed (relayer unreachable, or the balance dropped below the 0.01 ETH pool minimum). rescan and retry.');
+        }
+        const artifact = armed.artifact;
+        $('c-artifact').style.display = 'block';
+        $('v-artifact').textContent = JSON.stringify(artifact);
+        $('st-broadcast').textContent = '';
+        $('b-copyart').onclick = e => copy(JSON.stringify(artifact, null, 2), e.target);
+        // the sign button becomes the broadcast button: one primary action per stage
+        $('b-sweep').textContent = 'BROADCAST VIA RELAYER';
+        $('b-sweep').onclick = () => relaySweep(artifact);
+        $('b-sweep').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        return;
+      }
       const { sh } = check(W.viewPriv, W.spendPub, ephPub, addr);
       const sPriv = stealthKey(W.spendPriv, sh);
       const wallet = new ethers.Wallet(sPriv);
@@ -1232,6 +1361,10 @@ window.GP = {
     get meta() { return (W && W.meta) || null; },
     get recv() { return (W && W.recv) || null; },
     get ethPriceUsd() { return ethPriceUsd; },
+    armedIntent(addr) {
+      const a = armedIntents.get(String(addr || '').toLowerCase());
+      return a ? a.artifact : null;
+    },
     payments,
     signer() {
       if (W && W.prov) return W.prov.getSigner();
@@ -1248,16 +1381,18 @@ window.GP = {
   scanIncremental: () => scan({ append: true, quiet: true }),
   announce: () => announceRecv(),
   relaySweep: artifact => relaySweep(artifact),
+  relayerCaps,
   fmt: { formatEth, formatUsd },
   toast,
   on: gpOn,
   emit: gpEmit,
   jrpc,
   ethers,
-  const: { ANNOUNCER, CHAIN_ID, SWEEPER, RPC },
+  const: { ANNOUNCER, CHAIN_ID, SWEEPER, SWEEPER_V2, RPC },
   crypto: {
     secp256k1, keccak_256, sha256, hex, buf, mod, N,
     derive, check, stealthKey, sign7702,
+    intentDomain, INTENT_TYPES,
     poseidon1, poseidon2, poseidon3,
     ppCommitment, spentNullifierHash, deriveChangeKeys, computeContext,
     leanIMTBuild, leanIMTProof,
@@ -1298,11 +1433,74 @@ if (metaMatch) {
   $('b-copyaddr').onclick = e => copy(r.stealth, e.target);
   $('v-ann').textContent = 'announcement ready';
   $('b-announce').onclick = async () => {
-    if (!window.ethereum) return alert('no wallet found');
+    const setSt = m => $('v-ann').textContent = m;
+    const eip1193 = (W && W.eip1193) || window.ethereum;
+    if (!eip1193 && !(W && W.session)) return alert('no wallet found');
+    const annData = new ethers.Interface(['function announce(uint256,address,bytes,bytes)'])
+      .encodeFunctionData('announce', [1n, r.stealth, r.ephPub, Uint8Array.from([r.viewTag])]);
+    // provider-agnostic request: WalletConnect session when present, else the injected provider
+    const req = (method, params) => (W && W.session)
+      ? W.session.request({ chainId: 'eip155:1', request: { method, params } })
+      : eip1193.request({ method, params });
+    // invoice amount (ETH only): "?pay=25 ETH · note" → the value of the payment call
+    let value = 0n;
+    if (inv) {
+      const m = decodeURIComponent(inv[1]).match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*ETH/i);
+      if (m) { try { value = ethers.parseEther(m[1]); } catch { value = 0n; } }
+    }
+    const account = (W && W.account) || (await req('eth_requestAccounts', []))[0];
+    // EIP-5792: payment + announcement in one confirmation where the wallet supports it.
+    // Detection is defensive: capabilities first, then sendCalls itself, sequential on any error.
+    let caps = null;
+    try { caps = await req('wallet_getCapabilities', [account]); } catch { /* no capabilities API: still try sendCalls */ }
+    const cap1 = caps && (caps['eip155:1'] || caps['0x1']);
+    const atomic = cap1 && (cap1.atomicBatch || cap1.atomic);
+    const capSaysNo = !!(caps && (!atomic || !(atomic.supported === true || atomic.status === 'supported' || atomic.status === 'ready')));
+    if (!capSaysNo) {
+      try {
+        setSt('sending payment + announcement in one confirmation (EIP-5792)…');
+        const sendRes = await req('wallet_sendCalls', [{
+          version: '2.0.0', chainId: 'eip155:1', from: account,
+          calls: [
+            { to: r.stealth, value: '0x' + value.toString(16), data: '0x' },
+            { to: ANNOUNCER, value: '0x0', data: annData },
+          ],
+        }]);
+        const bundleId = typeof sendRes === 'string' ? sendRes : (sendRes && sendRes.id) || null;
+        // some wallets return the tx hash straight from sendCalls
+        let txHash = bundleId && /^0x[0-9a-fA-F]{64}$/.test(bundleId) ? bundleId : null;
+        let confirmed = false, polled = false;
+        for (let i = 0; i < 40 && !confirmed; i++) {
+          await new Promise(x => setTimeout(x, 3000));
+          if (txHash) {
+            const rcpt = await jrpc('eth_getTransactionReceipt', [txHash]);
+            if (rcpt) { if (rcpt.status !== '0x1') throw new Error('the batch transaction reverted'); confirmed = true; }
+          } else if (bundleId) {
+            let cs = null;
+            try { cs = await req('wallet_getCallsStatus', [bundleId]); } catch { break; } // no status API: report as submitted
+            polled = true;
+            const code = Number(cs && cs.status);
+            if (code >= 200 && code < 300) {
+              confirmed = true;
+              const rc = cs.receipts && cs.receipts[0];
+              txHash = (rc && rc.transactionHash) || txHash;
+            } else if (code >= 400) throw new Error('the batch was rejected or reverted (wallet calls status ' + code + ')');
+          } else break;
+        }
+        setSt((value > 0n ? 'paid ' + ethers.formatEther(value) + ' ETH + ' : '')
+          + 'announced: batched in one confirmation (EIP-5792)'
+          + (txHash ? ' · tx ' + txHash : '')
+          + (confirmed || !polled || txHash ? '' : ' · submitted, still pending'));
+        return;
+      } catch (e) {
+        setSt('EIP-5792 batch unavailable (' + ((e && e.message) || e) + ') · falling back to the sequential flow…');
+      }
+    }
+    // sequential fallback: the original flow, untouched
     const signer = await new ethers.BrowserProvider(window.ethereum).getSigner();
     const ann = new ethers.Contract(ANNOUNCER, ['function announce(uint256,address,bytes,bytes)'], signer);
     const tx = await ann.announce(1, r.stealth, r.ephPub, Uint8Array.from([r.viewTag]));
-    $('v-ann').textContent = 'announced: ' + tx.hash;
+    setSt('announced: ' + tx.hash + ' · sequential (no EIP-5792 batch support in this wallet)');
   };
 }
 // returning user: a stored gp-session collapses the wizard into the dashboard header.
