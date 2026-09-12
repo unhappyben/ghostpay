@@ -1,11 +1,13 @@
-// gp-invoices.mjs · GHOSTPAY invoice suite module (docs/GP-API.md).
-// Mounts into #gp-invoices on invoices.html (frag-invoices.html markup): four sub-tabs
-// (OVERVIEW, INVOICES, CLIENTS, PROFILE) over three localStorage registries (gp-profile,
-// gp-clients, gp-invoices). Invoices pin a pre-derived stealth address in a self-contained
-// hash-param URL pointing at the homepage pay panel; payment status reconciles from GP
-// payment events. On the homepage the same file runs without the suite mount and keeps
-// only its pay-a-ghost enhancement (memo format unchanged). Pure helpers are exported so
-// a node smoke test can exercise migration + totals math without a DOM.
+// gp-invoices.mjs · GHOSTPAY invoice suite module (docs/GP-API.md), storage schema v3.
+// Renders into the shell's tab mounts inside #gp-invoices on invoices.html: INVOICES
+// (plus ESTIMATES), CUSTOMERS, ITEMS, RECURRING, SETTINGS over six localStorage
+// registries: gp-profile, gp-clients, gp-items, gp-invoices, gp-estimates, gp-recurring.
+// Invoices pin a pre-derived stealth address in a self-contained hash-param URL
+// pointing at the homepage pay panel; payment status reconciles from GP payment
+// events, summing multiple payments to the same pinned address into PARTIAL/PAID.
+// On the homepage the same file runs without the suite mounts and keeps only its
+// pay-a-ghost enhancement (memo format unchanged). Pure helpers are exported so a
+// node smoke test can exercise migration, totals math and recurrence without a DOM.
 
 const GP = typeof window !== 'undefined' ? window.GP || null : null;
 
@@ -73,24 +75,37 @@ export function namehash(name, keccak) {
 
 // ── pure suite helpers (exported for the node smoke test) ──
 
+// gp-profile, schema v3.
 export const DEFAULT_PROFILE = {
-  name: '', contact: '', token: 'USDC', prefix: 'GP-', next: 1,
-  terms: 'payment due on receipt', taxPct: null,
+  name: '', contact: '', addressLines: [], token: 'USDC', prefix: 'GP-', next: 1,
+  terms: 'payment due on receipt', taxPct: null, accentColor: null, footerNote: '',
 };
 
 const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+const round6 = n => Math.round(n * 1e6) / 1e6;
 
-// Line items + optional tax % → subtotal/tax/total. Tax is its own line, never folded
-// into the item prices.
-export function computeTotals(items, taxPct) {
+// Line items + optional discount % + optional tax % → subtotal/discount/tax/total.
+// Discount comes off the subtotal first, tax applies to the discounted amount; both
+// are their own lines, never folded into the item prices.
+export function computeTotals(items, taxPct, discountPct) {
   const subtotal = round2((items || []).reduce((s, it) => s + (parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), 0));
+  const dpct = parseFloat(discountPct);
+  const useDisc = Number.isFinite(dpct) && dpct > 0;
+  const discountAmount = useDisc ? round2(subtotal * dpct / 100) : 0;
+  const taxable = round2(subtotal - discountAmount);
   const pct = parseFloat(taxPct);
   const useTax = Number.isFinite(pct) && pct > 0;
-  const taxAmount = useTax ? round2(subtotal * pct / 100) : 0;
-  return { subtotal, taxPct: useTax ? pct : null, taxAmount, total: round2(subtotal + taxAmount) };
+  const taxAmount = useTax ? round2(taxable * pct / 100) : 0;
+  return {
+    subtotal,
+    discountPct: useDisc ? dpct : null, discountAmount,
+    taxPct: useTax ? pct : null, taxAmount,
+    total: round2(taxable + taxAmount),
+  };
 }
 
-// Invoice numbers come from the profile counter: prefix + zero-padded counter.
+// Document numbers come from the profile counter: prefix + zero-padded counter.
+// Invoices and estimates share the sequence.
 export function allocateNumber(profile) {
   const p = profile || {};
   const prefix = typeof p.prefix === 'string' && p.prefix ? p.prefix : 'GP-';
@@ -98,68 +113,136 @@ export function allocateNumber(profile) {
   return { number: prefix + String(n).padStart(4, '0'), next: n + 1 };
 }
 
-// Effective status: PAID is terminal, EXPIRED is derived (past expiry, unpaid), the rest
-// is the stored status. DRAFT → SENT is manual; PAID arrives via GP payment events.
-export function invStatus(rec, now) {
-  if (rec.status === 'PAID') return 'PAID';
-  if (rec.expiry && (now ?? Date.now()) > rec.expiry) return 'EXPIRED';
-  return rec.status || 'SENT';
+// Derived payment state from the summed payments to the pinned stealth address:
+// nothing → null, below total → PARTIAL, at/over total → PAID. Never stored.
+export function paymentState(rec, paidSum) {
+  const paid = paidSum ?? (Number.isFinite(rec.paidAmount) ? rec.paidAmount : 0);
+  if (!(paid > 0)) return null;
+  return paid + 1e-9 >= (Number(rec.total) || 0) ? 'PAID' : 'PARTIAL';
 }
 
-// v1 → v2 record upgrade. v1 records were { id, amount, token, note, stealthAddress,
-// created, url, status: 'UNPAID'|'PAID', expiry }: the amount becomes a single line
-// item, UNPAID becomes SENT (the link was already handed out), a number is assigned.
-export function migrateInvoice(rec, number) {
-  if (rec && rec.v === 2) return rec;
+// Effective status. Terminal stored states pass through (PAID, ACCEPTED, DECLINED).
+// OVERDUE is derived (SENT past expiry), PARTIAL is derived (payments below total),
+// PAID can also be derived when the summed payments reach the total. DRAFT → SENT is
+// manual; PAID normally arrives via GP payment events.
+export function invStatus(rec, now, paidSum) {
+  if (!rec) return 'DRAFT';
+  if (rec.kind === 'estimate') {
+    if (rec.status === 'ACCEPTED' || rec.status === 'DECLINED') return rec.status;
+    if (rec.status === 'SENT' && rec.expiry && (now ?? Date.now()) > rec.expiry) return 'OVERDUE';
+    return rec.status || 'DRAFT';
+  }
+  if (rec.status === 'PAID') return 'PAID';
+  if (rec.status === 'SENT') {
+    const ps = paymentState(rec, paidSum);
+    if (ps) return ps;
+    if (rec.expiry && (now ?? Date.now()) > rec.expiry) return 'OVERDUE';
+    return 'SENT';
+  }
+  return rec.status || 'DRAFT';
+}
+
+// Profile upgrade to schema v3. Idempotent: v3 fields keep their values, missing
+// fields get defaults. A legacy string address becomes one address line.
+export function migrateProfile(p) {
+  const out = { ...DEFAULT_PROFILE, ...(p || {}) };
+  out.addressLines = Array.isArray(out.addressLines)
+    ? out.addressLines.map(String)
+    : (typeof out.addressLines === 'string' && out.addressLines ? out.addressLines.split('\n') : []);
+  out.token = out.token === 'ETH' ? 'ETH' : 'USDC';
+  out.taxPct = Number.isFinite(+out.taxPct) && +out.taxPct > 0 ? +out.taxPct : null;
+  out.accentColor = typeof out.accentColor === 'string' && out.accentColor ? out.accentColor : null;
+  out.footerNote = typeof out.footerNote === 'string' ? out.footerNote : '';
+  out.next = Number.isFinite(+out.next) && +out.next > 0 ? Math.floor(+out.next) : 1;
+  return out;
+}
+
+// v1/v2 → v3 record upgrade. v1 records were { id, amount, token, note,
+// stealthAddress, created, url, status: 'UNPAID'|'PAID', expiry }: the amount becomes
+// a single line item, UNPAID becomes SENT (the link was already handed out), a number
+// is assigned. v2 fields carry over; the v3 additions (discount, paidAmount,
+// estimateOf, kind) get defaults. kind is 'invoice' or 'estimate'.
+export function migrateInvoice(rec, number, kind) {
+  kind = kind === 'estimate' ? 'estimate' : 'invoice';
+  if (rec && rec.v === 3) return rec;
   const amount = parseFloat(rec.amount) || 0;
-  const t = computeTotals(
-    Array.isArray(rec.items) && rec.items.length ? rec.items : [{ description: rec.note || 'invoice', qty: 1, unitPrice: amount }],
-    rec.taxPct
-  );
+  const items = Array.isArray(rec.items) && rec.items.length
+    ? rec.items.map(it => ({ description: it.description || 'item', qty: parseFloat(it.qty) || 0, unitPrice: parseFloat(it.unitPrice) || 0 }))
+    : [{ description: rec.note || kind, qty: 1, unitPrice: amount }];
+  const t = computeTotals(items, rec.taxPct, rec.discountPct);
+  const st = String(rec.status || '').toUpperCase();
+  const status = kind === 'estimate'
+    ? (['DRAFT', 'SENT', 'ACCEPTED', 'DECLINED'].includes(st) ? st : 'SENT')
+    : (st === 'PAID' ? 'PAID' : (st === 'DRAFT' ? 'DRAFT' : 'SENT'));
   return {
-    v: 2,
+    v: 3,
     id: rec.id || 'inv-' + Date.now().toString(36),
     number: rec.number || number || rec.id,
     clientId: rec.clientId || null,
     clientName: rec.clientName || '',
-    items: Array.isArray(rec.items) && rec.items.length ? rec.items : [{ description: rec.note || 'invoice', qty: 1, unitPrice: amount }],
+    items,
     token: rec.token === 'ETH' ? 'ETH' : 'USDC',
     subtotal: Number.isFinite(rec.subtotal) ? rec.subtotal : t.subtotal,
     taxPct: rec.taxPct ?? t.taxPct,
     taxAmount: Number.isFinite(rec.taxAmount) ? rec.taxAmount : t.taxAmount,
+    discountPct: rec.discountPct ?? t.discountPct,
+    discountAmount: Number.isFinite(rec.discountAmount) ? rec.discountAmount : t.discountAmount,
     total: Number.isFinite(rec.total) ? rec.total : t.total,
     note: rec.note || '',
     stealthAddress: rec.stealthAddress || '',
     created: rec.created || Date.now(),
     url: rec.url || '',
     expiry: rec.expiry || null,
-    status: rec.status === 'PAID' ? 'PAID' : (rec.status === 'DRAFT' ? 'DRAFT' : 'SENT'),
+    status,
     sentAt: rec.sentAt || null,
     paidAt: rec.paidAt || null,
     paidTx: rec.paidTx || null,
+    paidAmount: Number.isFinite(rec.paidAmount) ? rec.paidAmount : null,
+    estimateOf: rec.estimateOf || null,
+    kind,
   };
 }
 
 // Whole-registry migration: legacy records get numbers in creation order, the profile
-// counter advances past them. Idempotent: v2 records pass through untouched.
-export function migrateRegistry(records, profile) {
-  const p = { ...DEFAULT_PROFILE, ...(profile || {}) };
-  const out = (records || []).map(r => (r && r.v === 2 ? r : null));
+// counter advances past them. Idempotent: v3 records pass through untouched.
+export function migrateRegistry(records, profile, kind) {
+  const p = migrateProfile(profile);
+  const out = (records || []).map(r => (r && r.v === 3 ? r : null));
   const legacy = (records || [])
     .map((r, i) => ({ r, i }))
-    .filter(x => x.r && x.r.v !== 2)
+    .filter(x => x.r && x.r.v !== 3)
     .sort((a, b) => (a.r.created || 0) - (b.r.created || 0));
   for (const { r, i } of legacy) {
     const a = allocateNumber(p);
     p.next = a.next;
-    out[i] = migrateInvoice(r, a.number);
+    out[i] = migrateInvoice(r, a.number, kind);
   }
   return { records: out.filter(Boolean), profile: p };
+}
+
+// Recurring templates: the run after `date` every N weeks (7-day steps) or N calendar
+// months. GENERATE NOW advances nextDate by exactly one period so a backlog can be
+// caught up one invoice at a time.
+export function nextRecurrence(date, everyN, unit) {
+  const n = Number.isFinite(+everyN) && +everyN > 0 ? Math.floor(+everyN) : 1;
+  const d = new Date(Number(date) || Date.now());
+  if (unit === 'months') {
+    const day = d.getDate();
+    d.setMonth(d.getMonth() + n);
+    // jan 31 + 1 month would roll into march: clamp to the last day of the target month
+    if (d.getDate() !== day) d.setDate(0);
+  } else {
+    d.setDate(d.getDate() + 7 * n);
+  }
+  return d.getTime();
 }
 
 // ── everything below runs only in the browser with window.GP present ──
 
 const INV_KEY = 'gp-invoices';
+const EST_KEY = 'gp-estimates';
+const REC_KEY = 'gp-recurring';
+const ITEMS_KEY = 'gp-items';
 const MEMO_KEY = 'gp-invoice-memos';
 const PROFILE_KEY = 'gp-profile';
 const CLIENTS_KEY = 'gp-clients';
@@ -168,24 +251,31 @@ const ENS_PUBLIC_RESOLVER = '0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63';
 const lsGet = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* best-effort */ } };
 
-const loadProfile = () => ({ ...DEFAULT_PROFILE, ...lsGet(PROFILE_KEY, {}) });
-const saveProfile = p => lsSet(PROFILE_KEY, p);
+const loadProfile = () => migrateProfile(lsGet(PROFILE_KEY, {}));
+const saveProfile = p => lsSet(PROFILE_KEY, migrateProfile(p));
 const loadClients = () => lsGet(CLIENTS_KEY, []);
 const saveClients = c => lsSet(CLIENTS_KEY, c);
+const loadItems = () => lsGet(ITEMS_KEY, []);
+const saveItems = c => lsSet(ITEMS_KEY, c);
+const loadRecurring = () => lsGet(REC_KEY, []);
+const saveRecurring = r => lsSet(REC_KEY, r);
 const loadMemos = () => lsGet(MEMO_KEY, {});
 const saveMemos = m => lsSet(MEMO_KEY, m);
 const memos = typeof localStorage !== 'undefined' ? loadMemos() : {};
 
-// Registry load migrates legacy records on the way out and persists the result once.
-function loadInv() {
-  const raw = lsGet(INV_KEY, []);
-  if (!raw.some(r => r && r.v !== 2)) return raw;
-  const { records, profile } = migrateRegistry(raw, loadProfile());
-  lsSet(INV_KEY, records);
+// Registry loads migrate legacy records on the way out and persist the result once.
+function loadReg(key, kind) {
+  const raw = lsGet(key, []);
+  if (!raw.some(r => r && r.v !== 3)) return raw;
+  const { records, profile } = migrateRegistry(raw, loadProfile(), kind);
+  lsSet(key, records);
   saveProfile(profile);
   return records;
 }
+const loadInv = () => loadReg(INV_KEY, 'invoice');
 const saveInv = inv => lsSet(INV_KEY, inv);
+const loadEst = () => loadReg(EST_KEY, 'estimate');
+const saveEst = est => lsSet(EST_KEY, est);
 
 // ── formatting ──
 const fmtAmt = (n, token) => token === 'ETH'
@@ -197,6 +287,10 @@ const fmtUsd = (amount, token, ethPrice) => {
   return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 };
 const fmtDate = ts => new Date(ts).toISOString().slice(0, 10);
+const dateInputVal = ts => {
+  const d = new Date(ts);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+};
 const escHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const monogram = name => {
   const w = (name || '').trim().split(/\s+/).filter(Boolean);
@@ -263,235 +357,327 @@ async function ethUsd() {
 }
 
 // ── invoice suite UI ──
+// Renders into the shell's tab mounts. Every renderer is defensive: a missing mount
+// means the view is skipped, so the shell can land tabs in any order.
 function initSuite() {
   const $ = id => document.getElementById(id);
-  const root = $('gpinv-root');
-  const view = $('gpinv-view');
   const C = GP.crypto;
+  const mounts = {
+    invoices: $('tab-invoices'), estimates: $('tab-estimates'),
+    customers: $('tab-customers'), items: $('tab-items'),
+    recurring: $('tab-recurring'), settings: $('tab-settings'),
+  };
 
   // view state (in-memory only)
-  let tab = 'overview';
-  let showForm = false;
+  let invKind = 'invoice';       // sub-view inside #tab-invoices when there is no #tab-estimates mount
+  let invFilter = 'ALL', estFilter = 'ALL';
+  let showForm = false, formKind = 'invoice', editId = null;
   let formRows = [{ description: '', qty: 1, unitPrice: '' }];
-  let openInv = null;
-  let qrFor = null;
+  let formDraft = {};
+  let recFormOpen = false, recEditId = null;
+  let recRows = [{ description: '', qty: 1, unitPrice: '' }];
+  let recDraft = {};
+  let itemEditId = null;
+  let itemDraft = { name: '', description: '', unitPrice: '', token: 'USDC' };
+  let openId = null, qrFor = null, recOpen = null;
 
-  const pill = st => '<span class="gpinv-pill' + (st === 'DRAFT' || st === 'EXPIRED' ? ' dim' : '') + '">' + st + '</span>';
+  // status pills: same idiom as the inbox (outline default, dim for inactive,
+  // solid for terminal-good)
+  const pill = st => {
+    const dim = st === 'DRAFT' || st === 'DECLINED' || st === 'PAUSED';
+    const solid = st === 'PAID' || st === 'ACCEPTED' || st === 'DUE';
+    return '<span class="gpinv-pill' + (dim ? ' dim' : '') + (solid ? ' solid' : '') + '">' + st + '</span>';
+  };
 
-  // ── tab: OVERVIEW ──
-  function renderOverview() {
-    const inv = loadInv();
-    const now = Date.now();
-    const month = new Date().toISOString().slice(0, 7);
-    const sum = (fn) => inv.filter(fn).reduce((m, i) => { m[i.token] = (m[i.token] || 0) + i.total; return m; }, {});
-    const outstanding = sum(i => invStatus(i, now) === 'SENT');
-    const paidMonth = sum(i => i.status === 'PAID' && new Date(i.paidAt || i.created).toISOString().slice(0, 7) === month);
-    const counts = { DRAFT: 0, SENT: 0, PAID: 0, EXPIRED: 0 };
-    for (const i of inv) counts[invStatus(i, now)]++;
-    const moneyLines = m => {
-      const keys = Object.keys(m);
-      if (!keys.length) return '<div class="gpinv-big">0</div>';
-      return keys.map(t =>
-        '<div class="gpinv-big">' + fmtAmt(m[t], t) + ' <span class="gpinv-unit">' + t + '</span></div>'
-        + '<div class="status" style="margin-top:2px" data-usd data-amt="' + m[t] + '" data-token="' + t + '"></div>'
-      ).join('');
-    };
-    const ev = [];
-    for (const i of inv) {
-      ev.push({ ts: i.created, text: i.number + ' created · ' + fmtAmt(i.total, i.token) + ' ' + i.token + (i.clientName ? ' · ' + i.clientName : '') });
-      if (i.sentAt) ev.push({ ts: i.sentAt, text: i.number + ' marked sent' });
-      if (i.paidAt) ev.push({ ts: i.paidAt, text: i.number + ' paid' });
-    }
-    ev.sort((a, b) => b.ts - a.ts);
-    const recent = ev.slice(0, 8);
-    const payments = GP.state.payments || [];
-    const swept = payments.filter(p => p.swept).length;
+  const findRec = id => loadInv().find(x => x.id === id) || loadEst().find(x => x.id === id) || null;
 
-    view.innerHTML =
-      '<div class="gpinv-grid">'
-      + '<div class="gpinv-box"><div class="gpinv-lbl">OUTSTANDING</div>' + moneyLines(outstanding) + '</div>'
-      + '<div class="gpinv-box"><div class="gpinv-lbl">PAID THIS MONTH</div>' + moneyLines(paidMonth) + '</div>'
-      + '</div>'
-      + '<div class="gpinv-box" style="margin-top:14px"><div class="gpinv-lbl">INVOICES</div>'
-      + '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px">'
-      + ['DRAFT', 'SENT', 'PAID', 'EXPIRED'].map(s => '<span>' + pill(s) + ' <b>' + counts[s] + '</b></span>').join('')
-      + '</div>'
-      + '<div class="status">payments detected this session: ' + payments.length + (swept ? ' · swept: ' + swept : '') + '</div>'
-      + '</div>'
-      + '<h3>RECENT ACTIVITY</h3>'
-      + (recent.length
-        ? '<table><tbody>' + recent.map(e =>
-            '<tr><td class="gpinv-muted" style="white-space:nowrap">' + fmtDate(e.ts) + '</td><td>' + escHtml(e.text) + '</td></tr>'
-          ).join('') + '</tbody></table>'
-        : '<div class="gpinv-empty">nothing yet: create an invoice in the INVOICES tab and it shows up here.</div>')
-      + '<div class="gpinv-actions">'
-      + '<button class="ghost" data-act="export-csv">EXPORT CSV</button>'
-      + '<button class="ghost" data-act="recv-qr">RECEIVE QR</button>'
-      + '</div>';
+  // links point at the homepage: the payer lands on the pay panel, not the app
+  function buildUrl({ amount, token, note, id, number, expiry, st, eph, vt }) {
+    return location.origin + '/#' + GP.state.meta
+      + '?pay=' + encodeURIComponent(amount + ' ' + token + (note ? ' · ' + note : ''))
+      + '&inv=' + id + '&num=' + encodeURIComponent(number)
+      + (expiry ? '&exp=' + expiry : '')
+      + '&st=' + st + '&eph=' + eph + '&vt=' + vt;
+  }
+  // editing keeps the pinned stealth address: st/eph/vt ride inside the existing URL
+  function parsePinned(url) {
+    const q = String(url || '');
+    const p = new URLSearchParams(q.includes('?') ? q.slice(q.indexOf('?') + 1) : '');
+    return { st: p.get('st'), eph: p.get('eph'), vt: p.get('vt') };
   }
 
-  // ── tab: INVOICES ──
-  function newFormHtml() {
-    const p = loadProfile();
-    const clients = loadClients();
-    return '<h3>NEW INVOICE</h3>'
-      + '<div class="gpinv-box">'
-      + '<div class="gpinv-lbl">CLIENT</div>'
-      + '<select id="gpinv-f-client" style="margin-top:4px"><option value="">no client</option>'
-      + clients.map(c => '<option value="' + escHtml(c.id) + '">' + escHtml(c.name) + '</option>').join('')
-      + '</select>'
-      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS</div>'
-      + '<div class="gpinv-tablewrap"><table id="gpinv-f-items"><thead><tr>'
+  // ── shared line-items editor (invoices, estimates, recurring templates) ──
+  function rowsTableHtml(rows, token, catalog, pref) {
+    return '<div class="gpinv-tablewrap"><table id="gpinv-' + pref + '-items"><thead><tr>'
       + '<th style="width:46%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th style="text-align:right">AMOUNT</th><th></th>'
       + '</tr></thead><tbody>'
-      + formRows.map((r, i) =>
-          '<tr><td><input data-row="' + i + '" data-f="description" placeholder="description" value="' + escHtml(r.description) + '"></td>'
-          + '<td><input data-row="' + i + '" data-f="qty" type="number" min="0" step="any" value="' + escHtml(r.qty) + '"></td>'
-          + '<td><input data-row="' + i + '" data-f="unitPrice" type="number" min="0" step="any" placeholder="0.00" value="' + escHtml(r.unitPrice) + '"></td>'
-          + '<td style="text-align:right;white-space:nowrap" data-rowamt="' + i + '">' + fmtAmt((parseFloat(r.qty) || 0) * (parseFloat(r.unitPrice) || 0), p.token) + '</td>'
-          + '<td style="width:1%"><button class="ghost gpinv-x" data-act="del-row" data-row="' + i + '" title="remove row">×</button></td></tr>'
+      + rows.map((r, i) =>
+          '<tr><td>'
+          + '<select data-row="' + i + '" data-f="pick" data-pref="' + pref + '" style="margin-top:0;margin-bottom:6px">'
+          + '<option value="">catalog item…</option>'
+          + catalog.map((c, ci) =>
+              '<option value="' + ci + '"' + (r._pick === String(ci) ? ' selected' : '') + '>'
+              + escHtml(c.name) + ' · ' + fmtAmt(c.unitPrice, c.token) + ' ' + c.token + '</option>'
+            ).join('')
+          + '</select>'
+          + '<input data-row="' + i + '" data-f="description" data-pref="' + pref + '" placeholder="description" value="' + escHtml(r.description) + '"></td>'
+          + '<td><input data-row="' + i + '" data-f="qty" data-pref="' + pref + '" type="number" min="0" step="any" value="' + escHtml(r.qty) + '"></td>'
+          + '<td><input data-row="' + i + '" data-f="unitPrice" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="0.00" value="' + escHtml(r.unitPrice) + '"></td>'
+          + '<td style="text-align:right;white-space:nowrap" data-rowamt="' + i + '" data-pref="' + pref + '">' + fmtAmt((parseFloat(r.qty) || 0) * (parseFloat(r.unitPrice) || 0), token) + '</td>'
+          + '<td style="width:1%"><button class="ghost gpinv-x" data-iact="' + pref + '-del-row" data-row="' + i + '" title="remove row">×</button></td></tr>'
         ).join('')
       + '</tbody></table></div>'
-      + '<button class="ghost" data-act="add-row" style="width:auto;padding:8px 14px;font-size:11px;margin-top:10px">+ ADD ROW</button>'
-      + '<div style="margin-top:14px;text-align:right;font-size:12px">'
-      + '<div>subtotal · <b id="gpinv-f-sub">0.00</b></div>'
-      + '<div id="gpinv-f-taxrow" style="display:none">tax <span id="gpinv-f-taxpct"></span>% · <b id="gpinv-f-tax">0.00</b></div>'
-      + '<div style="font-size:16px;margin-top:4px">total · <b id="gpinv-f-total">0.00</b> <span id="gpinv-f-tok2"></span></div>'
-      + '<div class="status" style="margin-top:2px" id="gpinv-f-usd"></div>'
-      + '</div>'
-      + '<div class="gpinv-lbl" style="margin-top:14px">TOKEN</div>'
-      + '<select id="gpinv-f-token" style="margin-top:4px">'
-      + ['USDC', 'ETH'].map(t => '<option' + (p.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
-      + '</select>'
-      + '<input id="gpinv-f-note" placeholder="note (optional: prefills the payer\'s encrypted memo)">'
-      + '<input id="gpinv-f-exp" type="number" min="0" placeholder="expires in days (optional: blank = never)">'
-      + '<button data-act="create" style="margin-top:14px">CREATE INVOICE</button>'
-      + '<div class="status" id="gpinv-f-st"></div>'
-      + '</div>';
+      + '<button class="ghost" data-iact="' + pref + '-add-row" style="width:auto;padding:8px 14px;font-size:11px;margin-top:10px">+ ADD ROW</button>';
   }
 
-  function readForm() {
+  function readRows(pref) {
     const rows = [];
-    view.querySelectorAll('#gpinv-f-items tbody tr').forEach(tr => {
+    const tbl = $('gpinv-' + pref + '-items');
+    if (!tbl) return null;
+    tbl.querySelectorAll('tbody tr').forEach(tr => {
       const get = f => { const el = tr.querySelector('[data-f="' + f + '"]'); return el ? el.value : ''; };
-      rows.push({ description: get('description').trim(), qty: get('qty'), unitPrice: get('unitPrice') });
+      rows.push({ description: get('description').trim(), qty: get('qty'), unitPrice: get('unitPrice'), _pick: get('pick') });
     });
     return rows;
   }
 
-  function refreshFormTotals() {
-    if (!$('gpinv-f-items')) return;
-    formRows = readForm();
-    const p = loadProfile();
-    const token = $('gpinv-f-token').value;
-    const t = computeTotals(formRows, p.taxPct);
-    formRows.forEach((r, i) => {
-      const cell = view.querySelector('[data-rowamt="' + i + '"]');
-      if (cell) cell.textContent = fmtAmt((parseFloat(r.qty) || 0) * (parseFloat(r.unitPrice) || 0), token);
-    });
-    $('gpinv-f-sub').textContent = fmtAmt(t.subtotal, token);
-    $('gpinv-f-taxrow').style.display = t.taxPct ? 'block' : 'none';
-    if (t.taxPct) { $('gpinv-f-taxpct').textContent = t.taxPct; $('gpinv-f-tax').textContent = fmtAmt(t.taxAmount, token); }
-    $('gpinv-f-total').textContent = fmtAmt(t.total, token);
-    $('gpinv-f-tok2').textContent = token;
-    const usdEl = $('gpinv-f-usd');
-    const direct = fmtUsd(t.total, token, GP.state.ethPriceUsd);
-    if (direct) usdEl.textContent = '≈ ' + direct + ' usd';
-    else ethUsd().then(px => {
-      const u = fmtUsd(t.total, token, px);
-      if (usdEl.isConnected) usdEl.textContent = u ? '≈ ' + u + ' usd' : 'usd estimate unavailable (relayer price feed offline)';
-    });
+  function totalsBlockHtml(pref, t, token) {
+    return '<div style="margin-top:14px;text-align:right;font-size:12px">'
+      + '<div>subtotal · <b id="gpinv-' + pref + '-sub">' + fmtAmt(t.subtotal, token) + '</b></div>'
+      + '<div id="gpinv-' + pref + '-discrow"' + (t.discountPct ? '' : ' style="display:none"') + '>discount <span id="gpinv-' + pref + '-discpct">' + (t.discountPct ?? '') + '</span>% · −<b id="gpinv-' + pref + '-disc">' + fmtAmt(t.discountAmount, token) + '</b></div>'
+      + '<div id="gpinv-' + pref + '-taxrow"' + (t.taxPct ? '' : ' style="display:none"') + '>tax <span id="gpinv-' + pref + '-taxpct">' + (t.taxPct ?? '') + '</span>% · <b id="gpinv-' + pref + '-tax">' + fmtAmt(t.taxAmount, token) + '</b></div>'
+      + '<div style="font-size:16px;margin-top:4px">total · <b id="gpinv-' + pref + '-total">' + fmtAmt(t.total, token) + '</b> <span id="gpinv-' + pref + '-tok2">' + token + '</span></div>'
+      + '<div class="status" style="margin-top:2px" id="gpinv-' + pref + '-usd"></div>'
+      + '</div>';
   }
 
-  function invDetailHtml(i) {
-    const st = invStatus(i);
-    const memo = memos[(i.stealthAddress || '').toLowerCase()] || '';
-    const itemRows = i.items.map(it =>
+  // own attribute mutations (style toggles, link previews) must not retrigger the
+  // tab-swap observer below: it would re-render mid-keystroke and drop focus
+  let selfTouch = 0;
+  const touchSelf = () => { selfTouch = Date.now(); };
+
+  function paintTotals(pref, rows, token, taxPct, discPct) {
+    touchSelf();
+    const t = computeTotals(rows, taxPct, discPct);
+    rows.forEach((r, i) => {
+      const cell = document.querySelector('[data-rowamt="' + i + '"][data-pref="' + pref + '"]');
+      if (cell) cell.textContent = fmtAmt((parseFloat(r.qty) || 0) * (parseFloat(r.unitPrice) || 0), token);
+    });
+    const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+    set('gpinv-' + pref + '-sub', fmtAmt(t.subtotal, token));
+    const drow = $('gpinv-' + pref + '-discrow');
+    if (drow) drow.style.display = t.discountPct ? 'block' : 'none';
+    if (t.discountPct) { set('gpinv-' + pref + '-discpct', t.discountPct); set('gpinv-' + pref + '-disc', fmtAmt(t.discountAmount, token)); }
+    const trow = $('gpinv-' + pref + '-taxrow');
+    if (trow) trow.style.display = t.taxPct ? 'block' : 'none';
+    if (t.taxPct) { set('gpinv-' + pref + '-taxpct', t.taxPct); set('gpinv-' + pref + '-tax', fmtAmt(t.taxAmount, token)); }
+    set('gpinv-' + pref + '-total', fmtAmt(t.total, token));
+    set('gpinv-' + pref + '-tok2', token);
+    const usdEl = $('gpinv-' + pref + '-usd');
+    if (usdEl) {
+      const direct = fmtUsd(t.total, token, GP.state.ethPriceUsd);
+      if (direct) usdEl.textContent = '≈ ' + direct + ' usd';
+      else ethUsd().then(px => {
+        const u = fmtUsd(t.total, token, px);
+        if (usdEl.isConnected) usdEl.textContent = u ? '≈ ' + u + ' usd' : 'usd estimate unavailable (relayer price feed offline)';
+      });
+    }
+    return t;
+  }
+
+  // ── invoice / estimate editor ──
+  function startForm(kind, rec) {
+    const p = loadProfile();
+    showForm = true;
+    formKind = kind;
+    editId = rec ? rec.id : null;
+    formRows = rec
+      ? rec.items.map(it => ({ description: it.description, qty: it.qty, unitPrice: it.unitPrice }))
+      : [{ description: '', qty: 1, unitPrice: '' }];
+    formDraft = {
+      clientId: rec ? rec.clientId || '' : '',
+      token: rec ? rec.token : p.token,
+      note: rec ? rec.note : '',
+      expDays: rec && rec.expiry ? Math.max(1, Math.round((rec.expiry - Date.now()) / 86400000)) : '',
+      taxPct: rec ? (rec.taxPct ?? '') : (p.taxPct ?? ''),
+      discPct: rec ? (rec.discountPct ?? '') : '',
+    };
+  }
+
+  function editorHtml() {
+    const kind = formKind;
+    const p = loadProfile();
+    const clients = loadClients();
+    const catalog = loadItems();
+    const d = formDraft;
+    return '<h3>' + (editId ? 'EDIT ' : 'NEW ') + kind.toUpperCase() + '</h3>'
+      + '<div class="gpinv-box">'
+      + '<div class="gpinv-lbl">CLIENT</div>'
+      + '<select id="gpinv-f-client" style="margin-top:4px"><option value="">no client</option>'
+      + clients.map(c => '<option value="' + escHtml(c.id) + '"' + (d.clientId === c.id ? ' selected' : '') + '>' + escHtml(c.name) + '</option>').join('')
+      + '</select>'
+      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS</div>'
+      + rowsTableHtml(formRows, d.token, catalog, 'f')
+      + '<div class="gpinv-grid" style="margin-top:14px">'
+      + '<div><div class="gpinv-lbl">DISCOUNT % (OPTIONAL)</div><input id="gpinv-f-disc" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.discPct) + '" placeholder="e.g. 10"></div>'
+      + '<div><div class="gpinv-lbl">TAX % (OPTIONAL)</div><input id="gpinv-f-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.taxPct) + '" placeholder="' + (p.taxPct ?? 'e.g. 20') + '"></div>'
+      + '</div>'
+      + totalsBlockHtml('f', computeTotals(formRows, d.taxPct, d.discPct), d.token)
+      + '<div class="gpinv-lbl" style="margin-top:14px">TOKEN</div>'
+      + '<select id="gpinv-f-token" style="margin-top:4px">'
+      + ['USDC', 'ETH'].map(t => '<option' + (d.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
+      + '</select>'
+      + '<input id="gpinv-f-note" placeholder="note (optional: prefills the payer\'s encrypted memo)" value="' + escHtml(d.note) + '">'
+      + '<input id="gpinv-f-exp" type="number" min="0" placeholder="expires in days (optional: blank = never)" value="' + escHtml(d.expDays) + '">'
+      + '<div class="gpinv-actions gpinv-sticky">'
+      + '<button data-iact="save-form">' + (editId ? 'SAVE CHANGES' : 'CREATE ' + kind.toUpperCase()) + '</button>'
+      + '<button class="ghost" data-iact="toggle-form">CANCEL</button>'
+      + '</div>'
+      + '<div class="status" id="gpinv-f-st"></div>'
+      + '</div>';
+  }
+
+  function syncFormFromDom() {
+    const rows = readRows('f');
+    if (rows) formRows = rows;
+    const m = { 'gpinv-f-client': 'clientId', 'gpinv-f-token': 'token', 'gpinv-f-note': 'note', 'gpinv-f-exp': 'expDays', 'gpinv-f-tax': 'taxPct', 'gpinv-f-disc': 'discPct' };
+    for (const [id, k] of Object.entries(m)) {
+      const el = $(id);
+      if (el) formDraft[k] = el.value;
+    }
+  }
+
+  // ── record detail (shared by invoices and estimates) ──
+  function detailHtml(rec) {
+    const kind = rec.kind === 'estimate' ? 'estimate' : 'invoice';
+    const st = invStatus(rec);
+    const memo = memos[(rec.stealthAddress || '').toLowerCase()] || '';
+    const itemRows = rec.items.map(it =>
       '<tr><td>' + escHtml(it.description || 'item') + '</td>'
       + '<td>' + escHtml(it.qty) + '</td>'
-      + '<td>' + fmtAmt(it.unitPrice, i.token) + '</td>'
-      + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), i.token) + '</td></tr>'
+      + '<td>' + fmtAmt(it.unitPrice, rec.token) + '</td>'
+      + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
     ).join('');
-    return '<div class="gpinv-lbl">INVOICE ' + escHtml(i.number) + '</div>'
+    return '<div class="gpinv-lbl">' + kind.toUpperCase() + ' ' + escHtml(rec.number) + ' · ' + pill(st) + '</div>'
       + '<div class="gpinv-muted" style="font-size:12px">'
-      + 'created ' + fmtDate(i.created)
-      + (i.clientName ? ' · client: ' + escHtml(i.clientName) : '')
-      + (i.expiry ? ' · expires ' + fmtDate(i.expiry) : ' · no expiry')
-      + (i.sentAt ? ' · sent ' + fmtDate(i.sentAt) : '')
-      + (i.paidAt ? ' · paid ' + fmtDate(i.paidAt) : '')
+      + 'created ' + fmtDate(rec.created)
+      + (rec.clientName ? ' · client: ' + escHtml(rec.clientName) : '')
+      + (rec.expiry ? ' · ' + (kind === 'invoice' ? 'due ' : 'valid until ') + fmtDate(rec.expiry) : ' · no expiry')
+      + (rec.sentAt ? ' · sent ' + fmtDate(rec.sentAt) : '')
+      + (rec.paidAt ? ' · paid ' + fmtDate(rec.paidAt) : '')
+      + (rec.estimateOf ? ' · converted from estimate' : '')
       + '</div>'
       + '<div class="gpinv-tablewrap" style="margin-top:12px"><table><thead><tr>'
       + '<th style="width:46%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th style="text-align:right">AMOUNT</th>'
       + '</tr></thead><tbody>' + itemRows + '</tbody></table></div>'
       + '<div style="margin-top:10px;text-align:right;font-size:12px">'
-      + '<div>subtotal · ' + fmtAmt(i.subtotal, i.token) + ' ' + i.token + '</div>'
-      + (i.taxPct ? '<div>tax ' + i.taxPct + '% · ' + fmtAmt(i.taxAmount, i.token) + ' ' + i.token + '</div>' : '')
-      + '<div style="font-size:16px;margin-top:2px"><b>' + fmtAmt(i.total, i.token) + ' ' + i.token + '</b></div>'
-      + '<div class="status" style="margin-top:2px" data-usd data-amt="' + i.total + '" data-token="' + i.token + '"></div>'
+      + '<div>subtotal · ' + fmtAmt(rec.subtotal, rec.token) + ' ' + rec.token + '</div>'
+      + (rec.discountPct ? '<div>discount ' + rec.discountPct + '% · −' + fmtAmt(rec.discountAmount, rec.token) + ' ' + rec.token + '</div>' : '')
+      + (rec.taxPct ? '<div>tax ' + rec.taxPct + '% · ' + fmtAmt(rec.taxAmount, rec.token) + ' ' + rec.token + '</div>' : '')
+      + '<div style="font-size:16px;margin-top:2px"><b>' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</b></div>'
+      + '<div class="status" style="margin-top:2px" data-usd data-amt="' + rec.total + '" data-token="' + rec.token + '"></div>'
+      + (st === 'PARTIAL' ? '<div class="status" style="color:#fff">paid so far · ' + fmtAmt(rec.paidAmount, rec.token) + ' ' + rec.token + ' · remaining ' + fmtAmt(round2(rec.total - rec.paidAmount), rec.token) + ' ' + rec.token + '</div>' : '')
       + '</div>'
-      + (i.note ? '<div class="status">note: ' + escHtml(i.note) + '</div>' : '')
+      + (rec.note ? '<div class="status">note: ' + escHtml(rec.note) + '</div>' : '')
       + (memo ? '<div class="status" style="color:#fff">payment memo: ' + escHtml(memo) + '</div>' : '')
+      + (rec.paidTx ? '<div class="status">payment tx: <a href="https://etherscan.io/tx/' + escHtml(rec.paidTx) + '" target="_blank" rel="noopener">' + escHtml(rec.paidTx.slice(0, 18)) + '…</a></div>' : '')
       + '<div class="gpinv-lbl" style="margin-top:12px">PINNED STEALTH ADDRESS</div>'
-      + '<div class="gpinv-mono">' + escHtml(i.stealthAddress) + '</div>'
-      + '<div class="gpinv-mono" style="margin-top:6px">' + escHtml(i.url) + '</div>'
-      + (qrFor === i.id ? '<div style="margin-top:12px;text-align:center"><canvas data-qr style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas></div>' : '')
+      + '<div class="gpinv-mono">' + escHtml(rec.stealthAddress) + '</div>'
+      + '<div class="gpinv-mono" style="margin-top:6px">' + escHtml(rec.url) + '</div>'
+      + (qrFor === rec.id ? '<div style="margin-top:12px;text-align:center"><canvas data-qr style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas></div>' : '')
       + '<div class="gpinv-actions">'
-      + '<button class="ghost" data-act="view" data-id="' + escHtml(i.id) + '">VIEW LINK</button>'
-      + '<button class="ghost" data-act="qr" data-id="' + escHtml(i.id) + '">QR</button>'
-      + '<button class="ghost" data-act="copy" data-id="' + escHtml(i.id) + '">COPY LINK</button>'
-      + '<button class="ghost" data-act="dup" data-id="' + escHtml(i.id) + '">DUPLICATE</button>'
-      + (st === 'DRAFT' ? '<button class="ghost" data-act="sent" data-id="' + escHtml(i.id) + '">MARK SENT</button>' : '')
-      + '<button class="ghost" data-act="print" data-id="' + escHtml(i.id) + '">PRINT / PDF</button>'
-      + '<button class="ghost" data-act="del" data-id="' + escHtml(i.id) + '">DELETE</button>'
+      + '<button class="ghost" data-iact="view" data-id="' + escHtml(rec.id) + '">VIEW LINK</button>'
+      + '<button class="ghost" data-iact="qr" data-id="' + escHtml(rec.id) + '">QR</button>'
+      + '<button class="ghost" data-iact="copy" data-id="' + escHtml(rec.id) + '">COPY LINK</button>'
+      + '<button class="ghost" data-iact="dup" data-id="' + escHtml(rec.id) + '">DUPLICATE</button>'
+      + '<button class="ghost" data-iact="print" data-id="' + escHtml(rec.id) + '">PRINT / PDF</button>'
+      + (st === 'DRAFT' ? '<button class="ghost" data-iact="edit" data-id="' + escHtml(rec.id) + '">EDIT</button>' : '')
+      + (st === 'DRAFT' ? '<button class="ghost" data-iact="sent" data-id="' + escHtml(rec.id) + '">MARK SENT</button>' : '')
+      + (kind === 'estimate' && st === 'SENT' ? '<button class="ghost" data-iact="accept" data-id="' + escHtml(rec.id) + '">MARK ACCEPTED</button>' : '')
+      + (kind === 'estimate' && st === 'SENT' ? '<button class="ghost" data-iact="decline" data-id="' + escHtml(rec.id) + '">MARK DECLINED</button>' : '')
+      + (kind === 'estimate' && (st === 'SENT' || st === 'ACCEPTED') ? '<button data-iact="convert" data-id="' + escHtml(rec.id) + '">CONVERT TO INVOICE</button>' : '')
+      + (st === 'DRAFT' ? '<button class="ghost" data-iact="del" data-id="' + escHtml(rec.id) + '">DELETE</button>' : '')
       + '</div>';
   }
 
-  function renderInvoices() {
-    const inv = loadInv();
-    const rows = [...inv].sort((a, b) => b.created - a.created);
-    view.innerHTML =
-      '<div class="gpinv-actions" style="margin-top:0">'
-      + '<button data-act="toggle-form">' + (showForm ? 'CANCEL' : 'NEW INVOICE') + '</button>'
+  // ── document list (shared by invoices and estimates) ──
+  function listHtml(kind) {
+    const reg = kind === 'estimate' ? loadEst() : loadInv();
+    const filter = kind === 'estimate' ? estFilter : invFilter;
+    const filters = kind === 'estimate'
+      ? ['ALL', 'DRAFT', 'SENT', 'ACCEPTED', 'DECLINED', 'OVERDUE']
+      : ['ALL', 'DRAFT', 'SENT', 'PARTIAL', 'OVERDUE', 'PAID'];
+    const rows = [...reg].sort((a, b) => b.created - a.created);
+    const shown = filter === 'ALL' ? rows : rows.filter(r => invStatus(r) === filter);
+    const noun = kind === 'estimate' ? 'estimate' : 'invoice';
+    return '<div class="gpinv-actions" style="margin-top:0">'
+      + '<button data-iact="toggle-form" data-k="' + kind + '">' + (showForm && formKind === kind ? 'CANCEL' : 'NEW ' + noun.toUpperCase()) + '</button>'
       + '</div>'
-      + (showForm ? newFormHtml() : '')
-      + '<h3>INVOICES</h3>'
-      + (rows.length
-        ? '<div class="gpinv-tablewrap"><table><thead><tr>'
-          + '<th>NUMBER</th><th>CLIENT</th><th style="text-align:right">TOTAL</th><th style="text-align:right">STATUS</th>'
-          + '</tr></thead><tbody>'
-          + rows.map(i =>
-              '<tr class="gpinv-rowbtn" data-act="open" data-id="' + escHtml(i.id) + '">'
-              + '<td><b>' + escHtml(i.number) + '</b><div class="gpinv-muted" style="font-size:10px">' + fmtDate(i.created) + '</div></td>'
-              + '<td>' + (i.clientName ? escHtml(i.clientName) : '<span class="gpinv-muted">·</span>') + '</td>'
-              + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(i.total, i.token) + ' ' + i.token + '</td>'
-              + '<td style="text-align:right">' + pill(invStatus(i)) + '</td></tr>'
-              + (openInv === i.id ? '<tr class="gpinv-detail"><td colspan="4">' + invDetailHtml(i) + '</td></tr>' : '')
-            ).join('')
-          + '</tbody></table></div>'
-        : '<div class="gpinv-empty">no invoices yet: press NEW INVOICE to create your first one.</div>');
-    if (showForm) refreshFormTotals();
-    if (openInv && qrFor === openInv) {
-      const i = inv.find(x => x.id === openInv);
-      const cv = view.querySelector('canvas[data-qr]');
-      if (i && cv) drawQr(cv, i.url).catch(() => GP.toast('QR failed: content too long'));
-    }
+      + (showForm && formKind === kind ? editorHtml() : '')
+      + '<div class="gpinv-filter">'
+      + filters.map(f => '<button class="ghost' + (filter === f ? ' on' : '') + '" data-iact="filter" data-k="' + kind + '" data-f="' + f + '">' + f + '</button>').join('')
+      + '</div>'
+      + (rows.length === 0
+        ? '<div class="gpinv-empty">no ' + noun + 's yet: press NEW ' + noun.toUpperCase() + ' to create your first one. '
+          + (kind === 'invoice' ? 'tip: add clients under CUSTOMERS and reusable lines under ITEMS first, then pick them here.' : 'estimates share the client list and item catalog with invoices.') + '</div>'
+        : shown.length === 0
+          ? '<div class="gpinv-empty">nothing with status ' + filter + ': pick another filter above.</div>'
+          : '<div class="gpinv-tablewrap"><table><thead><tr>'
+            + '<th>NUMBER</th><th>CLIENT</th><th>DATE</th><th>' + (kind === 'invoice' ? 'DUE' : 'VALID UNTIL') + '</th>'
+            + '<th style="text-align:right">TOTAL</th><th style="text-align:right">USD</th><th style="text-align:right">STATUS</th>'
+            + '</tr></thead><tbody>'
+            + shown.map(rec =>
+                '<tr class="gpinv-rowbtn" data-iact="open" data-id="' + escHtml(rec.id) + '">'
+                + '<td><b>' + escHtml(rec.number) + '</b></td>'
+                + '<td>' + (rec.clientName ? escHtml(rec.clientName) : '<span class="gpinv-muted">·</span>') + '</td>'
+                + '<td style="white-space:nowrap">' + fmtDate(rec.created) + '</td>'
+                + '<td style="white-space:nowrap">' + (rec.expiry ? fmtDate(rec.expiry) : '<span class="gpinv-muted">·</span>') + '</td>'
+                + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</td>'
+                + '<td style="text-align:right;white-space:nowrap" data-usd data-amt="' + rec.total + '" data-token="' + rec.token + '"></td>'
+                + '<td style="text-align:right">' + pill(invStatus(rec)) + '</td></tr>'
+                + (openId === rec.id ? '<tr class="gpinv-detail"><td colspan="7">' + detailHtml(rec) + '</td></tr>' : '')
+              ).join('')
+            + '</tbody></table></div>');
   }
 
-  // ── tab: CLIENTS ──
-  function renderClients() {
+  // ── tab: INVOICES (with the ESTIMATES sub-switch when the shell has no separate mount) ──
+  function renderInvoices() {
+    const el = mounts.invoices;
+    if (!el) return;
+    const kindSwitch = mounts.estimates ? '' :
+      '<div class="gpinv-sub">'
+      + '<button data-iact="kind" data-k="invoice"' + (invKind === 'invoice' ? ' class="on"' : '') + '>INVOICES</button>'
+      + '<button data-iact="kind" data-k="estimate"' + (invKind === 'estimate' ? ' class="on"' : '') + '>ESTIMATES</button>'
+      + '</div>';
+    el.innerHTML = kindSwitch + listHtml(mounts.estimates ? 'invoice' : invKind);
+    afterRender(el);
+  }
+
+  // ── tab: ESTIMATES (only when the shell provides a dedicated mount) ──
+  function renderEstimates() {
+    const el = mounts.estimates;
+    if (!el) return;
+    el.innerHTML = listHtml('estimate');
+    afterRender(el);
+  }
+
+  // ── tab: CUSTOMERS ──
+  function renderCustomers() {
+    const el = mounts.customers;
+    if (!el) return;
     const clients = loadClients();
     const inv = loadInv();
     const now = Date.now();
-    view.innerHTML =
-      '<h3>ADD CLIENT</h3>'
+    el.innerHTML =
+      '<h3>ADD CUSTOMER</h3>'
       + '<div class="gpinv-box">'
       + '<input id="gpinv-c-name" placeholder="name" style="margin-top:0">'
       + '<input id="gpinv-c-contact" placeholder="contact (email, telegram, …)">'
       + '<input id="gpinv-c-notes" placeholder="notes (optional)">'
-      + '<button data-act="add-client" style="margin-top:14px">ADD CLIENT</button>'
+      + '<button data-iact="add-client" style="margin-top:14px">ADD CUSTOMER</button>'
       + '<div class="status" id="gpinv-c-st"></div>'
       + '</div>'
-      + '<h3>CLIENTS</h3>'
+      + '<h3>CUSTOMERS</h3>'
       + (clients.length
         ? '<div class="gpinv-tablewrap"><table><thead><tr>'
           + '<th>NAME</th><th>CONTACT</th><th style="text-align:right">OUTSTANDING</th><th style="text-align:right">PAID</th><th></th>'
@@ -500,216 +686,363 @@ function initSuite() {
               const mine = inv.filter(i => i.clientId === c.id);
               const tot = f => mine.filter(f).reduce((m, i) => { m[i.token] = (m[i.token] || 0) + i.total; return m; }, {});
               const cell = m => Object.keys(m).length ? Object.keys(m).map(t => fmtAmt(m[t], t) + ' ' + t).join('<br>') : '<span class="gpinv-muted">·</span>';
+              const open = i => ['SENT', 'PARTIAL', 'OVERDUE'].includes(invStatus(i, now));
               return '<tr><td><b>' + escHtml(c.name) + '</b>'
                 + (c.notes ? '<div class="gpinv-muted" style="font-size:10px">' + escHtml(c.notes) + '</div>' : '')
                 + '</td><td>' + (c.contact ? escHtml(c.contact) : '<span class="gpinv-muted">·</span>') + '</td>'
-                + '<td style="text-align:right">' + cell(tot(i => invStatus(i, now) === 'SENT')) + '</td>'
+                + '<td style="text-align:right">' + cell(tot(open)) + '</td>'
                 + '<td style="text-align:right">' + cell(tot(i => i.status === 'PAID')) + '</td>'
-                + '<td style="width:1%"><button class="ghost gpinv-x" data-act="del-client" data-id="' + escHtml(c.id) + '" title="delete client">×</button></td></tr>';
+                + '<td style="width:1%"><button class="ghost gpinv-x" data-iact="del-client" data-id="' + escHtml(c.id) + '" title="delete customer">×</button></td></tr>';
             }).join('')
           + '</tbody></table></div>'
-        : '<div class="gpinv-empty">no clients yet: add one above, then pick them when creating an invoice.</div>');
+        : '<div class="gpinv-empty">no customers yet: add one above, then pick them when creating an invoice. outstanding and paid totals build up here as invoices move.</div>');
   }
 
-  // ── tab: PROFILE ──
-  function renderProfile() {
+  // ── tab: ITEMS (reusable line-item catalog) ──
+  function renderItems() {
+    const el = mounts.items;
+    if (!el) return;
+    const items = loadItems();
+    el.innerHTML =
+      '<h3>' + (itemEditId ? 'EDIT ITEM' : 'ADD ITEM') + '</h3>'
+      + '<div class="gpinv-box">'
+      + '<input id="gpinv-i-name" placeholder="item name (e.g. design retainer)" style="margin-top:0" value="' + escHtml(itemDraft.name) + '">'
+      + '<input id="gpinv-i-desc" placeholder="description (prefills invoice lines)" value="' + escHtml(itemDraft.description) + '">'
+      + '<div class="gpinv-grid" style="margin-top:8px">'
+      + '<div><div class="gpinv-lbl">UNIT PRICE</div><input id="gpinv-i-price" type="number" min="0" step="any" style="margin-top:4px" value="' + escHtml(itemDraft.unitPrice) + '" placeholder="0.00"></div>'
+      + '<div><div class="gpinv-lbl">TOKEN</div><select id="gpinv-i-token" style="margin-top:4px">'
+      + ['USDC', 'ETH'].map(t => '<option' + (itemDraft.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
+      + '</select></div>'
+      + '</div>'
+      + '<div class="gpinv-actions gpinv-sticky">'
+      + '<button data-iact="save-item">' + (itemEditId ? 'SAVE ITEM' : 'ADD ITEM') + '</button>'
+      + (itemEditId ? '<button class="ghost" data-iact="cancel-item">CANCEL</button>' : '')
+      + '</div>'
+      + '<div class="status" id="gpinv-i-st"></div>'
+      + '</div>'
+      + '<h3>CATALOG</h3>'
+      + (items.length
+        ? '<div class="gpinv-tablewrap"><table><thead><tr>'
+          + '<th>NAME</th><th>DESCRIPTION</th><th style="text-align:right">UNIT PRICE</th><th></th>'
+          + '</tr></thead><tbody>'
+          + items.map(it =>
+              '<tr><td><b>' + escHtml(it.name) + '</b></td>'
+              + '<td>' + (it.description ? escHtml(it.description) : '<span class="gpinv-muted">·</span>') + '</td>'
+              + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(it.unitPrice, it.token) + ' ' + it.token + '</td>'
+              + '<td style="width:1%;white-space:nowrap">'
+              + '<button class="ghost gpinv-x" data-iact="edit-item" data-id="' + escHtml(it.id) + '" title="edit item">✎</button> '
+              + '<button class="ghost gpinv-x" data-iact="del-item" data-id="' + escHtml(it.id) + '" title="delete item">×</button>'
+              + '</td></tr>'
+            ).join('')
+          + '</tbody></table></div>'
+        : '<div class="gpinv-empty">the catalog is empty: add reusable line items above, then pick them from any invoice, estimate or recurring template row.</div>');
+  }
+
+  // ── tab: RECURRING ──
+  function startRecForm(rec) {
     const p = loadProfile();
-    view.innerHTML =
+    recFormOpen = true;
+    recEditId = rec ? rec.id : null;
+    recRows = rec
+      ? rec.items.map(it => ({ description: it.description, qty: it.qty, unitPrice: it.unitPrice }))
+      : [{ description: '', qty: 1, unitPrice: '' }];
+    recDraft = {
+      clientId: rec ? rec.clientId || '' : '',
+      token: rec ? rec.token : p.token,
+      note: rec ? rec.note : '',
+      everyN: rec ? rec.everyN : 1,
+      unit: rec ? rec.unit : 'months',
+      next: rec ? dateInputVal(rec.nextDate) : dateInputVal(nextRecurrence(Date.now(), 1, 'months')),
+      taxPct: rec ? (rec.taxPct ?? '') : (p.taxPct ?? ''),
+      discPct: rec ? (rec.discountPct ?? '') : '',
+      active: rec ? rec.active !== false : true,
+    };
+  }
+
+  function recFormHtml() {
+    const clients = loadClients();
+    const catalog = loadItems();
+    const d = recDraft;
+    return '<h3>' + (recEditId ? 'EDIT TEMPLATE' : 'NEW RECURRING TEMPLATE') + '</h3>'
+      + '<div class="gpinv-box">'
+      + '<div class="gpinv-lbl">CLIENT</div>'
+      + '<select id="gpinv-r-client" style="margin-top:4px"><option value="">no client</option>'
+      + clients.map(c => '<option value="' + escHtml(c.id) + '"' + (d.clientId === c.id ? ' selected' : '') + '>' + escHtml(c.name) + '</option>').join('')
+      + '</select>'
+      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS</div>'
+      + rowsTableHtml(recRows, d.token, catalog, 'r')
+      + '<div class="gpinv-grid" style="margin-top:14px">'
+      + '<div><div class="gpinv-lbl">DISCOUNT % (OPTIONAL)</div><input id="gpinv-r-disc" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.discPct) + '"></div>'
+      + '<div><div class="gpinv-lbl">TAX % (OPTIONAL)</div><input id="gpinv-r-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + escHtml(d.taxPct) + '"></div>'
+      + '</div>'
+      + totalsBlockHtml('r', computeTotals(recRows, d.taxPct, d.discPct), d.token)
+      + '<div class="gpinv-lbl" style="margin-top:14px">TOKEN</div>'
+      + '<select id="gpinv-r-token" style="margin-top:4px">'
+      + ['USDC', 'ETH'].map(t => '<option' + (d.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
+      + '</select>'
+      + '<div class="gpinv-grid" style="margin-top:8px">'
+      + '<div><div class="gpinv-lbl">REPEAT EVERY</div><input id="gpinv-r-everyn" style="margin-top:4px" type="number" min="1" step="1" value="' + escHtml(d.everyN) + '"></div>'
+      + '<div><div class="gpinv-lbl">UNIT</div><select id="gpinv-r-unit" style="margin-top:4px">'
+      + ['weeks', 'months'].map(u => '<option' + (d.unit === u ? ' selected' : '') + '>' + u + '</option>').join('')
+      + '</select></div>'
+      + '</div>'
+      + '<div class="gpinv-lbl" style="margin-top:12px">NEXT RUN DATE</div>'
+      + '<input id="gpinv-r-next" style="margin-top:4px" type="date" value="' + escHtml(d.next) + '">'
+      + '<input id="gpinv-r-note" placeholder="note (optional: prefills the payer\'s encrypted memo)" value="' + escHtml(d.note) + '">'
+      + '<label style="display:block;font-size:12px;margin-top:12px;cursor:pointer"><input type="checkbox" id="gpinv-r-active" style="width:auto;margin-right:6px"' + (d.active ? ' checked' : '') + '>active (inactive templates never come due)</label>'
+      + '<div class="gpinv-actions gpinv-sticky">'
+      + '<button data-iact="rec-save">' + (recEditId ? 'SAVE TEMPLATE' : 'CREATE TEMPLATE') + '</button>'
+      + '<button class="ghost" data-iact="rec-new">CANCEL</button>'
+      + '</div>'
+      + '<div class="status" id="gpinv-r-st"></div>'
+      + '</div>';
+  }
+
+  function syncRecFromDom() {
+    const rows = readRows('r');
+    if (rows) recRows = rows;
+    const m = { 'gpinv-r-client': 'clientId', 'gpinv-r-token': 'token', 'gpinv-r-note': 'note', 'gpinv-r-everyn': 'everyN', 'gpinv-r-unit': 'unit', 'gpinv-r-next': 'next', 'gpinv-r-tax': 'taxPct', 'gpinv-r-disc': 'discPct' };
+    for (const [id, k] of Object.entries(m)) {
+      const el = $(id);
+      if (el) recDraft[k] = el.value;
+    }
+    const act = $('gpinv-r-active');
+    if (act) recDraft.active = act.checked;
+  }
+
+  function recDetailHtml(r) {
+    const t = computeTotals(r.items, r.taxPct, r.discountPct);
+    const itemRows = r.items.map(it =>
+      '<tr><td>' + escHtml(it.description || 'item') + '</td>'
+      + '<td>' + escHtml(it.qty) + '</td>'
+      + '<td>' + fmtAmt(it.unitPrice, r.token) + '</td>'
+      + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), r.token) + '</td></tr>'
+    ).join('');
+    const due = r.active && r.nextDate <= Date.now();
+    return '<div class="gpinv-muted" style="font-size:12px">'
+      + 'every ' + r.everyN + ' ' + r.unit + ' · next run ' + fmtDate(r.nextDate) + (due ? ' · due now' : '')
+      + '</div>'
+      + '<div class="gpinv-tablewrap" style="margin-top:12px"><table><thead><tr>'
+      + '<th style="width:46%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th style="text-align:right">AMOUNT</th>'
+      + '</tr></thead><tbody>' + itemRows + '</tbody></table></div>'
+      + '<div style="margin-top:10px;text-align:right;font-size:12px">'
+      + (t.discountPct ? '<div>discount ' + t.discountPct + '% · −' + fmtAmt(t.discountAmount, r.token) + ' ' + r.token + '</div>' : '')
+      + (t.taxPct ? '<div>tax ' + t.taxPct + '% · ' + fmtAmt(t.taxAmount, r.token) + ' ' + r.token + '</div>' : '')
+      + '<div style="font-size:16px;margin-top:2px"><b>' + fmtAmt(t.total, r.token) + ' ' + r.token + '</b> per run</div>'
+      + '</div>'
+      + (r.note ? '<div class="status">note: ' + escHtml(r.note) + '</div>' : '')
+      + '<div class="gpinv-actions">'
+      + (due ? '<button data-iact="rec-gen" data-id="' + escHtml(r.id) + '">GENERATE NOW</button>' : '')
+      + '<button class="ghost" data-iact="rec-edit" data-id="' + escHtml(r.id) + '">EDIT</button>'
+      + '<button class="ghost" data-iact="rec-toggle" data-id="' + escHtml(r.id) + '">' + (r.active ? 'PAUSE' : 'RESUME') + '</button>'
+      + '<button class="ghost" data-iact="rec-del" data-id="' + escHtml(r.id) + '">DELETE</button>'
+      + '</div>';
+  }
+
+  function renderRecurring() {
+    const el = mounts.recurring;
+    if (!el) return;
+    const list = loadRecurring();
+    const now = Date.now();
+    el.innerHTML =
+      '<div class="gpinv-actions" style="margin-top:0">'
+      + '<button data-iact="rec-new">' + (recFormOpen ? 'CANCEL' : 'NEW TEMPLATE') + '</button>'
+      + '</div>'
+      + (recFormOpen ? recFormHtml() : '')
+      + '<h3>RECURRING TEMPLATES</h3>'
+      + (list.length
+        ? '<div class="gpinv-tablewrap"><table><thead><tr>'
+          + '<th>CLIENT</th><th>FREQUENCY</th><th>NEXT RUN</th><th style="text-align:right">TOTAL / RUN</th><th style="text-align:right">STATUS</th>'
+          + '</tr></thead><tbody>'
+          + list.map(r => {
+              const t = computeTotals(r.items, r.taxPct, r.discountPct);
+              const due = r.active && r.nextDate <= now;
+              return '<tr class="gpinv-rowbtn" data-iact="rec-open" data-id="' + escHtml(r.id) + '">'
+                + '<td><b>' + (r.clientName ? escHtml(r.clientName) : '<span class="gpinv-muted">no client</span>') + '</b>'
+                + '<div class="gpinv-muted" style="font-size:10px">' + r.items.length + ' line item' + (r.items.length === 1 ? '' : 's') + '</div></td>'
+                + '<td style="white-space:nowrap">every ' + r.everyN + ' ' + r.unit + '</td>'
+                + '<td style="white-space:nowrap">' + fmtDate(r.nextDate) + (due ? ' ' + pill('DUE') : '') + '</td>'
+                + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(t.total, r.token) + ' ' + r.token + '</td>'
+                + '<td style="text-align:right">' + pill(r.active ? 'ACTIVE' : 'PAUSED') + '</td></tr>'
+                + (recOpen === r.id ? '<tr class="gpinv-detail"><td colspan="5">' + recDetailHtml(r) + '</td></tr>' : '');
+            }).join('')
+          + '</tbody></table></div>'
+        : '<div class="gpinv-empty">no recurring templates yet: press NEW TEMPLATE to bill a client on a schedule. when a run comes due, GENERATE NOW creates the invoice and moves the next date forward.</div>');
+    afterRender(el);
+  }
+
+  // ── tab: SETTINGS (profile, numbering, ENS, CSV) ──
+  function renderSettings() {
+    const el = mounts.settings;
+    if (!el) return;
+    const p = loadProfile();
+    const accent = p.accentColor || '#fff';
+    el.innerHTML =
       '<div style="display:flex;gap:16px;align-items:center;margin-bottom:6px">'
-      + '<div class="gpinv-mg">' + escHtml(monogram(p.name)) + '</div>'
+      + '<div class="gpinv-mg" style="border-color:' + escHtml(accent) + '">' + escHtml(monogram(p.name)) + '</div>'
       + '<div><div style="font-weight:700">' + (p.name ? escHtml(p.name) : 'your business') + '</div>'
-      + '<div class="gpinv-muted" style="font-size:11px">' + (p.contact ? escHtml(p.contact) : 'this profile stamps every invoice and receipt.') + '</div></div>'
+      + '<div class="gpinv-muted" style="font-size:11px">' + (p.contact ? escHtml(p.contact) : 'this profile stamps every invoice, estimate and receipt.') + '</div></div>'
       + '</div>'
       + '<h3>BUSINESS PROFILE</h3>'
       + '<div class="gpinv-box">'
       + '<div class="gpinv-lbl">BUSINESS NAME</div><input id="gpinv-p-name" style="margin-top:4px" value="' + escHtml(p.name) + '" placeholder="e.g. Ghost Studio">'
       + '<div class="gpinv-lbl" style="margin-top:12px">FROM / CONTACT LINE</div><input id="gpinv-p-contact" style="margin-top:4px" value="' + escHtml(p.contact) + '" placeholder="e.g. ben@ghoststudio.eth">'
+      + '<div class="gpinv-lbl" style="margin-top:12px">ADDRESS LINES (ONE PER LINE: PRINTED ON DOCUMENTS)</div>'
+      + '<textarea id="gpinv-p-addr" rows="3" style="margin-top:4px" placeholder="1 Ghost Lane&#10;Berlin">' + escHtml(p.addressLines.join('\n')) + '</textarea>'
       + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT TOKEN</div><select id="gpinv-p-token" style="margin-top:4px">'
       + ['USDC', 'ETH'].map(t => '<option' + (p.token === t ? ' selected' : '') + '>' + t + '</option>').join('') + '</select>'
-      + '<div class="gpinv-grid" style="margin-top:12px">'
+      + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT PAYMENT TERMS</div><input id="gpinv-p-terms" style="margin-top:4px" value="' + escHtml(p.terms) + '" placeholder="payment due on receipt">'
+      + '<div class="gpinv-lbl" style="margin-top:12px">TAX % (OPTIONAL: SHOWN AS ITS OWN LINE)</div><input id="gpinv-p-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + (p.taxPct ?? '') + '" placeholder="e.g. 20">'
+      + '<div class="gpinv-lbl" style="margin-top:12px">ACCENT COLOR (OPTIONAL HEX: STAMPS PRINTED DOCUMENTS)</div><input id="gpinv-p-accent" style="margin-top:4px" value="' + escHtml(p.accentColor || '') + '" placeholder="#fff · blank = plain black and white">'
+      + '<div class="gpinv-lbl" style="margin-top:12px">FOOTER NOTE (PRINTED AT THE BOTTOM OF EVERY DOCUMENT)</div><input id="gpinv-p-footer" style="margin-top:4px" value="' + escHtml(p.footerNote) + '" placeholder="e.g. thank you for your business">'
+      + '<button data-iact="save-profile" style="margin-top:14px">SAVE PROFILE</button>'
+      + '<div class="status" id="gpinv-p-st"></div>'
+      + '</div>'
+      + '<h3>NUMBERING</h3>'
+      + '<div class="gpinv-box"><div class="gpinv-grid">'
       + '<div><div class="gpinv-lbl">NUMBER PREFIX</div><input id="gpinv-p-prefix" style="margin-top:4px" value="' + escHtml(p.prefix) + '" placeholder="GP-"></div>'
       + '<div><div class="gpinv-lbl">NEXT NUMBER</div><input id="gpinv-p-next" style="margin-top:4px" type="number" min="1" value="' + escHtml(p.next) + '"></div>'
       + '</div>'
-      + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT PAYMENT TERMS</div><input id="gpinv-p-terms" style="margin-top:4px" value="' + escHtml(p.terms) + '" placeholder="payment due on receipt">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">TAX % (OPTIONAL: SHOWN AS ITS OWN LINE)</div><input id="gpinv-p-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + (p.taxPct ?? '') + '" placeholder="e.g. 20">'
-      + '<button data-act="save-profile" style="margin-top:14px">SAVE PROFILE</button>'
-      + '<div class="status" id="gpinv-p-st"></div>'
-      + '</div>'
+      + '<div class="status">numbers allocate as prefix + zero-padded counter (GP-0001, GP-0002, …). invoices and estimates share the sequence.</div>'
+      + '<button data-iact="save-profile" style="margin-top:14px">SAVE NUMBERING</button></div>'
       + '<h3>PUBLISH TO ENS</h3>'
       + '<div class="gpinv-box">'
       + '<div class="status" style="margin-top:0">writes a "stealth" text record on your ENS name so senders can resolve it to your stealth meta-address. the meta-address is public by design: anyone can derive fresh payment addresses from it, nobody can spend from it.</div>'
       + '<input id="gpinv-ensname" placeholder="yourname.eth">'
       + '<input id="gpinv-ensresolver" value="' + ENS_PUBLIC_RESOLVER + '" placeholder="resolver address">'
-      + '<button class="ghost" data-act="ens" style="margin-top:12px">PUBLISH TO ENS</button>'
+      + '<button class="ghost" data-iact="ens" style="margin-top:12px">PUBLISH TO ENS</button>'
       + '<div class="status" id="gpinv-ens-st"></div>'
       + '<div class="status">rather click through: <a id="gpinv-enslink" href="https://app.ens.domains" target="_blank" rel="noopener">open app.ens.domains</a> and set the "stealth" text record manually.</div>'
+      + '</div>'
+      + '<h3>EXPORT</h3>'
+      + '<div class="gpinv-box">'
+      + '<div class="status" style="margin-top:0">downloads every payment detected this session plus every invoice and estimate as one CSV: dates, amounts, usd values, statuses.</div>'
+      + '<button class="ghost" data-iact="export-csv" style="margin-top:12px">EXPORT CSV</button>'
       + '</div>';
   }
 
-  function render() {
-    root.querySelectorAll('.gpinv-tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-    if (tab === 'overview') renderOverview();
-    else if (tab === 'invoices') renderInvoices();
-    else if (tab === 'clients') renderClients();
-    else renderProfile();
-    fillUsd();
+  // ── render dispatch ──
+  function renderAll() {
+    renderInvoices();
+    renderEstimates();
+    renderCustomers();
+    renderItems();
+    renderRecurring();
+    renderSettings();
+  }
+
+  // per-render tail: USD placeholders + any open QR canvas
+  function afterRender(scope) {
+    fillUsd(scope);
+    if (qrFor) {
+      const rec = findRec(qrFor);
+      const cv = scope.querySelector('canvas[data-qr]');
+      if (rec && cv) drawQr(cv, rec.url).catch(() => GP.toast('QR failed: content too long'));
+    }
   }
 
   // fills every [data-usd] placeholder once a price is available
-  function fillUsd() {
-    const els = [...view.querySelectorAll('[data-usd]')];
+  function fillUsd(scope) {
+    const els = [...scope.querySelectorAll('[data-usd]')];
     if (!els.length) return;
     const paint = px => els.forEach(el => {
       const u = fmtUsd(el.dataset.amt, el.dataset.token, px);
-      if (u && el.isConnected) el.textContent = '≈ ' + u + ' usd';
+      if (u && el.isConnected) el.textContent = '≈ ' + u;
     });
     paint(GP.state.ethPriceUsd);
     ethUsd().then(paint);
   }
 
-  // ── actions (one delegated handler) ──
-  root.addEventListener('click', e => {
-    const el = e.target.closest('[data-act]');
-    if (!el || !root.contains(el)) return;
-    const act = el.dataset.act, id = el.dataset.id;
-    const inv = id != null ? loadInv() : null;
-    const rec = id != null ? inv.find(x => x.id === id) : null;
+  // ── persistence ──
+  function saveForm() {
+    const kind = formKind;
+    const st = m => { const el = $('gpinv-f-st'); if (el) el.textContent = m; };
+    if (!GP.state.unlocked || !GP.state.meta) { st('generate your stealth keys first (step 2).'); return; }
+    syncFormFromDom();
+    const rows = formRows.filter(r => (parseFloat(r.qty) || 0) > 0 && (parseFloat(r.unitPrice) || 0) > 0);
+    if (!rows.length) { st('add at least one line item with qty and unit price.'); return; }
+    const token = formDraft.token === 'ETH' ? 'ETH' : 'USDC';
+    const note = (formDraft.note || '').trim();
+    const days = parseFloat(formDraft.expDays);
+    const clientId = formDraft.clientId || null;
+    const client = clientId ? loadClients().find(c => c.id === clientId) : null;
+    const items = rows.map(r => ({ description: (r.description || '').trim() || 'item', qty: parseFloat(r.qty), unitPrice: parseFloat(r.unitPrice) }));
+    const t = computeTotals(items, formDraft.taxPct, formDraft.discPct);
+    const expiry = Number.isFinite(days) && days > 0 ? Date.now() + Math.round(days * 86400000) : null;
+    const reg = kind === 'estimate' ? loadEst() : loadInv();
+    const save = kind === 'estimate' ? saveEst : saveInv;
 
-    if (act === 'tab') { tab = el.dataset.tab; render(); return; }
-    if (act === 'toggle-form') { showForm = !showForm; render(); return; }
-    if (act === 'add-row') { formRows = readForm(); formRows.push({ description: '', qty: 1, unitPrice: '' }); render(); return; }
-    if (act === 'del-row') {
-      formRows = readForm();
-      formRows.splice(Number(el.dataset.row), 1);
-      if (!formRows.length) formRows.push({ description: '', qty: 1, unitPrice: '' });
-      render();
-      return;
-    }
-    if (act === 'open') { openInv = openInv === id ? null : id; if (qrFor !== openInv) qrFor = null; render(); return; }
-    if (act === 'qr') { openInv = id; qrFor = qrFor === id ? null : id; render(); return; }
-    if (act === 'copy' && rec) { copyBtn(rec.url, el, 'COPY LINK'); return; }
-    if (act === 'view' && rec) { window.open(rec.url, '_blank', 'noopener'); return; }
-    if (act === 'print' && rec) { printInvoice(rec); return; }
-    if (act === 'sent' && rec && invStatus(rec) === 'DRAFT') {
-      rec.status = 'SENT'; rec.sentAt = Date.now();
-      saveInv(inv); render();
-      GP.toast(rec.number + ' marked sent');
-      return;
-    }
-    if (act === 'dup' && rec) { duplicateInvoice(rec); return; }
-    if (act === 'del' && rec) {
-      saveInv(inv.filter(x => x.id !== id));
-      if (openInv === id) { openInv = null; qrFor = null; }
-      render();
-      return;
-    }
-    if (act === 'create') { createInvoice(); return; }
-    if (act === 'add-client') {
-      const name = $('gpinv-c-name').value.trim();
-      if (!name) { $('gpinv-c-st').textContent = 'enter a name.'; return; }
-      const clients = loadClients();
-      clients.push({ id: 'cl-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36), name, contact: $('gpinv-c-contact').value.trim(), notes: $('gpinv-c-notes').value.trim(), created: Date.now() });
-      saveClients(clients); render();
-      GP.toast('client added: ' + name);
-      return;
-    }
-    if (act === 'del-client') {
-      saveClients(loadClients().filter(c => c.id !== id));
-      render();
-      return;
-    }
-    if (act === 'save-profile') {
-      const p = loadProfile();
-      p.name = $('gpinv-p-name').value.trim();
-      p.contact = $('gpinv-p-contact').value.trim();
-      p.token = $('gpinv-p-token').value === 'ETH' ? 'ETH' : 'USDC';
-      p.prefix = $('gpinv-p-prefix').value.trim() || 'GP-';
-      p.next = Math.max(1, Math.floor(parseFloat($('gpinv-p-next').value) || 1));
-      p.terms = $('gpinv-p-terms').value.trim() || DEFAULT_PROFILE.terms;
-      const tax = parseFloat($('gpinv-p-tax').value);
-      p.taxPct = Number.isFinite(tax) && tax > 0 ? tax : null;
-      saveProfile(p); render();
-      GP.toast('profile saved');
-      return;
-    }
-    if (act === 'export-csv') { exportCsv(); return; }
-    if (act === 'recv-qr') {
-      const recv = GP.state.recv;
-      if (!recv) { GP.toast('generate your stealth keys first (step 2)'); return; }
-      showQr(recv.stealth, 'your current one-time receiving address');
-      return;
-    }
-    if (act === 'ens') { publishEns(); return; }
-  });
-
-  // live totals in the new-invoice form + ENS link preview
-  root.addEventListener('input', e => {
-    if (e.target.closest('#gpinv-f-items') || e.target.id === 'gpinv-f-token') refreshFormTotals();
-    if (e.target.id === 'gpinv-ensname') {
-      const n = e.target.value.trim().toLowerCase();
-      const link = $('gpinv-enslink');
-      if (link) {
-        link.href = n ? 'https://app.ens.domains/' + encodeURIComponent(n) : 'https://app.ens.domains';
-        link.textContent = n ? 'open ' + n + ' in app.ens.domains' : 'open app.ens.domains';
+    if (editId) {
+      const rec = reg.find(x => x.id === editId);
+      if (!rec) { st('record not found.'); return; }
+      Object.assign(rec, {
+        clientId, clientName: client ? client.name : '', items, token,
+        subtotal: t.subtotal, taxPct: t.taxPct, taxAmount: t.taxAmount,
+        discountPct: t.discountPct, discountAmount: t.discountAmount, total: t.total,
+        note, expiry,
+      });
+      const pin = parsePinned(rec.url);
+      if (pin.st && pin.eph && pin.vt !== null) {
+        rec.url = buildUrl({ amount: fmtAmt(t.total, token), token, note, id: rec.id, number: rec.number, expiry, st: pin.st, eph: pin.eph, vt: pin.vt });
       }
+      save(reg);
+      GP.toast(kind + ' ' + rec.number + ' updated (same pinned stealth address)');
+    } else {
+      const profile = loadProfile();
+      const a = allocateNumber(profile);
+      profile.next = a.next;
+      saveProfile(profile);
+      const d = C.derive(GP.state.meta.slice(7));
+      const id = (kind === 'estimate' ? 'est-' : 'inv-') + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36);
+      const url = buildUrl({ amount: fmtAmt(t.total, token), token, note, id, number: a.number, expiry, st: d.stealth, eph: d.ephPub, vt: d.viewTag });
+      reg.push({
+        v: 3, id, number: a.number,
+        clientId, clientName: client ? client.name : '',
+        items, token,
+        subtotal: t.subtotal, taxPct: t.taxPct, taxAmount: t.taxAmount,
+        discountPct: t.discountPct, discountAmount: t.discountAmount, total: t.total,
+        note, stealthAddress: d.stealth, created: Date.now(), url, expiry,
+        status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null, paidAmount: null,
+        estimateOf: null, kind,
+      });
+      save(reg);
+      openId = id; qrFor = id;
+      GP.toast(kind + ' ' + a.number + ' created: one fresh stealth address, link is self-contained');
     }
-  });
-  root.addEventListener('change', e => {
-    if (e.target.id === 'gpinv-f-token') refreshFormTotals();
-  });
-
-  function showQr(text, caption) {
-    drawQr($('gpinv-qr'), text).then(
-      () => { $('gpinv-qr-cap').textContent = caption; $('gpinv-qrwrap').style.display = 'block'; },
-      () => GP.toast('QR failed: content too long')
-    );
+    showForm = false;
+    editId = null;
+    renderAll();
   }
 
-  // create: same link shape as before (self-contained hash params, pinned one-time
-  // stealth address), now with number, client, itemized total and DRAFT status.
-  function createInvoice() {
-    const st = m => { $('gpinv-f-st').textContent = m; };
-    if (!GP.state.unlocked || !GP.state.meta) { st('generate your stealth keys first (step 2).'); return; }
-    const rows = readForm().filter(r => (parseFloat(r.qty) || 0) > 0 && (parseFloat(r.unitPrice) || 0) > 0);
-    if (!rows.length) { st('add at least one line item with qty and unit price.'); return; }
-    const token = $('gpinv-f-token').value;
-    const note = $('gpinv-f-note').value.trim();
-    const days = parseFloat($('gpinv-f-exp').value);
-    const clientId = $('gpinv-f-client').value || null;
-    const client = clientId ? loadClients().find(c => c.id === clientId) : null;
-    const t = computeTotals(rows, loadProfile().taxPct);
+  function duplicateRecord(rec) {
+    if (!GP.state.unlocked || !GP.state.meta) { GP.toast('generate your stealth keys first (step 2)'); return; }
+    const kind = rec.kind === 'estimate' ? 'estimate' : 'invoice';
     const profile = loadProfile();
     const a = allocateNumber(profile);
     profile.next = a.next;
     saveProfile(profile);
     const d = C.derive(GP.state.meta.slice(7));
-    const id = 'inv-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36);
-    const expiry = Number.isFinite(days) && days > 0 ? Date.now() + Math.round(days * 86400000) : null;
-    const items = rows.map(r => ({ description: r.description || 'item', qty: parseFloat(r.qty), unitPrice: parseFloat(r.unitPrice) }));
-    const amount = fmtAmt(t.total, token);
-    // links point at the homepage: the payer lands on the pay panel, not the app
-    const url = location.origin + '/#' + GP.state.meta
-      + '?pay=' + encodeURIComponent(amount + ' ' + token + (note ? ' · ' + note : ''))
-      + '&inv=' + id + '&num=' + encodeURIComponent(a.number)
-      + (expiry ? '&exp=' + expiry : '')
-      + '&st=' + d.stealth + '&eph=' + d.ephPub + '&vt=' + d.viewTag;
-    const all = loadInv();
-    all.push({
-      v: 2, id, number: a.number,
-      clientId, clientName: client ? client.name : '',
-      items, token, subtotal: t.subtotal, taxPct: t.taxPct, taxAmount: t.taxAmount, total: t.total,
-      note, stealthAddress: d.stealth, created: Date.now(), url, expiry,
-      status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null,
+    const id = (kind === 'estimate' ? 'est-' : 'inv-') + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36);
+    const url = buildUrl({
+      amount: fmtAmt(rec.total, rec.token), token: rec.token, note: rec.note, id, number: a.number,
+      expiry: rec.expiry && rec.expiry > Date.now() ? rec.expiry : null,
+      st: d.stealth, eph: d.ephPub, vt: d.viewTag,
     });
-    saveInv(all);
-    showForm = false;
-    formRows = [{ description: '', qty: 1, unitPrice: '' }];
-    openInv = id; qrFor = id;
-    render();
-    GP.toast('invoice ' + a.number + ' created: one fresh stealth address, link is self-contained');
+    const reg = kind === 'estimate' ? loadEst() : loadInv();
+    reg.push({
+      ...rec, id, number: a.number,
+      items: rec.items.map(it => ({ ...it })),
+      stealthAddress: d.stealth, created: Date.now(), url,
+      status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null, paidAmount: null, estimateOf: null,
+    });
+    (kind === 'estimate' ? saveEst : saveInv)(reg);
+    openId = id; qrFor = null;
+    if (!mounts.estimates) invKind = kind;
+    renderAll();
+    GP.toast('duplicated as ' + a.number + ' (fresh stealth address)');
   }
 
-  function duplicateInvoice(rec) {
+  function convertEstimate(est) {
     if (!GP.state.unlocked || !GP.state.meta) { GP.toast('generate your stealth keys first (step 2)'); return; }
     const profile = loadProfile();
     const a = allocateNumber(profile);
@@ -717,45 +1050,381 @@ function initSuite() {
     saveProfile(profile);
     const d = C.derive(GP.state.meta.slice(7));
     const id = 'inv-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36);
-    const amount = fmtAmt(rec.total, rec.token);
-    // links point at the homepage: the payer lands on the pay panel, not the app
-    const url = location.origin + '/#' + GP.state.meta
-      + '?pay=' + encodeURIComponent(amount + ' ' + rec.token + (rec.note ? ' · ' + rec.note : ''))
-      + '&inv=' + id + '&num=' + encodeURIComponent(a.number)
-      + (rec.expiry && rec.expiry > Date.now() ? '&exp=' + rec.expiry : '')
-      + '&st=' + d.stealth + '&eph=' + d.ephPub + '&vt=' + d.viewTag;
-    const all = loadInv();
-    all.push({
-      ...rec, id, number: a.number,
-      items: rec.items.map(it => ({ ...it })),
-      stealthAddress: d.stealth, created: Date.now(), url,
-      status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null,
+    const url = buildUrl({ amount: fmtAmt(est.total, est.token), token: est.token, note: est.note, id, number: a.number, expiry: null, st: d.stealth, eph: d.ephPub, vt: d.viewTag });
+    const inv = loadInv();
+    inv.push({
+      v: 3, id, number: a.number,
+      clientId: est.clientId, clientName: est.clientName,
+      items: est.items.map(it => ({ ...it })),
+      token: est.token,
+      subtotal: est.subtotal, taxPct: est.taxPct ?? null, taxAmount: est.taxAmount || 0,
+      discountPct: est.discountPct ?? null, discountAmount: est.discountAmount || 0, total: est.total,
+      note: est.note, stealthAddress: d.stealth, created: Date.now(), url, expiry: null,
+      status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null, paidAmount: null,
+      estimateOf: est.id, kind: 'invoice',
     });
-    saveInv(all);
-    openInv = id; qrFor = null;
-    render();
-    GP.toast('duplicated as ' + a.number + ' (fresh stealth address)');
+    saveInv(inv);
+    const reg = loadEst();
+    const src = reg.find(x => x.id === est.id);
+    if (src && src.status !== 'ACCEPTED') { src.status = 'ACCEPTED'; saveEst(reg); }
+    if (!mounts.estimates) invKind = 'invoice';
+    openId = id; qrFor = null;
+    renderAll();
+    GP.toast('estimate ' + est.number + ' converted to invoice ' + a.number + ' (fresh stealth address)');
   }
 
-  // ── print / pdf: a real invoice document, monochrome, window.print() ──
-  async function printInvoice(i) {
+  function saveRecurringTemplate() {
+    const st = m => { const el = $('gpinv-r-st'); if (el) el.textContent = m; };
+    syncRecFromDom();
+    const rows = recRows.filter(r => (parseFloat(r.qty) || 0) > 0 && (parseFloat(r.unitPrice) || 0) > 0);
+    if (!rows.length) { st('add at least one line item with qty and unit price.'); return; }
+    const clientId = recDraft.clientId || null;
+    const client = clientId ? loadClients().find(c => c.id === clientId) : null;
+    const items = rows.map(r => ({ description: (r.description || '').trim() || 'item', qty: parseFloat(r.qty), unitPrice: parseFloat(r.unitPrice) }));
+    const everyN = Math.max(1, Math.floor(parseFloat(recDraft.everyN) || 1));
+    const unit = recDraft.unit === 'months' ? 'months' : 'weeks';
+    const nextDate = recDraft.next ? new Date(recDraft.next + 'T00:00:00').getTime() : Date.now();
+    if (!Number.isFinite(nextDate)) { st('pick a valid next run date.'); return; }
+    const tax = parseFloat(recDraft.taxPct);
+    const disc = parseFloat(recDraft.discPct);
+    const list = loadRecurring();
+    const fields = {
+      clientId, clientName: client ? client.name : '',
+      items, token: recDraft.token === 'ETH' ? 'ETH' : 'USDC',
+      taxPct: Number.isFinite(tax) && tax > 0 ? tax : null,
+      discountPct: Number.isFinite(disc) && disc > 0 ? disc : null,
+      note: (recDraft.note || '').trim(),
+      everyN, unit, nextDate,
+      active: recDraft.active !== false,
+    };
+    if (recEditId) {
+      const rec = list.find(x => x.id === recEditId);
+      if (!rec) { st('template not found.'); return; }
+      Object.assign(rec, fields);
+      GP.toast('recurring template updated');
+    } else {
+      list.push({ id: 'rec-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36), ...fields });
+      GP.toast('recurring template created');
+    }
+    saveRecurring(list);
+    recFormOpen = false;
+    recEditId = null;
+    renderAll();
+  }
+
+  // GENERATE NOW: one invoice from the template (fresh stealth address, next number),
+  // then nextDate advances by exactly one period.
+  function generateFromTemplate(rec) {
+    if (!GP.state.unlocked || !GP.state.meta) { GP.toast('generate your stealth keys first (step 2)'); return; }
+    const items = rec.items.map(it => ({ ...it }));
+    const t = computeTotals(items, rec.taxPct, rec.discountPct);
+    const profile = loadProfile();
+    const a = allocateNumber(profile);
+    profile.next = a.next;
+    saveProfile(profile);
+    const d = C.derive(GP.state.meta.slice(7));
+    const id = 'inv-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36);
+    const url = buildUrl({ amount: fmtAmt(t.total, rec.token), token: rec.token, note: rec.note, id, number: a.number, expiry: null, st: d.stealth, eph: d.ephPub, vt: d.viewTag });
+    const inv = loadInv();
+    inv.push({
+      v: 3, id, number: a.number,
+      clientId: rec.clientId, clientName: rec.clientName,
+      items, token: rec.token,
+      subtotal: t.subtotal, taxPct: t.taxPct, taxAmount: t.taxAmount,
+      discountPct: t.discountPct, discountAmount: t.discountAmount, total: t.total,
+      note: rec.note || '', stealthAddress: d.stealth, created: Date.now(), url, expiry: null,
+      status: 'DRAFT', sentAt: null, paidAt: null, paidTx: null, paidAmount: null,
+      estimateOf: null, kind: 'invoice',
+    });
+    saveInv(inv);
+    const list = loadRecurring();
+    const tpl = list.find(x => x.id === rec.id);
+    if (tpl) {
+      tpl.nextDate = nextRecurrence(tpl.nextDate, tpl.everyN, tpl.unit);
+      saveRecurring(list);
+      recOpen = tpl.id;
+    }
+    renderAll();
+    GP.toast('invoice ' + a.number + ' generated as a draft · next run ' + (tpl ? fmtDate(tpl.nextDate) : 'advanced'));
+  }
+
+  // ── actions (one delegated handler; data-iact is ours, the shell owns data-act) ──
+  document.addEventListener('click', e => {
+    const el = e.target.closest('[data-iact]');
+    if (!el || !el.closest('#gp-invoices')) return;
+    const act = el.dataset.iact, id = el.dataset.id;
+    const invAll = id != null ? loadInv() : null;
+    const estAll = id != null ? loadEst() : null;
+    const rec = id != null ? (invAll.find(x => x.id === id) || estAll.find(x => x.id === id) || null) : null;
+    const persistDocs = () => { saveInv(invAll); saveEst(estAll); };
+
+    if (act === 'kind') { invKind = el.dataset.k === 'estimate' ? 'estimate' : 'invoice'; renderInvoices(); return; }
+    if (act === 'filter') {
+      if (el.dataset.k === 'estimate') estFilter = el.dataset.f; else invFilter = el.dataset.f;
+      renderAll();
+      return;
+    }
+    if (act === 'toggle-form') {
+      const k = el.dataset.k || formKind;
+      if (showForm && formKind === k) { showForm = false; editId = null; }
+      else startForm(k, null);
+      if (!mounts.estimates) invKind = formKind;
+      renderAll();
+      return;
+    }
+    if (act === 'save-form') { saveForm(); return; }
+    if (act === 'f-add-row') { syncFormFromDom(); formRows.push({ description: '', qty: 1, unitPrice: '' }); renderAll(); return; }
+    if (act === 'f-del-row') {
+      syncFormFromDom();
+      formRows.splice(Number(el.dataset.row), 1);
+      if (!formRows.length) formRows.push({ description: '', qty: 1, unitPrice: '' });
+      renderAll();
+      return;
+    }
+    if (act === 'r-add-row') { syncRecFromDom(); recRows.push({ description: '', qty: 1, unitPrice: '' }); renderAll(); return; }
+    if (act === 'r-del-row') {
+      syncRecFromDom();
+      recRows.splice(Number(el.dataset.row), 1);
+      if (!recRows.length) recRows.push({ description: '', qty: 1, unitPrice: '' });
+      renderAll();
+      return;
+    }
+    if (act === 'open') { openId = openId === id ? null : id; if (qrFor !== openId) qrFor = null; renderAll(); return; }
+    if (act === 'qr') { openId = id; qrFor = qrFor === id ? null : id; renderAll(); return; }
+    if (act === 'copy' && rec) { copyBtn(rec.url, el, 'COPY LINK'); return; }
+    if (act === 'view' && rec) { window.open(rec.url, '_blank', 'noopener'); return; }
+    if (act === 'print' && rec) { printInvoice(rec); return; }
+    if (act === 'edit' && rec && invStatus(rec) === 'DRAFT') {
+      startForm(rec.kind === 'estimate' ? 'estimate' : 'invoice', rec);
+      if (!mounts.estimates) invKind = formKind;
+      renderAll();
+      return;
+    }
+    if (act === 'sent' && rec && invStatus(rec) === 'DRAFT') {
+      rec.status = 'SENT'; rec.sentAt = Date.now();
+      persistDocs(); renderAll();
+      GP.toast(rec.number + ' marked sent');
+      return;
+    }
+    if (act === 'accept' && rec && rec.kind === 'estimate' && invStatus(rec) === 'SENT') {
+      rec.status = 'ACCEPTED';
+      persistDocs(); renderAll();
+      GP.toast('estimate ' + rec.number + ' accepted');
+      return;
+    }
+    if (act === 'decline' && rec && rec.kind === 'estimate' && invStatus(rec) === 'SENT') {
+      rec.status = 'DECLINED';
+      persistDocs(); renderAll();
+      GP.toast('estimate ' + rec.number + ' declined');
+      return;
+    }
+    if (act === 'convert' && rec && rec.kind === 'estimate') { convertEstimate(rec); return; }
+    if (act === 'dup' && rec) { duplicateRecord(rec); return; }
+    if (act === 'del' && rec && invStatus(rec) === 'DRAFT') {
+      saveInv(invAll.filter(x => x.id !== id));
+      saveEst(estAll.filter(x => x.id !== id));
+      if (openId === id) { openId = null; qrFor = null; }
+      renderAll();
+      GP.toast(rec.number + ' deleted');
+      return;
+    }
+    if (act === 'add-client') {
+      const name = $('gpinv-c-name').value.trim();
+      if (!name) { $('gpinv-c-st').textContent = 'enter a name.'; return; }
+      const clients = loadClients();
+      clients.push({ id: 'cl-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36), name, contact: $('gpinv-c-contact').value.trim(), notes: $('gpinv-c-notes').value.trim(), created: Date.now() });
+      saveClients(clients); renderAll();
+      GP.toast('customer added: ' + name);
+      return;
+    }
+    if (act === 'del-client') {
+      saveClients(loadClients().filter(c => c.id !== id));
+      renderAll();
+      return;
+    }
+    if (act === 'save-item') {
+      const stEl = $('gpinv-i-st');
+      const name = ($('gpinv-i-name').value || '').trim();
+      const price = parseFloat($('gpinv-i-price').value);
+      if (!name) { stEl.textContent = 'enter an item name.'; return; }
+      if (!Number.isFinite(price) || price <= 0) { stEl.textContent = 'enter a unit price above zero.'; return; }
+      const items = loadItems();
+      const fields = { name, description: ($('gpinv-i-desc').value || '').trim(), unitPrice: price, token: $('gpinv-i-token').value === 'ETH' ? 'ETH' : 'USDC' };
+      if (itemEditId) {
+        const it = items.find(x => x.id === itemEditId);
+        if (it) Object.assign(it, fields);
+        GP.toast('item updated: ' + name);
+      } else {
+        items.push({ id: 'it-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 46656).toString(36), ...fields });
+        GP.toast('item added: ' + name);
+      }
+      saveItems(items);
+      itemEditId = null;
+      itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token };
+      renderAll();
+      return;
+    }
+    if (act === 'edit-item') {
+      const it = loadItems().find(x => x.id === id);
+      if (it) { itemEditId = it.id; itemDraft = { name: it.name, description: it.description || '', unitPrice: it.unitPrice, token: it.token }; }
+      renderAll();
+      return;
+    }
+    if (act === 'cancel-item') {
+      itemEditId = null;
+      itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token };
+      renderAll();
+      return;
+    }
+    if (act === 'del-item') {
+      saveItems(loadItems().filter(x => x.id !== id));
+      if (itemEditId === id) { itemEditId = null; itemDraft = { name: '', description: '', unitPrice: '', token: loadProfile().token }; }
+      renderAll();
+      return;
+    }
+    if (act === 'rec-new') {
+      if (recFormOpen) { recFormOpen = false; recEditId = null; }
+      else startRecForm(null);
+      renderAll();
+      return;
+    }
+    if (act === 'rec-save') { saveRecurringTemplate(); return; }
+    if (act === 'rec-open') { recOpen = recOpen === id ? null : id; renderAll(); return; }
+    if (act === 'rec-edit') {
+      const tpl = loadRecurring().find(x => x.id === id);
+      if (tpl) startRecForm(tpl);
+      renderAll();
+      return;
+    }
+    if (act === 'rec-toggle') {
+      const list = loadRecurring();
+      const tpl = list.find(x => x.id === id);
+      if (tpl) { tpl.active = !tpl.active; saveRecurring(list); GP.toast(tpl.active ? 'template resumed' : 'template paused'); }
+      renderAll();
+      return;
+    }
+    if (act === 'rec-del') {
+      saveRecurring(loadRecurring().filter(x => x.id !== id));
+      if (recOpen === id) recOpen = null;
+      if (recEditId === id) { recFormOpen = false; recEditId = null; }
+      renderAll();
+      return;
+    }
+    if (act === 'rec-gen') {
+      const tpl = loadRecurring().find(x => x.id === id);
+      if (tpl) generateFromTemplate(tpl);
+      return;
+    }
+    if (act === 'save-profile') {
+      const stEl = $('gpinv-p-st');
+      const p = loadProfile();
+      p.name = $('gpinv-p-name').value.trim();
+      p.contact = $('gpinv-p-contact').value.trim();
+      p.addressLines = $('gpinv-p-addr').value.split('\n').map(s => s.trim()).filter(Boolean);
+      p.token = $('gpinv-p-token').value === 'ETH' ? 'ETH' : 'USDC';
+      p.prefix = $('gpinv-p-prefix').value.trim() || 'GP-';
+      p.next = Math.max(1, Math.floor(parseFloat($('gpinv-p-next').value) || 1));
+      p.terms = $('gpinv-p-terms').value.trim() || DEFAULT_PROFILE.terms;
+      const tax = parseFloat($('gpinv-p-tax').value);
+      p.taxPct = Number.isFinite(tax) && tax > 0 ? tax : null;
+      const accent = $('gpinv-p-accent').value.trim();
+      if (accent && !/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(accent)) { stEl.textContent = 'accent color must be a hex value like #ffcc00 (or blank).'; return; }
+      p.accentColor = accent || null;
+      p.footerNote = $('gpinv-p-footer').value.trim();
+      saveProfile(p); renderAll();
+      GP.toast('profile saved');
+      return;
+    }
+    if (act === 'export-csv') { exportCsv(); return; }
+    if (act === 'ens') { publishEns(); return; }
+  });
+
+  // live totals + form drafts: typing syncs state so re-renders never lose input
+  document.addEventListener('input', e => {
+    const t = e.target;
+    if (!t.closest || !t.closest('#gp-invoices')) return;
+    if (t.closest('#gpinv-f-items') || ['gpinv-f-client', 'gpinv-f-token', 'gpinv-f-note', 'gpinv-f-exp', 'gpinv-f-tax', 'gpinv-f-disc'].includes(t.id)) {
+      syncFormFromDom();
+      paintTotals('f', formRows, formDraft.token, formDraft.taxPct, formDraft.discPct);
+    }
+    if (t.closest('#gpinv-r-items') || ['gpinv-r-client', 'gpinv-r-token', 'gpinv-r-note', 'gpinv-r-everyn', 'gpinv-r-unit', 'gpinv-r-next', 'gpinv-r-tax', 'gpinv-r-disc'].includes(t.id)) {
+      syncRecFromDom();
+      paintTotals('r', recRows, recDraft.token, recDraft.taxPct, recDraft.discPct);
+    }
+    if (['gpinv-i-name', 'gpinv-i-desc', 'gpinv-i-price', 'gpinv-i-token'].includes(t.id)) {
+      itemDraft = { name: $('gpinv-i-name').value, description: $('gpinv-i-desc').value, unitPrice: $('gpinv-i-price').value, token: $('gpinv-i-token').value };
+    }
+    if (t.id === 'gpinv-ensname') {
+      const n = t.value.trim().toLowerCase();
+      const link = $('gpinv-enslink');
+      if (link) {
+        touchSelf();
+        link.href = n ? 'https://app.ens.domains/' + encodeURIComponent(n) : 'https://app.ens.domains';
+        link.textContent = n ? 'open ' + n + ' in app.ens.domains' : 'open app.ens.domains';
+      }
+    }
+  });
+
+  // selects fire change, not input, in some browsers; catalog picks fill the row
+  document.addEventListener('change', e => {
+    const t = e.target;
+    if (!t.closest || !t.closest('#gp-invoices')) return;
+    if (t.dataset && t.dataset.f === 'pick') {
+      const pref = t.dataset.pref === 'r' ? 'r' : 'f';
+      if (pref === 'r') syncRecFromDom(); else syncFormFromDom();
+      const rows = pref === 'r' ? recRows : formRows;
+      const draft = pref === 'r' ? recDraft : formDraft;
+      const row = rows[Number(t.dataset.row)];
+      const cat = loadItems()[Number(t.value)];
+      if (row) {
+        row._pick = t.value;
+        if (cat) {
+          row.description = cat.description || cat.name;
+          row.unitPrice = cat.unitPrice;
+          if (cat.token && cat.token !== draft.token) draft.token = cat.token;
+        }
+      }
+      renderAll();
+      return;
+    }
+    if (['gpinv-f-client', 'gpinv-f-token'].includes(t.id)) { syncFormFromDom(); paintTotals('f', formRows, formDraft.token, formDraft.taxPct, formDraft.discPct); }
+    if (['gpinv-r-client', 'gpinv-r-token', 'gpinv-r-unit', 'gpinv-r-next', 'gpinv-r-active'].includes(t.id)) { syncRecFromDom(); paintTotals('r', recRows, recDraft.token, recDraft.taxPct, recDraft.discPct); }
+    if (t.id === 'gpinv-i-token') itemDraft.token = t.value;
+  });
+
+  // ── print / pdf: the reports agent can take over by setting window.GPINVPrint ──
+  function printInvoice(rec) {
+    if (typeof window.GPINVPrint === 'function') {
+      return window.GPINVPrint(rec, {
+        profile: loadProfile(), escHtml, fmtAmt, fmtDate, fmtUsd, invStatus, monogram,
+        qrDataUrl, ethUsd,
+        memo: memos[(rec.stealthAddress || '').toLowerCase()] || '',
+      });
+    }
+    return defaultPrint(rec);
+  }
+
+  // default print: a real document, monochrome (accent color when set), window.print()
+  async function defaultPrint(i) {
     let qr;
     try { qr = await qrDataUrl(i.url); } catch { GP.toast('QR failed: content too long'); return; }
     const w = window.open('', '_blank', 'width=640,height=860');
-    if (!w) { GP.toast('popup blocked: allow popups to print invoices'); return; }
+    if (!w) { GP.toast('popup blocked: allow popups to print'); return; }
     const p = loadProfile();
+    const kind = i.kind === 'estimate' ? 'estimate' : 'invoice';
     const st = invStatus(i);
     const memo = memos[(i.stealthAddress || '').toLowerCase()] || '';
+    const accent = p.accentColor || '#000';
     const rows = i.items.map(it =>
       '<tr><td>' + escHtml(it.description || 'item') + '</td>'
       + '<td class="r">' + escHtml(it.qty) + '</td>'
       + '<td class="r">' + fmtAmt(it.unitPrice, i.token) + '</td>'
       + '<td class="r">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), i.token) + '</td></tr>'
     ).join('');
-    w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>invoice ' + escHtml(i.number) + '</title>'
+    w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + kind + ' ' + escHtml(i.number) + '</title>'
       + '<style>body{font-family:\'IBM Plex Mono\',monospace;background:#fff;color:#000;padding:40px;font-size:12px;line-height:1.6;max-width:640px;margin:0 auto}'
       + '.top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #000;padding-bottom:20px}'
-      + '.mg{width:52px;height:52px;border:2px solid #000;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;letter-spacing:.1em}'
+      + '.mg{width:52px;height:52px;border:2px solid ' + escHtml(accent) + ';display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;letter-spacing:.1em}'
       + '.biz{font-size:15px;font-weight:700;margin-top:10px}.muted{color:#555;font-size:10px;letter-spacing:.15em}'
       + 'h1{font-size:22px;letter-spacing:.15em;margin:0;text-align:right}.num{text-align:right;font-size:12px;margin-top:4px}'
       + 'table{width:100%;border-collapse:collapse;margin-top:22px}th{font-size:10px;letter-spacing:.2em;color:#555;text-align:left;font-weight:400;border-bottom:1px solid #000;padding:6px 0}'
@@ -767,14 +1436,16 @@ function initSuite() {
       + '.foot{margin-top:26px;border-top:1px solid #000;padding-top:12px;font-size:11px;color:#333}</style></head><body>'
       + '<div class="top"><div><div class="mg">' + escHtml(monogram(p.name)) + '</div>'
       + '<div class="biz">' + escHtml(p.name || 'GHOSTPAY') + '</div>'
-      + (p.contact ? '<div class="muted">' + escHtml(p.contact) + '</div>' : '') + '</div>'
-      + '<div><h1>INVOICE</h1><div class="num"><b>' + escHtml(i.number) + '</b></div>'
+      + (p.contact ? '<div class="muted">' + escHtml(p.contact) + '</div>' : '')
+      + p.addressLines.map(l => '<div class="muted">' + escHtml(l) + '</div>').join('') + '</div>'
+      + '<div><h1>' + kind.toUpperCase() + '</h1><div class="num"><b>' + escHtml(i.number) + '</b></div>'
       + '<div class="num">date: ' + fmtDate(i.created) + '</div>'
-      + (i.expiry ? '<div class="num">due: ' + fmtDate(i.expiry) + '</div>' : '') + '</div></div>'
+      + (i.expiry ? '<div class="num">' + (kind === 'invoice' ? 'due' : 'valid until') + ': ' + fmtDate(i.expiry) + '</div>' : '') + '</div></div>'
       + (i.clientName ? '<div style="margin-top:20px"><div class="muted">BILL TO</div><b>' + escHtml(i.clientName) + '</b></div>' : '')
       + '<table><thead><tr><th style="width:50%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th><th class="r">AMOUNT</th></tr></thead>'
       + '<tbody>' + rows + '</tbody></table>'
       + '<div class="tot"><div>subtotal · ' + fmtAmt(i.subtotal, i.token) + ' ' + i.token + '</div>'
+      + (i.discountPct ? '<div>discount ' + i.discountPct + '% · −' + fmtAmt(i.discountAmount, i.token) + ' ' + i.token + '</div>' : '')
       + (i.taxPct ? '<div>tax ' + i.taxPct + '% · ' + fmtAmt(i.taxAmount, i.token) + ' ' + i.token + '</div>' : '')
       + '<div class="grand">total · ' + fmtAmt(i.total, i.token) + ' ' + i.token + '</div></div>'
       + (st === 'PAID' ? '<div style="text-align:right"><span class="stamp">PAID</span></div>' : '')
@@ -785,29 +1456,54 @@ function initSuite() {
       + (i.note ? '<div class="foot">note: ' + escHtml(i.note) + '</div>' : '')
       + (memo ? '<div class="foot">payment memo: ' + escHtml(memo) + '</div>' : '')
       + (p.terms ? '<div class="foot">terms: ' + escHtml(p.terms) + '</div>' : '')
+      + (p.footerNote ? '<div class="foot">' + escHtml(p.footerNote) + '</div>' : '')
       + '</body></html>');
     w.document.close();
     w.focus();
     w.print();
   }
 
-  // ── payment reconciliation: PAID arrives via GP events matching the pinned address ──
-  function markPaid(p) {
+  // ── payment reconciliation: PAID arrives via GP events matching the pinned address.
+  // The pinned address is unique to the invoice, so its ETH balance is the running sum
+  // of everything paid to it; max() keeps the figure across sweeps. Sum below total is
+  // PARTIAL, at/over total flips PAID.
+  const partialToasted = new Set();
+  async function syncPaid(p) {
     const all = loadInv();
-    const hit = all.find(i => i.stealthAddress && i.stealthAddress.toLowerCase() === p.address.toLowerCase());
-    if (hit && hit.status !== 'PAID') {
+    const hit = all.find(i => i.stealthAddress && i.stealthAddress.toLowerCase() === String(p.address).toLowerCase());
+    if (!hit) return;
+    let balEth = null;
+    try {
+      balEth = Number(GP.fmt.formatEth(BigInt(await GP.jrpc('eth_getBalance', [hit.stealthAddress, 'latest']))));
+    } catch { /* balance best-effort: keep the previous figure */ }
+    if (balEth != null && balEth > 0) {
+      if (hit.token === 'ETH') {
+        hit.paidAmount = Math.max(hit.paidAmount || 0, round6(balEth));
+      } else {
+        const px = await ethUsd();
+        if (px) hit.paidAmount = Math.max(hit.paidAmount || 0, round2(balEth * px));
+      }
+    }
+    const ps = paymentState(hit, hit.paidAmount);
+    hit.paidTx = p.tx || hit.paidTx || null;
+    if (ps === 'PAID' && hit.status !== 'PAID') {
       hit.status = 'PAID';
       hit.paidAt = Date.now();
-      hit.paidTx = p.tx || null;
       saveInv(all);
-      render();
+      renderAll();
       GP.toast('invoice paid: ' + hit.number + ' · ' + fmtAmt(hit.total, hit.token) + ' ' + hit.token);
+    } else {
+      saveInv(all);
+      renderAll();
+      if (ps === 'PARTIAL' && !partialToasted.has(hit.id)) {
+        partialToasted.add(hit.id);
+        GP.toast('partial payment on ' + hit.number + ': ' + fmtAmt(hit.paidAmount, hit.token) + ' of ' + fmtAmt(hit.total, hit.token) + ' ' + hit.token);
+      }
     }
   }
   function reconcile() {
     if (!GP.state.unlocked) return;
-    for (const p of GP.state.payments) markPaid(p);
-    render();
+    for (const p of GP.state.payments) syncPaid(p);
   }
 
   // encrypted memo pickup: the core scan emits payments without metadata, so we pull the
@@ -833,7 +1529,7 @@ function initSuite() {
         memos[key] = memo;
         saveMemos(memos);
         p.memo = memo;
-        render();
+        renderAll();
         GP.toast('payment memo decrypted: ' + memo.slice(0, 60));
       }
     } catch { /* receipt unavailable or undecryptable: no memo */ } finally {
@@ -862,14 +1558,39 @@ function initSuite() {
     }
   }
 
-  render();
+  renderAll();
   reconcile();
 
-  GP.on('payment', p => { markPaid(p); attachMemo(p); });
+  GP.on('payment', p => { syncPaid(p); attachMemo(p); });
   GP.on('session', () => reconcile());
+
+  // the shell swaps tabs by toggling mount visibility: re-render any mount that
+  // becomes visible so lists are always current
+  let renderQueued = false;
+  const queueRender = () => {
+    if (renderQueued || Date.now() - selfTouch < 150) return;
+    renderQueued = true;
+    setTimeout(() => {
+      renderQueued = false;
+      for (const el of Object.values(mounts)) {
+        if (el && el.offsetParent !== null) {
+          if (el === mounts.invoices) renderInvoices();
+          else if (el === mounts.estimates) renderEstimates();
+          else if (el === mounts.customers) renderCustomers();
+          else if (el === mounts.items) renderItems();
+          else if (el === mounts.recurring) renderRecurring();
+          else if (el === mounts.settings) renderSettings();
+        }
+      }
+    }, 0);
+  };
+  const container = document.getElementById('gp-invoices');
+  if (container) {
+    new MutationObserver(queueRender).observe(container, { attributes: true, subtree: true, attributeFilter: ['style', 'class', 'hidden'] });
+  }
 }
 
-// ── CSV export: payments + invoices ──
+// ── CSV export: payments + invoices + estimates ──
 async function exportCsv() {
   const rows = [['date', 'type', 'number', 'client', 'address', 'amount', 'token', 'amount_usd', 'memo_or_note', 'status']];
   const price = await ethUsd();
@@ -889,6 +1610,10 @@ async function exportCsv() {
   for (const inv of loadInv()) {
     const usd = inv.token === 'USDC' ? inv.total.toFixed(2) : (price ? (inv.total * price).toFixed(2) : '');
     rows.push([new Date(inv.created).toISOString(), 'invoice', inv.number, inv.clientName || '', inv.stealthAddress, fmtAmt(inv.total, inv.token), inv.token, usd, inv.note || '', invStatus(inv)]);
+  }
+  for (const est of loadEst()) {
+    const usd = est.token === 'USDC' ? est.total.toFixed(2) : (price ? (est.total * price).toFixed(2) : '');
+    rows.push([new Date(est.created).toISOString(), 'estimate', est.number, est.clientName || '', est.stealthAddress, fmtAmt(est.total, est.token), est.token, usd, est.note || '', invStatus(est)]);
   }
   const csv = rows.map(r => r.map(c => '"' + String(c ?? '').replace(/"/g, '""') + '"').join(',')).join('\r\n');
   download('ghostpay-export-' + new Date().toISOString().slice(0, 10) + '.csv', csv, 'text/csv');
@@ -955,6 +1680,29 @@ function enhancePayghost() {
         $('v-ann').textContent = e.message;
         return;
       }
+    }
+    // invoice amount (ETH only): "25 ETH · note" → the value of the payment call
+    let value = 0n;
+    const pm = (params.get('pay') || '').match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*ETH/i);
+    if (pm) { try { value = GP.ethers.parseEther(pm[1]); } catch { value = 0n; } }
+    const PAA = GP.const && GP.const.PAY_AND_ANNOUNCE;
+    if (PAA) {
+      // one transaction: payment + announcement + (optional) encrypted memo via PayAndAnnounce
+      try {
+        $('v-ann').textContent = 'paying + announcing in one transaction…';
+        const md = metadataHex ? C.buf(metadataHex) : Uint8Array.from([target.viewTag]);
+        const payData = new GP.ethers.Interface(['function pay(address stealth, bytes ephPub, bytes metadata) payable'])
+          .encodeFunctionData('pay', [target.stealth, target.ephPub, md]);
+        const account = (await GP.state.walletRequest('eth_requestAccounts', []))[0];
+        const hash = await GP.state.walletRequest('eth_sendTransaction', [{ from: account, to: PAA, value: '0x' + value.toString(16), data: payData }]);
+        $('v-ann').textContent = 'paid + announced in one transaction · tx ' + hash + (memo ? ' · encrypted memo attached' : '');
+        return;
+      } catch (e) {
+        $('v-ann').textContent = 'payment failed: ' + (e.shortMessage || e.message) + ' · nothing was sent, retry.';
+        return;
+      }
+    }
+    if (memo) {
       // relayer path: gasless for the payer, metadata passed through verbatim
       try {
         $('v-ann').textContent = 'announcing via relayer… (deliberate 2–15s privacy delay)';
@@ -979,7 +1727,8 @@ function enhancePayghost() {
 
 function boot() {
   if (!GP) return;
-  if (document.getElementById('gpinv-root')) initSuite();
+  const SUITE_MOUNTS = ['tab-invoices', 'tab-estimates', 'tab-customers', 'tab-items', 'tab-recurring', 'tab-settings'];
+  if (SUITE_MOUNTS.some(id => document.getElementById(id))) initSuite();
   enhancePayghost();
 }
 if (typeof document !== 'undefined') {

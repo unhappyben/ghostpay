@@ -7,6 +7,8 @@
 <title>GHOSTPAY · APP</title>
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="./icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="./gp-ui.css">
+<script>try{const p=JSON.parse(localStorage.getItem('gp-profile')||'{}');if(p&&p.accentColor)document.documentElement.style.setProperty('--gp-accent',p.accentColor)}catch(e){}</script>
 <style>
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:#000; color:#fff; font-family:'IBM Plex Mono',monospace; font-size:14px; line-height:1.6; }
@@ -62,6 +64,14 @@
 </style>
 </head>
 <body>
+<nav class="gp-nav">
+  <a class="gp-nav-logo" href="./">GHOSTPAY</a>
+  <div class="gp-nav-links">
+    <a class="gp-nav-link" href="./">HOME</a>
+    <a class="gp-nav-link on" href="./app.html">APP</a>
+    <a class="gp-nav-link" href="./invoices.html">INVOICING</a>
+  </div>
+</nav>
 <div class="wrap">
   <div id="gp-status">relayer: checking…</div>
   <div class="logo">GHOST<span>PAY</span></div>

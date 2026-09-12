@@ -1,0 +1,72 @@
+/* gp-ui.css · GHOSTPAY shared design system: fixed top nav, layout + card/table/pill
+   primitives, invoice suite tab shell. Monochrome first. --gp-accent may be set from
+   localStorage gp-profile accentColor by a one-line inline script on each page; the
+   default stays white, so no script means pure monochrome. */
+:root {
+  --gp-bg: #000;
+  --gp-fg: #fff;
+  --gp-muted: #888;
+  --gp-faint: #555;
+  --gp-line: #333;
+  --gp-accent: #fff;
+  --gp-nav-h: 48px;
+}
+
+body { padding-top: var(--gp-nav-h); }
+
+/* ── fixed top nav (every page): logo left, page links right, current page inverted ── */
+.gp-nav { position: fixed; top: 0; left: 0; right: 0; height: var(--gp-nav-h); z-index: 100;
+  display: flex; align-items: center; gap: 16px; padding: 0 20px;
+  background: var(--gp-bg); border-bottom: 1px solid var(--gp-line); }
+.gp-nav-logo { color: var(--gp-fg); text-decoration: none; font-weight: 700; font-size: 13px;
+  letter-spacing: .2em; }
+.gp-nav-links { margin-left: auto; display: flex; align-items: center; gap: 4px; }
+.gp-nav-link { color: var(--gp-muted); text-decoration: none; font-size: 11px;
+  letter-spacing: .15em; padding: 8px 14px; border: 1px solid transparent; }
+.gp-nav-link:hover { color: var(--gp-fg); border-color: var(--gp-line); }
+.gp-nav-link.on { background: var(--gp-accent); color: #000; font-weight: 700; }
+
+/* visible focus everywhere, monochrome (or the accent when one is set) */
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
+textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+  outline: 1px solid var(--gp-accent); outline-offset: 2px; }
+
+/* ── layout primitives ── */
+.gp-container { max-width: 720px; margin: 0 auto; padding: 0 20px; }
+.gp-section { margin-top: 28px; }
+.gp-label { font-size: 10px; letter-spacing: .2em; color: var(--gp-muted); margin-bottom: 6px; }
+.gp-muted { color: var(--gp-muted); }
+
+/* dark bordered card: companion to the inverted white .card the flow pages already use */
+.gp-card { border: 1px solid var(--gp-line); padding: 22px; margin-top: 14px; }
+.gp-card.on { border-color: var(--gp-fg); }
+
+/* tables */
+.gp-tablewrap { overflow-x: auto; }
+.gp-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.gp-table th { text-align: left; font-size: 10px; letter-spacing: .2em; color: var(--gp-muted);
+  font-weight: 400; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--gp-line);
+  white-space: nowrap; }
+.gp-table td { padding: 12px 12px 12px 0; border-bottom: 1px solid #1c1c1c; vertical-align: top; }
+
+/* pills */
+.gp-pill { display: inline-block; border: 1px solid var(--gp-fg); padding: 2px 8px;
+  font-size: 10px; letter-spacing: .15em; white-space: nowrap; }
+.gp-pill.dim { border-color: #444; color: var(--gp-muted); }
+
+/* ── invoice suite tab shell (invoices.html, #gp-invoices) ── */
+.gp-tabs { display: flex; flex-wrap: wrap; border: 1px solid var(--gp-line); margin-top: 16px; }
+.gp-tab { background: var(--gp-bg); color: var(--gp-muted); border: 0;
+  border-right: 1px solid var(--gp-line); padding: 12px 10px; font-size: 10px;
+  letter-spacing: .15em; font-weight: 400; flex: 1 1 auto; width: auto; }
+.gp-tab:last-child { border-right: 0; }
+.gp-tab:hover { color: var(--gp-fg); }
+.gp-tab.on { background: var(--gp-accent); color: #000; font-weight: 700; }
+.gp-tabpane { padding: 22px 0 8px; }
+
+@media (max-width: 700px) {
+  .gp-nav { padding: 0 12px; gap: 8px; }
+  .gp-nav-link { padding: 8px 9px; font-size: 10px; }
+  .gp-tab { min-height: 44px; }
+  .gp-card { padding: 16px; }
+}

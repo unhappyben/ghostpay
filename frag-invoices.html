@@ -1,62 +1,61 @@
-<!-- GHOSTPAY invoice suite fragment.
-     Insert this block inside <div id="gp-invoices"></div> in index.html (step 3),
-     then add <script type="module" src="./gp-invoices.mjs"></script> after the main
-     inline module script. Styles are scoped to #gpinv-root; the tab views are rendered
-     by gp-invoices.mjs into #gpinv-view. -->
-<div id="gpinv-root">
+<!-- GHOSTPAY invoice suite fragment (storage schema v3).
+     The shell pastes this block inside <div id="gp-invoices"></div> and provides the
+     tab bar plus these mount divs (all optional: gp-invoices.mjs skips a view whose
+     mount is absent):
+       #tab-invoices    INVOICES (+ ESTIMATES sub-switch when #tab-estimates is absent)
+       #tab-estimates   ESTIMATES (dedicated mount, optional)
+       #tab-customers   CUSTOMERS
+       #tab-items       ITEMS catalog
+       #tab-recurring   RECURRING templates
+       #tab-settings    SETTINGS (profile, numbering, ENS publish, CSV export)
+     Everything renders via JS into those mounts; this frag carries only scoped styles.
+     Actions inside the mounts use data-iact (data-act belongs to the shell tab bar).
+     gp-ui.css is linked page-wide by the shell; the rules below are suite extras. -->
 <style>
-  #gpinv-root { border:1px solid #333; margin-top:16px; padding:22px; }
-  #gpinv-root .gpinv-title { font-size:11px; letter-spacing:.25em; color:#888; margin-bottom:16px; }
-  #gpinv-root .gpinv-tabs { display:flex; border:1px solid #333; margin-bottom:20px; }
-  #gpinv-root .gpinv-tabs button { background:#000; color:#888; border:0; border-right:1px solid #333;
-    padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
-  #gpinv-root .gpinv-tabs button:last-child { border-right:0; }
-  #gpinv-root .gpinv-tabs button.on { background:#fff; color:#000; font-weight:700; }
-  #gpinv-root h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
-  #gpinv-root .gpinv-box { border:1px solid #333; padding:16px; }
-  #gpinv-root .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-  #gpinv-root .gpinv-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:4px; }
-  #gpinv-root .gpinv-big { font-size:24px; font-weight:700; letter-spacing:-.5px; }
-  #gpinv-root .gpinv-unit { font-size:12px; color:#888; letter-spacing:.1em; }
-  #gpinv-root .gpinv-muted { color:#777; }
-  #gpinv-root .gpinv-mono { font-size:11px; color:#777; word-break:break-all; }
-  #gpinv-root .gpinv-mg { width:46px; height:46px; border:1px solid #fff; display:flex; flex:none;
+  #gp-invoices h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
+  #gp-invoices .gpinv-box { border:1px solid #333; padding:16px; }
+  #gp-invoices .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  #gp-invoices .gpinv-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:4px; }
+  #gp-invoices .gpinv-muted { color:#777; }
+  #gp-invoices .gpinv-mono { font-size:11px; color:#777; word-break:break-all; }
+  #gp-invoices .gpinv-mg { width:46px; height:46px; border:1px solid #fff; display:flex; flex:none;
     align-items:center; justify-content:center; font-weight:700; letter-spacing:.1em; }
-  #gpinv-root .gpinv-tablewrap { overflow-x:auto; }
-  #gpinv-root table { width:100%; border-collapse:collapse; font-size:12px; }
-  #gpinv-root th { text-align:left; font-size:10px; letter-spacing:.2em; color:#777; font-weight:400;
+  #gp-invoices .gpinv-tablewrap { overflow-x:auto; }
+  #gp-invoices table { width:100%; border-collapse:collapse; font-size:12px; }
+  #gp-invoices th { text-align:left; font-size:10px; letter-spacing:.2em; color:#777; font-weight:400;
     padding:6px 10px 6px 0; border-bottom:1px solid #333; white-space:nowrap; }
-  #gpinv-root td { padding:10px 10px 10px 0; border-bottom:1px solid #222; vertical-align:top; }
-  #gpinv-root .gpinv-rowbtn { cursor:pointer; }
-  #gpinv-root .gpinv-rowbtn:hover td { background:#0d0d0d; }
-  #gpinv-root .gpinv-detail td { background:#0a0a0a; padding:16px; }
-  #gpinv-root td input { margin-top:0; padding:8px 10px; font-size:12px; }
-  #gpinv-root .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
+  #gp-invoices td { padding:10px 10px 10px 0; border-bottom:1px solid #222; vertical-align:top; }
+  #gp-invoices .gpinv-rowbtn { cursor:pointer; }
+  #gp-invoices .gpinv-rowbtn:hover td { background:#0d0d0d; }
+  #gp-invoices .gpinv-detail td { background:#0a0a0a; padding:16px; }
+  #gp-invoices td input, #gp-invoices td select { margin-top:0; padding:8px 10px; font-size:12px; }
+  /* status pills: same idiom as the inbox (outline, dim, solid) */
+  #gp-invoices .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
     letter-spacing:.15em; white-space:nowrap; }
-  #gpinv-root .gpinv-pill.dim { border-color:#444; color:#888; }
-  #gpinv-root .gpinv-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
-  #gpinv-root .gpinv-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
-  #gpinv-root .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
-  #gpinv-root .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
+  #gp-invoices .gpinv-pill.dim { border-color:#444; color:#888; }
+  #gp-invoices .gpinv-pill.solid { background:#fff; color:#000; font-weight:700; }
+  #gp-invoices .gpinv-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  #gp-invoices .gpinv-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
+  #gp-invoices .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
+  #gp-invoices .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
     text-align:center; margin-top:4px; }
+  /* status filter row */
+  #gp-invoices .gpinv-filter { display:flex; gap:6px; flex-wrap:wrap; margin:16px 0 12px; }
+  #gp-invoices .gpinv-filter button { width:auto; padding:6px 12px; font-size:10px; letter-spacing:.15em; }
+  #gp-invoices .gpinv-filter button.on { background:#fff; color:#000; font-weight:700; border-color:#fff; }
+  /* INVOICES / ESTIMATES sub-switch (only when the shell has no #tab-estimates mount) */
+  #gp-invoices .gpinv-sub { display:flex; border:1px solid #333; margin-bottom:16px; }
+  #gp-invoices .gpinv-sub button { background:#000; color:#888; border:0; border-right:1px solid #333;
+    padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
+  #gp-invoices .gpinv-sub button:last-child { border-right:0; }
+  #gp-invoices .gpinv-sub button.on { background:#fff; color:#000; font-weight:700; }
+  /* editor save/cancel bar stays reachable on long forms */
+  #gp-invoices .gpinv-sticky { position:sticky; bottom:0; background:#000; border-top:1px solid #333;
+    padding:12px 0 8px; z-index:5; }
   @media (max-width:700px) {
-    #gpinv-root { padding:16px; }
-    #gpinv-root .gpinv-grid { grid-template-columns:1fr; }
-    #gpinv-root .gpinv-actions { flex-direction:column; }
-    #gpinv-root .gpinv-actions button { width:100%; }
-    #gpinv-root .gpinv-tabs button { min-height:44px; }
+    #gp-invoices .gpinv-grid { grid-template-columns:1fr; }
+    #gp-invoices .gpinv-actions { flex-direction:column; }
+    #gp-invoices .gpinv-actions button { width:100%; }
+    #gp-invoices .gpinv-sub button, #gp-invoices .gpinv-filter button { min-height:44px; }
   }
 </style>
-  <div class="gpinv-title">INVOICE SUITE</div>
-  <div class="gpinv-tabs">
-    <button data-act="tab" data-tab="overview" class="on">OVERVIEW</button>
-    <button data-act="tab" data-tab="invoices">INVOICES</button>
-    <button data-act="tab" data-tab="clients">CLIENTS</button>
-    <button data-act="tab" data-tab="profile">PROFILE</button>
-  </div>
-  <div id="gpinv-view"></div>
-  <div id="gpinv-qrwrap" style="display:none;margin-top:14px;text-align:center">
-    <canvas id="gpinv-qr" style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas>
-    <div class="status" id="gpinv-qr-cap"></div>
-  </div>
-</div>

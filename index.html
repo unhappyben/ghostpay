@@ -7,6 +7,8 @@
 <title>GHOSTPAY</title>
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="./icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="./gp-ui.css">
+<script>try{const p=JSON.parse(localStorage.getItem('gp-profile')||'{}');if(p&&p.accentColor)document.documentElement.style.setProperty('--gp-accent',p.accentColor)}catch(e){}</script>
 <style>
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:#000; color:#fff; font-family:'IBM Plex Mono',monospace; font-size:14px; line-height:1.6; }
@@ -55,6 +57,14 @@
 </style>
 </head>
 <body>
+<nav class="gp-nav">
+  <a class="gp-nav-logo" href="./">GHOSTPAY</a>
+  <div class="gp-nav-links">
+    <a class="gp-nav-link on" href="./">HOME</a>
+    <a class="gp-nav-link" href="./app.html">APP</a>
+    <a class="gp-nav-link" href="./invoices.html">INVOICING</a>
+  </div>
+</nav>
 <div class="wrap">
   <div id="gp-status">relayer: checking…</div>
   <div class="logo">GHOST<span>PAY</span></div>
@@ -63,11 +73,11 @@
 
   <div id="doors">
     <a class="door" href="./app.html">
-      <div class="door-t">OPEN APP</div>
+      <div class="door-t">APP</div>
       <div class="door-d">connect, generate your stealth keys, receive, sweep into Privacy Pools, withdraw unlinked.</div>
     </a>
     <a class="door" href="./invoices.html">
-      <div class="door-t">INVOICE SUITE</div>
+      <div class="door-t">INVOICING</div>
       <div class="door-d">tracked invoices, clients, private payment links, encrypted memos.</div>
     </a>
     <div class="door" id="paydoor">
@@ -147,9 +157,8 @@ let W = null; // { account, prov, eip1193 } or { account, session }
 const ANNOUNCER = '0x55649E01B5Df198D18D95b5cc5051630cfD45564';
 const CHAIN_ID = 1;
 // PayAndAnnounce contract (pay(stealth, ephPub, metadata) payable: announces + forwards the
-// ETH in one transaction). Deploy pending: while null, the EIP-5792 / sequential fallback
-// below runs unchanged. The orchestrator fills in the address after deployment.
-const PAY_AND_ANNOUNCE = null;
+// ETH in one transaction). Deployed on mainnet; bytecode verified against test/PayAndAnnounce.t.sol.
+const PAY_AND_ANNOUNCE = '0x665E5f19FFFfBa541B3314E66bBAaCD08080cC02';
 
 const copy = (txt, btn) => { navigator.clipboard.writeText(txt); btn.textContent = 'COPIED ✓'; setTimeout(()=>btn.textContent=btn.dataset.t, 1200); };
 document.querySelectorAll('button').forEach(b => b.dataset.t = b.textContent);
@@ -349,7 +358,7 @@ window.GP = {
   },
   toast,
   ethers,
-  const: { ANNOUNCER, CHAIN_ID },
+  const: { ANNOUNCER, CHAIN_ID, PAY_AND_ANNOUNCE },
   crypto: { secp256k1, keccak_256, hex, buf, mod, N, derive },
 };
 

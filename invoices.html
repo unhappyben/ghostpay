@@ -7,6 +7,8 @@
 <title>GHOSTPAY · INVOICES</title>
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="./icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="./gp-ui.css">
+<script>try{const p=JSON.parse(localStorage.getItem('gp-profile')||'{}');if(p&&p.accentColor)document.documentElement.style.setProperty('--gp-accent',p.accentColor)}catch(e){}</script>
 <style>
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:#000; color:#fff; font-family:'IBM Plex Mono',monospace; font-size:14px; line-height:1.6; }
@@ -62,10 +64,18 @@
 </style>
 </head>
 <body>
+<nav class="gp-nav">
+  <a class="gp-nav-logo" href="./">GHOSTPAY</a>
+  <div class="gp-nav-links">
+    <a class="gp-nav-link" href="./">HOME</a>
+    <a class="gp-nav-link" href="./app.html">APP</a>
+    <a class="gp-nav-link on" href="./invoices.html">INVOICING</a>
+  </div>
+</nav>
 <div class="wrap">
   <div id="gp-status">relayer: checking…</div>
   <div class="logo">GHOST<span>PAY</span></div>
-  <div class="sub">INVOICE SUITE · <a href="./">GHOSTPAY HOME</a> · <a href="./app.html">OPEN APP</a></div>
+  <div class="sub">INVOICE SUITE · TRACKED INVOICES · CLIENTS · PRIVATE PAYMENT LINKS · ENCRYPTED MEMOS</div>
   <div class="sub" id="bootline" style="color:#fff">booting…</div>
 
   <!-- returning-user dashboard: replaces steps 1-2 when a gp-session exists on this device -->
@@ -127,69 +137,47 @@
   </div>
 
 
-  <!-- the invoice suite: same connect + generate machinery as the app (app-core.mjs), then the mount -->
+  <!-- the invoice suite: same connect + generate machinery as the app (app-core.mjs), then the
+       tab shell. #gp-invoices wraps the tab bar + seven mount divs. gp-invoices.mjs fills
+       #tab-invoices / #tab-customers / #tab-items / #tab-recurring / #tab-settings
+       (frag-invoices.html); gp-reports.mjs fills #tab-dashboard / #tab-reports
+       (frag-reports.html). Renderers must tolerate any mount being absent. -->
   <div class="step on">
     <h2>INVOICE SUITE</h2>
     <div id="gp-invoices">
-<div id="gpinv-root">
-<style>
-  #gpinv-root { border:1px solid #333; margin-top:16px; padding:22px; }
-  #gpinv-root .gpinv-title { font-size:11px; letter-spacing:.25em; color:#888; margin-bottom:16px; }
-  #gpinv-root .gpinv-tabs { display:flex; border:1px solid #333; margin-bottom:20px; }
-  #gpinv-root .gpinv-tabs button { background:#000; color:#888; border:0; border-right:1px solid #333;
-    padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
-  #gpinv-root .gpinv-tabs button:last-child { border-right:0; }
-  #gpinv-root .gpinv-tabs button.on { background:#fff; color:#000; font-weight:700; }
-  #gpinv-root h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
-  #gpinv-root .gpinv-box { border:1px solid #333; padding:16px; }
-  #gpinv-root .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-  #gpinv-root .gpinv-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:4px; }
-  #gpinv-root .gpinv-big { font-size:24px; font-weight:700; letter-spacing:-.5px; }
-  #gpinv-root .gpinv-unit { font-size:12px; color:#888; letter-spacing:.1em; }
-  #gpinv-root .gpinv-muted { color:#777; }
-  #gpinv-root .gpinv-mono { font-size:11px; color:#777; word-break:break-all; }
-  #gpinv-root .gpinv-mg { width:46px; height:46px; border:1px solid #fff; display:flex; flex:none;
-    align-items:center; justify-content:center; font-weight:700; letter-spacing:.1em; }
-  #gpinv-root .gpinv-tablewrap { overflow-x:auto; }
-  #gpinv-root table { width:100%; border-collapse:collapse; font-size:12px; }
-  #gpinv-root th { text-align:left; font-size:10px; letter-spacing:.2em; color:#777; font-weight:400;
-    padding:6px 10px 6px 0; border-bottom:1px solid #333; white-space:nowrap; }
-  #gpinv-root td { padding:10px 10px 10px 0; border-bottom:1px solid #222; vertical-align:top; }
-  #gpinv-root .gpinv-rowbtn { cursor:pointer; }
-  #gpinv-root .gpinv-rowbtn:hover td { background:#0d0d0d; }
-  #gpinv-root .gpinv-detail td { background:#0a0a0a; padding:16px; }
-  #gpinv-root td input { margin-top:0; padding:8px 10px; font-size:12px; }
-  #gpinv-root .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
-    letter-spacing:.15em; white-space:nowrap; }
-  #gpinv-root .gpinv-pill.dim { border-color:#444; color:#888; }
-  #gpinv-root .gpinv-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
-  #gpinv-root .gpinv-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
-  #gpinv-root .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
-  #gpinv-root .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
-    text-align:center; margin-top:4px; }
-  @media (max-width:700px) {
-    #gpinv-root { padding:16px; }
-    #gpinv-root .gpinv-grid { grid-template-columns:1fr; }
-    #gpinv-root .gpinv-actions { flex-direction:column; }
-    #gpinv-root .gpinv-actions button { width:100%; }
-    #gpinv-root .gpinv-tabs button { min-height:44px; }
-  }
-</style>
-  <div class="gpinv-title">INVOICE SUITE</div>
-  <div class="gpinv-tabs">
-    <button data-act="tab" data-tab="overview" class="on">OVERVIEW</button>
-    <button data-act="tab" data-tab="invoices">INVOICES</button>
-    <button data-act="tab" data-tab="clients">CLIENTS</button>
-    <button data-act="tab" data-tab="profile">PROFILE</button>
-  </div>
-  <div id="gpinv-view"></div>
-  <div id="gpinv-qrwrap" style="display:none;margin-top:14px;text-align:center">
-    <canvas id="gpinv-qr" style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas>
-    <div class="status" id="gpinv-qr-cap"></div>
-  </div>
-</div>
+      <div class="gp-tabs" id="gp-tabs">
+        <button type="button" class="gp-tab on" data-tab="tab-dashboard">DASHBOARD</button>
+        <button type="button" class="gp-tab" data-tab="tab-invoices">INVOICES</button>
+        <button type="button" class="gp-tab" data-tab="tab-customers">CUSTOMERS</button>
+        <button type="button" class="gp-tab" data-tab="tab-items">ITEMS</button>
+        <button type="button" class="gp-tab" data-tab="tab-recurring">RECURRING</button>
+        <button type="button" class="gp-tab" data-tab="tab-reports">REPORTS</button>
+        <button type="button" class="gp-tab" data-tab="tab-settings">SETTINGS</button>
+      </div>
+      <div id="tab-dashboard" class="gp-tabpane"></div>
+      <div id="tab-invoices" class="gp-tabpane" style="display:none"></div>
+      <div id="tab-customers" class="gp-tabpane" style="display:none"></div>
+      <div id="tab-items" class="gp-tabpane" style="display:none"></div>
+      <div id="tab-recurring" class="gp-tabpane" style="display:none"></div>
+      <div id="tab-reports" class="gp-tabpane" style="display:none"></div>
+      <div id="tab-settings" class="gp-tabpane" style="display:none"></div>
     </div>
   </div>
+<script>
+// suite tab shell: switch visibility of the seven mount divs only. Renderers fill the mounts
+// independently, so this never touches their content and works with dynamically rendered trees.
+(function () {
+  const bar = document.getElementById('gp-tabs');
+  if (!bar) return;
+  const panes = document.querySelectorAll('#gp-invoices .gp-tabpane');
+  bar.addEventListener('click', e => {
+    const b = e.target.closest('[data-tab]');
+    if (!b) return;
+    bar.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x === b));
+    panes.forEach(p => { p.style.display = p.id === b.dataset.tab ? '' : 'none'; });
+  });
+})();
+</script>
 
   <!-- scanner stubs: the shared core scans announcements into these so the suite sees
        payments (PAID reconciliation runs off GP payment events). c-secret lets the
