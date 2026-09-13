@@ -540,9 +540,21 @@ async function handleSweep(artifact, attempts = 1) {
     if (!SWEEPER_V2) throw Object.assign(new Error('eip7702-intent sweeps are unavailable: SWEEPER_V2 is not configured on this relayer'), { status: 503 });
     verifyIntent(artifact);
     const data = SWEEPER_IFACE.encodeFunctionData('executeSweep', [artifact.intent, artifact.signature]);
-    // fee estimate for the ledger: stealth balance * feeBps / 10000, best-effort (a failed
-    // balance read skips the ledger line, it never blocks the broadcast).
+    // preflights that turn opaque gas-estimation reverts into clear errors: the two common
+    // causes are a stale authorization (the address was already swept, nonce consumed) and
+    // an empty address (already swept or never paid).
     const bal = await getBalance(artifact.stealthAddress).catch(() => null);
+    const nonce = await getNonce(artifact.stealthAddress).catch(() => null);
+    console.log(`intent sweep request: stealth=${artifact.stealthAddress} balance=${bal === null ? '?' : ethers.formatEther(bal)} ETH nonce=${nonce} authNonce=${artifact.authorization.nonce} action=${artifact.intent.action}`);
+    if (nonce !== null && Number(artifact.authorization.nonce) !== nonce) {
+      throw Object.assign(new Error(`stale authorization: stealth EOA nonce is ${nonce} but the intent was signed for ${artifact.authorization.nonce} · this address was very likely swept already; rescan and only sweep again if a NEW payment arrived`), { status: 400 });
+    }
+    if (bal === 0n) {
+      throw Object.assign(new Error('stealth address is empty · it was already swept (or never paid). check the inbox pill before sweeping again'), { status: 400 });
+    }
+    if (Number(artifact.intent.action) === 1 && bal !== null && bal < ethers.parseEther('0.01')) {
+      throw Object.assign(new Error(`stealth balance ${ethers.formatEther(bal)} ETH is below the Privacy Pools 0.01 ETH minimum · use a direct sweep (action 0) instead`), { status: 400 });
+    }
     const runner = pickRunner();
     lastRunner = runner;
     const out = await broadcast(runner, {
