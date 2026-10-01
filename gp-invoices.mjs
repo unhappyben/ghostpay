@@ -306,6 +306,157 @@ export function nextRecurrence(date, everyN, unit) {
   return d.getTime();
 }
 
+// ── ERC-20 payments: approve + payToken, batched (EIP-5792) or sequential ──
+// PayAndAnnounce.payToken pulls the token via transferFrom, so the payer's wallet must
+// approve the contract for the exact amount first. Wallets with EIP-5792 atomic batching
+// take both calls in one confirmation; the rest take two transactions. The exact-amount
+// approval (never infinite) is the privacy-preserving default: no standing allowance.
+
+// USDC on mainnet, 6 decimals. The only ERC-20 the payer flow wires today; the invoice
+// suite prices in it by default.
+export const USDC_MAINNET = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
+const TOKEN_DECIMALS = { ETH: 18, USDC: 6 };
+
+// "25" / "25.50" → base units (USDC 6 decimals, ETH 18 wei). Null when the token is
+// unknown, the string is not a plain positive decimal, or it carries more precision
+// than the token has: a dead link is safer than a silently rounded payment.
+export function parseTokenUnits(amountStr, token) {
+  const dec = TOKEN_DECIMALS[String(token || '').toUpperCase()];
+  if (dec == null) return null;
+  const m = String(amountStr || '').trim().match(/^([0-9]+)(?:\.([0-9]+)?)?$/);
+  if (!m || (m[2] || '').length > dec) return null;
+  const units = BigInt(m[1]) * 10n ** BigInt(dec) + (m[2] ? BigInt(m[2].padEnd(dec, '0')) : 0n);
+  return units > 0n ? units : null;
+}
+
+// The two wallet calls of a token payment: exact-amount approve on the token contract,
+// then payToken on PayAndAnnounce (announces + transferFrom in one call). `ethers` is a
+// parameter (GP.ethers in the browser, the vendored bundle in node tests) so this
+// module stays importable without it.
+export function buildTokenPayCalls({ ethers, tokenAddr, spender, stealth, amountUnits, ephPub, metadata }) {
+  const approveData = new ethers.Interface(['function approve(address spender, uint256 amount) returns (bool)'])
+    .encodeFunctionData('approve', [spender, amountUnits]);
+  const payData = new ethers.Interface(['function payToken(address token, address stealth, uint256 amount, bytes ephPub, bytes metadata)'])
+    .encodeFunctionData('payToken', [tokenAddr, stealth, amountUnits, ephPub, metadata]);
+  return {
+    approve: { to: tokenAddr, value: '0x0', data: approveData },
+    payToken: { to: spender, value: '0x0', data: payData },
+  };
+}
+
+// Wallet rejection, across the three shapes it arrives in: EIP-1193 code 4001, ethers
+// ACTION_REJECTED, WalletConnect's message-only rejections.
+export const isWalletReject = e => {
+  const code = e && (e.code ?? (e.cause && e.cause.code));
+  return code === 4001 || code === 'ACTION_REJECTED' || /user (rejected|denied)|rejected by (the )?user/i.test(String((e && e.message) || e));
+};
+
+// Status line for a failed token payment. The approve/pay split matters to the copy:
+// before the approval nothing moved; after it, the approval is onchain but no payment left.
+export function tokenPayErrorText(e) {
+  const msg = (e && (e.shortMessage || e.message)) || String(e);
+  if (e && e.stage === 'reject') return msg;
+  if (e && e.stage === 'pay') return 'The approval mined, then the payment failed: ' + msg + ' · no payment was sent, retry.';
+  if (e && e.stage === 'wait') return 'The approval was sent but its mining was never observed: ' + msg + ' · no payment was sent.';
+  if (isWalletReject(e)) return 'Cancelled in your wallet · nothing was sent.';
+  return 'Payment failed: ' + msg + ' · nothing was sent, retry.';
+}
+
+// The token-payment state machine. `calls` comes from buildTokenPayCalls, walletRequest
+// is the provider-agnostic sender (GP.state.walletRequest), jrpc polls receipts.
+// Returns { via: 'batch' | 'sequential', hash, confirmed }. Errors carry a .stage:
+// 'batch' (the batch itself failed onchain), 'approve', 'wait' (approval mining never
+// observed), 'pay' (approval is onchain but the payment failed), 'reject' (user said no).
+export async function sendTokenPayment({ walletRequest, jrpc, account, calls, say = () => {}, pollMs = 3000, maxPolls = 40 }) {
+  const sleep = ms => new Promise(x => setTimeout(x, ms));
+  const fail = (stage, msg) => { const e = new Error(msg); e.stage = stage; throw e; };
+  // EIP-5792 capability detection: an explicit "no atomic batching" skips straight to the
+  // sequential flow; anything else (capabilities absent, API missing) still tries the batch.
+  let caps = null;
+  try { caps = await walletRequest('wallet_getCapabilities', [account]); } catch { /* no capabilities API: still try sendCalls */ }
+  const cap1 = caps && (caps['0x1'] || caps['0x01'] || caps['eip155:1']);
+  const atomic = cap1 && (cap1.atomicBatch || cap1.atomic);
+  const capSaysNo = !!(caps && (!atomic || !(atomic.supported === true || atomic.status === 'supported' || atomic.status === 'ready')));
+  if (!capSaysNo) {
+    try {
+      say('Confirm the approval + payment in your wallet: one confirmation does both (EIP-5792)…');
+      const sendRes = await walletRequest('wallet_sendCalls', [{
+        version: '2.0.0', chainId: '0x1', from: account,
+        calls: [calls.approve, calls.payToken],
+      }]);
+      const bundleId = typeof sendRes === 'string' ? sendRes : (sendRes && sendRes.id) || null;
+      // some wallets return the transaction hash straight from sendCalls
+      let hash = bundleId && /^0x[0-9a-fA-F]{64}$/.test(bundleId) ? bundleId : null;
+      let confirmed = false, polled = false;
+      if (hash || bundleId) say('Batch sent · waiting for confirmation…');
+      for (let i = 0; i < maxPolls && !confirmed; i++) {
+        await sleep(pollMs);
+        if (hash) {
+          const rcpt = await jrpc('eth_getTransactionReceipt', [hash]).catch(() => null);
+          if (rcpt) {
+            if (rcpt.status !== '0x1') fail('batch', 'the batch transaction reverted');
+            confirmed = true;
+          }
+        } else if (bundleId) {
+          let cs = null;
+          try { cs = await walletRequest('wallet_getCallsStatus', [bundleId]); } catch { break; } // no status API: report as submitted
+          polled = true;
+          const code = Number(cs && cs.status);
+          if (code >= 200 && code < 300) {
+            confirmed = true;
+            const rc = cs.receipts && cs.receipts[0];
+            hash = (rc && rc.transactionHash) || hash;
+          } else if (code >= 400) fail('batch', 'the batch was rejected or reverted (wallet calls status ' + code + ')');
+        } else break;
+      }
+      return { via: 'batch', hash, confirmed };
+    } catch (e) {
+      if (e && e.stage === 'batch') throw e;
+      if (isWalletReject(e)) fail('reject', 'Cancelled in your wallet · nothing was sent.');
+      say('EIP-5792 batch unavailable (' + ((e && e.message) || e) + ') · falling back to two transactions…');
+    }
+  }
+  // sequential fallback: exact-amount approve, wait for it to mine, then payToken
+  say('Confirm the exact-amount USDC approval in your wallet (transaction 1 of 2)…');
+  let approveHash;
+  try {
+    approveHash = await walletRequest('eth_sendTransaction', [{ from: account, ...calls.approve }]);
+  } catch (e) {
+    if (isWalletReject(e)) fail('reject', 'Cancelled in your wallet · nothing was sent.');
+    fail('approve', (e && e.message) || String(e));
+  }
+  say('Approval sent · waiting for it to mine…');
+  for (let i = 0; ; i++) {
+    const rcpt = await jrpc('eth_getTransactionReceipt', [approveHash]).catch(() => null);
+    if (rcpt) {
+      if (rcpt.status !== '0x1') fail('approve', 'the approval transaction reverted');
+      break;
+    }
+    if (i >= maxPolls) fail('wait', 'the approval is still pending · check your wallet before retrying');
+    await sleep(pollMs);
+  }
+  say('Approval mined · confirm the payment (transaction 2 of 2)…');
+  let hash;
+  try {
+    hash = await walletRequest('eth_sendTransaction', [{ from: account, ...calls.payToken }]);
+  } catch (e) {
+    if (isWalletReject(e)) fail('reject', 'Cancelled in your wallet · the approval is already onchain, retrying reuses it.');
+    fail('pay', (e && e.message) || String(e));
+  }
+  return { via: 'sequential', hash, approveHash, confirmed: false };
+}
+
+// paidAmount from the pinned address's balances. The token reading (USDC invoices paid
+// via payToken) always wins; the ETH × price reading is only the legacy fallback for
+// links paid before token payments existed, so one payment is never counted twice.
+// Returns null when nothing readable arrived (the caller keeps its previous figure).
+export function paidFromBalances(rec, { balEth = 0, tokenBal = null, ethPrice = null } = {}) {
+  if (rec && rec.token === 'ETH') return balEth > 0 ? round6(balEth) : null;
+  if (tokenBal != null && tokenBal > 0) return round6(tokenBal);
+  if (balEth > 0 && ethPrice) return round2(balEth * ethPrice);
+  return null;
+}
+
 // ── everything below runs only in the browser with window.GP present ──
 
 const INV_KEY = 'gp-invoices';
@@ -410,7 +561,7 @@ async function qrDataUrl(text) {
 
 function copyBtn(text, btn, label) {
   navigator.clipboard.writeText(text).then(
-    () => { btn.textContent = 'COPIED ✓'; setTimeout(() => { btn.textContent = label; }, 1200); },
+    () => { btn.textContent = 'Copied ✓'; setTimeout(() => { btn.textContent = label; }, 1200); },
     () => GP.toast('copy failed: clipboard unavailable')
   );
 }
@@ -455,53 +606,90 @@ async function injectFrag() {
   container.insertAdjacentHTML('afterbegin', html || FRAG_FALLBACK);
 }
 
-// offline fallback: identical copy of frag-invoices.html
+// offline fallback: identical copy of the <style> block in frag-invoices.html
 const FRAG_FALLBACK = `<style id="gpinv-styles">
-  #gp-invoices h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
-  #gp-invoices .gpinv-box { border:1px solid #333; padding:16px; }
-  #gp-invoices .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-  #gp-invoices .gpinv-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:4px; }
-  #gp-invoices .gpinv-muted { color:#777; }
-  #gp-invoices .gpinv-mono { font-size:11px; color:#777; word-break:break-all; }
-  #gp-invoices .gpinv-mg { width:46px; height:46px; border:1px solid #fff; display:flex; flex:none;
-    align-items:center; justify-content:center; font-weight:700; letter-spacing:.1em; }
-  #gp-invoices .gpinv-tablewrap { overflow-x:auto; }
-  #gp-invoices table { width:100%; border-collapse:collapse; font-size:12px; }
-  #gp-invoices th { text-align:left; font-size:10px; letter-spacing:.2em; color:#777; font-weight:400;
-    padding:6px 10px 6px 0; border-bottom:1px solid #333; white-space:nowrap; }
-  #gp-invoices td { padding:10px 10px 10px 0; border-bottom:1px solid #222; vertical-align:top; }
-  #gp-invoices .gpinv-rowbtn { cursor:pointer; }
-  #gp-invoices .gpinv-rowbtn:hover td { background:#0d0d0d; }
-  #gp-invoices .gpinv-detail td { background:#0a0a0a; padding:16px; }
-  #gp-invoices td input, #gp-invoices td select { margin-top:0; padding:8px 10px; font-size:12px; }
-  /* status pills: same idiom as the inbox (outline, dim, solid) */
-  #gp-invoices .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
-    letter-spacing:.15em; white-space:nowrap; }
-  #gp-invoices .gpinv-pill.dim { border-color:#444; color:#888; }
-  #gp-invoices .gpinv-pill.solid { background:#fff; color:#000; font-weight:700; }
-  #gp-invoices .gpinv-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
-  #gp-invoices .gpinv-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
-  #gp-invoices .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
-  #gp-invoices .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
-    text-align:center; margin-top:4px; }
-  /* status filter row */
-  #gp-invoices .gpinv-filter { display:flex; gap:6px; flex-wrap:wrap; margin:16px 0 12px; }
-  #gp-invoices .gpinv-filter button { width:auto; padding:6px 12px; font-size:10px; letter-spacing:.15em; }
-  #gp-invoices .gpinv-filter button.on { background:#fff; color:#000; font-weight:700; border-color:#fff; }
-  /* INVOICES / ESTIMATES sub-switch (only when the shell has no #tab-estimates mount) */
-  #gp-invoices .gpinv-sub { display:flex; border:1px solid #333; margin-bottom:16px; }
-  #gp-invoices .gpinv-sub button { background:#000; color:#888; border:0; border-right:1px solid #333;
-    padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
-  #gp-invoices .gpinv-sub button:last-child { border-right:0; }
-  #gp-invoices .gpinv-sub button.on { background:#fff; color:#000; font-weight:700; }
-  /* editor save/cancel bar stays reachable on long forms */
-  #gp-invoices .gpinv-sticky { position:sticky; bottom:0; background:#000; border-top:1px solid #333;
-    padding:12px 0 8px; z-index:5; }
-  @media (max-width:700px) {
-    #gp-invoices .gpinv-grid { grid-template-columns:1fr; }
-    #gp-invoices .gpinv-actions { flex-direction:column; }
-    #gp-invoices .gpinv-actions button { width:100%; }
-    #gp-invoices .gpinv-sub button, #gp-invoices .gpinv-filter button { min-height:44px; }
+  /* pane headings + field labels (scoped to this module's five panes) */
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) .gp-h3 { margin: var(--gp-s6) 0 var(--gp-s3); }
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) > .gp-h3:first-child,
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) .gp-card > .gp-h3:first-child { margin-top: 0; }
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) .gp-eyebrow { display: block; margin-bottom: 6px; }
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) :is(.gp-input,.gp-select,.gp-textarea) { margin-top: 0; }
+
+  /* field layout: two-column rows collapse on mobile, .gpinv-gap stacks fields */
+  #gp-invoices .gpinv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gp-s4); }
+  #gp-invoices .gpinv-gap { margin-top: var(--gp-s4); }
+
+  /* line-items editor: denser controls inside table cells */
+  #gp-invoices .gpinv-items td :is(.gp-input,.gp-select) { padding: 8px 10px; font-size: var(--gp-fs-micro); }
+  #gp-invoices .gpinv-items td .gp-select[data-f="pick"] { margin-bottom: 6px; }
+
+  /* totals column: live editor totals, record detail, and the payer document.
+     Right-aligned rows with hairlines, the grand total on a strong line */
+  #gp-invoices .gpinv-totals, #payghost .gpinv-totals { margin: var(--gp-s4) 0 0 auto; width: min(320px,100%); font-size: var(--gp-fs-small); }
+  #gp-invoices .gpinv-trow, #payghost .gpinv-trow { display: flex; justify-content: space-between; gap: 16px; padding: 6px 0; border-bottom: 1px solid var(--gp-line-soft); color: var(--gp-muted); }
+  #gp-invoices .gpinv-trow > span:last-child, #payghost .gpinv-trow > span:last-child { color: var(--gp-fg); text-align: right; }
+  #gp-invoices .gpinv-trow.gpinv-grand, #payghost .gpinv-trow.gpinv-grand { border-bottom: 0; border-top: 1px solid var(--gp-line-strong); margin-top: 4px; padding-top: 10px; font-weight: 700; }
+  #gp-invoices .gpinv-trow.gpinv-grand > span, #payghost .gpinv-trow.gpinv-grand > span { color: var(--gp-fg); font-size: var(--gp-fs-body); }
+  #gp-invoices .gpinv-trow.gpinv-tusd, #payghost .gpinv-trow.gpinv-tusd { border-bottom: 0; color: var(--gp-faint); font-size: var(--gp-fs-micro); justify-content: flex-end; }
+
+  /* clickable list rows + the expansion row (an inset well) */
+  #gp-invoices .gpinv-rowbtn { cursor: pointer; }
+  #gp-invoices .gpinv-rowbtn:hover td { background: var(--gp-bg-raise); }
+  #gp-invoices .gpinv-detail td { background: var(--gp-bg-inset); padding: var(--gp-s4); }
+  #gp-invoices .gpinv-detailhead { display: flex; align-items: center; gap: 10px; }
+  #gp-invoices .gpinv-detailhead .gp-eyebrow { margin-bottom: 0; }
+  #gp-invoices .gpinv-meta { font-size: var(--gp-fs-small); margin-top: 6px; }
+  #gp-invoices .gpinv-detailtable { margin-top: var(--gp-s3); }
+  #gp-invoices .gpinv-sub { font-size: var(--gp-fs-micro); }
+
+  /* address / url blocks + the decrypted memo line */
+  #gp-invoices .gpinv-mono { font-size: var(--gp-fs-micro); color: var(--gp-muted); word-break: break-all; margin-top: 6px; }
+  #gp-invoices .gpinv-memo-line { font-size: var(--gp-fs-small); margin-top: 10px; }
+  #gp-invoices .gpinv-qr { margin-top: var(--gp-s3); text-align: center; }
+
+  /* action rows + the editor's sticky save bar (stays reachable on long forms) */
+  #gp-invoices .gpinv-actions { display: flex; gap: var(--gp-s2); margin-top: var(--gp-s4); flex-wrap: wrap; }
+  #gp-invoices .gpinv-paneactions { margin-top: 0; }
+  #gp-invoices .gpinv-sticky { position: sticky; bottom: 0; z-index: 5; background: var(--gp-bg-raise); border-top: 1px solid var(--gp-line); margin-top: var(--gp-s4); padding: var(--gp-s3) 0 var(--gp-s2); }
+
+  /* status filter + the INVOICES/ESTIMATES sub-switch ride the .gp-tabs primitive */
+  #gp-invoices .gp-tabs.gpinv-sub { margin-top: 0; }
+  #gp-invoices .gp-tabs.gpinv-filter { margin: var(--gp-s4) 0 var(--gp-s3); }
+
+  /* settings identity row (monogram + business name) */
+  #gp-invoices .gpinv-idrow { display: flex; gap: var(--gp-s4); align-items: center; }
+  #gp-invoices .gpinv-mg { width: 46px; height: 46px; border: 1px solid var(--gp-line-strong); border-radius: var(--gp-radius-sm); display: flex; flex: none; align-items: center; justify-content: center; font-family: var(--gp-font-display); font-weight: 700; letter-spacing: .1em; }
+
+  /* checkbox row (recurring template active flag) */
+  #gp-invoices .gpinv-check { display: flex; align-items: center; gap: 8px; font-size: var(--gp-fs-small); margin-top: var(--gp-s4); cursor: pointer; }
+  #gp-invoices .gpinv-check input { width: auto; margin: 0; }
+
+  /* ── payer invoice document (#payghost): the bill, above the address card ── */
+  #payghost .gpinv-doc { background: var(--gp-bg-raise); border: 1px solid var(--gp-line); border-radius: var(--gp-radius); padding: var(--gp-s5); margin-top: var(--gp-s4); }
+  #payghost .gpinv-doc-head { display: flex; align-items: center; gap: 10px; padding-bottom: var(--gp-s3); border-bottom: 1px solid var(--gp-line); }
+  #payghost .gpinv-doc-num { font-weight: 700; }
+  #payghost .gpinv-doc-head .gp-pill { margin-left: auto; }
+  #payghost .gpinv-doc-items { margin-top: var(--gp-s3); }
+  #payghost .gpinv-doc-kv { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-bottom: 1px solid var(--gp-line-soft); font-size: var(--gp-fs-small); }
+  #payghost .gpinv-doc-k { color: var(--gp-muted); flex: none; }
+  #payghost .gpinv-doc-duebox { margin-top: var(--gp-s4); }
+  #payghost .gpinv-doc-duebox .gp-eyebrow { display: block; }
+  #payghost .gpinv-doc-amount { font-size: 26px; font-weight: 700; letter-spacing: -.5px; margin-top: 6px; }
+  #payghost .gpinv-doc-token { font-size: var(--gp-fs-small); font-weight: 400; color: var(--gp-muted); letter-spacing: .1em; }
+  #payghost .gpinv-doc-eq { color: var(--gp-muted); font-size: var(--gp-fs-small); margin-top: 4px; min-height: 1.2em; }
+  #payghost .gpinv-doc-settle { border: 1px solid var(--gp-line); border-radius: var(--gp-radius-sm); padding: 10px 12px; margin-top: var(--gp-s4); font-size: var(--gp-fs-small); color: var(--gp-muted); }
+  #payghost .gpinv-doc-expired { border-color: rgba(205,111,94,.45); background: var(--gp-danger-bg); color: var(--gp-danger); }
+  /* the memo field lives inside the shell's address card: inherit works on the
+     inverted .card today and on a dark card if the shell retires .card later */
+  #payghost .gpinv-memo { margin-top: var(--gp-s4); }
+  #payghost .gpinv-memo .gp-eyebrow { display: block; margin-bottom: 6px; color: inherit; opacity: .8; }
+  #payghost .gpinv-memo .gp-input { margin-top: 0; }
+
+  @media (max-width: 700px) {
+    #gp-invoices .gpinv-grid { grid-template-columns: 1fr; }
+    #gp-invoices .gpinv-actions { flex-direction: column; }
+    #gp-invoices .gpinv-actions .gp-btn { width: 100%; min-height: 44px; }
+    #payghost .gpinv-doc { padding: var(--gp-s4); }
   }
 </style>`;
 
@@ -528,12 +716,17 @@ async function initSuite() {
   let itemDraft = { name: '', description: '', unitPrice: '', token: 'USDC', taxPct: '', discPct: '' };
   let openId = null, qrFor = null, recOpen = null;
 
-  // status pills: same idiom as the inbox (outline default, dim for inactive,
-  // solid for terminal-good)
+  // status pills ride the .gp-pill primitive: semantic tones for terminal and
+  // attention states, dim for inactive, bare outline otherwise. Labels stay caps:
+  // they are status tokens, not copy.
   const pill = st => {
-    const dim = st === 'DRAFT' || st === 'DECLINED' || st === 'PAUSED';
-    const solid = st === 'PAID' || st === 'ACCEPTED' || st === 'DUE';
-    return '<span class="gpinv-pill' + (dim ? ' dim' : '') + (solid ? ' solid' : '') + '">' + st + '</span>';
+    const tone =
+      st === 'PAID' || st === 'ACCEPTED' || st === 'ACTIVE' ? ' ok'
+      : st === 'OVERDUE' ? ' danger'
+      : st === 'DRAFT' || st === 'DECLINED' || st === 'PAUSED' ? ' dim'
+      : st === 'SENT' || st === 'PARTIAL' ? ' info'
+      : '';
+    return '<span class="gp-pill' + tone + '">' + st + '</span>';
   };
 
   const findRec = id => loadInv().find(x => x.id === id) || loadEst().find(x => x.id === id) || null;
@@ -560,38 +753,38 @@ async function initSuite() {
   function taxCellHtml(r, i, pref) {
     const rateStr = r.taxPct == null || r.taxPct === '' ? '' : String(r.taxPct);
     const sel = r._taxpick ?? (rateStr === '' ? '0' : (TAX_PRESETS.includes(rateStr) ? rateStr : 'custom'));
-    return '<select data-row="' + i + '" data-f="taxpick" data-pref="' + pref + '" style="margin-top:0">'
+    return '<select class="gp-select" data-row="' + i + '" data-f="taxpick" data-pref="' + pref + '">'
       + TAX_PRESETS.map(v => '<option value="' + v + '"' + (sel === v ? ' selected' : '') + '>' + v + '%</option>').join('')
       + '<option value="custom"' + (sel === 'custom' ? ' selected' : '') + '>custom…</option>'
       + '</select>'
       + (sel === 'custom'
-        ? '<input data-row="' + i + '" data-f="taxcustom" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="%" value="' + escHtml(rateStr) + '" style="margin-top:6px">'
+        ? '<input class="gp-input" data-row="' + i + '" data-f="taxcustom" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="%" value="' + escHtml(rateStr) + '" style="margin-top:6px">'
         : '');
   }
 
   function rowsTableHtml(rows, token, catalog, pref) {
-    return '<div class="gpinv-tablewrap"><table id="gpinv-' + pref + '-items"><thead><tr>'
-      + '<th style="width:34%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th><th>DISC %</th><th>TAX</th><th style="text-align:right">AMOUNT</th><th></th>'
+    return '<div class="gp-tablewrap gpinv-items"><table class="gp-table" id="gpinv-' + pref + '-items"><thead><tr>'
+      + '<th style="width:34%">Description</th><th>Qty</th><th>Unit price</th><th>Disc %</th><th>Tax</th><th style="text-align:right">Amount</th><th></th>'
       + '</tr></thead><tbody>'
       + rows.map((r, i) =>
           '<tr><td>'
-          + '<select data-row="' + i + '" data-f="pick" data-pref="' + pref + '" style="margin-top:0;margin-bottom:6px">'
+          + '<select class="gp-select" data-row="' + i + '" data-f="pick" data-pref="' + pref + '">'
           + '<option value="">catalog item…</option>'
           + catalog.map((c, ci) =>
               '<option value="' + ci + '"' + (r._pick === String(ci) ? ' selected' : '') + '>'
               + escHtml(c.name) + ' · ' + fmtAmt(c.unitPrice, c.token) + ' ' + c.token + '</option>'
             ).join('')
           + '</select>'
-          + '<input data-row="' + i + '" data-f="description" data-pref="' + pref + '" placeholder="description" value="' + escHtml(r.description) + '"></td>'
-          + '<td><input data-row="' + i + '" data-f="qty" data-pref="' + pref + '" type="number" min="0" step="any" value="' + escHtml(r.qty) + '"></td>'
-          + '<td><input data-row="' + i + '" data-f="unitPrice" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="0.00" value="' + escHtml(r.unitPrice) + '"></td>'
-          + '<td><input data-row="' + i + '" data-f="discPct" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="0" value="' + escHtml(r.discPct ?? '') + '"></td>'
+          + '<input class="gp-input" data-row="' + i + '" data-f="description" data-pref="' + pref + '" placeholder="description" value="' + escHtml(r.description) + '"></td>'
+          + '<td><input class="gp-input" data-row="' + i + '" data-f="qty" data-pref="' + pref + '" type="number" min="0" step="any" value="' + escHtml(r.qty) + '"></td>'
+          + '<td><input class="gp-input" data-row="' + i + '" data-f="unitPrice" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="0.00" value="' + escHtml(r.unitPrice) + '"></td>'
+          + '<td><input class="gp-input" data-row="' + i + '" data-f="discPct" data-pref="' + pref + '" type="number" min="0" step="any" placeholder="0" value="' + escHtml(r.discPct ?? '') + '"></td>'
           + '<td style="white-space:nowrap">' + taxCellHtml(r, i, pref) + '</td>'
           + '<td style="text-align:right;white-space:nowrap" data-rowamt="' + i + '" data-pref="' + pref + '">' + fmtAmt((parseFloat(r.qty) || 0) * (parseFloat(r.unitPrice) || 0), token) + '</td>'
-          + '<td style="width:1%"><button class="ghost gpinv-x" data-iact="' + pref + '-del-row" data-row="' + i + '" title="remove row">×</button></td></tr>'
+          + '<td style="width:1%"><button type="button" class="gp-btn small ghost gpinv-x" data-iact="' + pref + '-del-row" data-row="' + i + '" title="remove row">×</button></td></tr>'
         ).join('')
       + '</tbody></table></div>'
-      + '<button class="ghost" data-iact="' + pref + '-add-row" style="width:auto;padding:8px 14px;font-size:11px;margin-top:10px">+ ADD ROW</button>';
+      + '<button type="button" class="gp-btn small ghost" data-iact="' + pref + '-add-row" style="margin-top:10px">Add row</button>';
   }
 
   function readRows(pref) {
@@ -614,17 +807,17 @@ async function initSuite() {
   // v4 totals block: subtotal, total discount, one line per tax rate (rate · base ·
   // amount), grand total. The whole block rewrites on each keystroke (no inputs inside).
   function totalsInnerHtml(pref, t, token) {
-    return '<div>subtotal · <b>' + fmtAmt(t.subtotal, token) + '</b></div>'
-      + (t.discountAmount > 0 ? '<div>discount · −<b>' + fmtAmt(t.discountAmount, token) + '</b></div>' : '')
+    return '<div class="gpinv-trow"><span>Subtotal</span><span>' + fmtAmt(t.subtotal, token) + '</span></div>'
+      + (t.discountAmount > 0 ? '<div class="gpinv-trow"><span>Discount</span><span>−' + fmtAmt(t.discountAmount, token) + '</span></div>' : '')
       + (t.taxLines || []).map(tl =>
-          '<div>tax ' + tl.rate + '% on ' + fmtAmt(tl.base, token) + ' · <b>' + fmtAmt(tl.amount, token) + '</b></div>'
+          '<div class="gpinv-trow"><span>Tax ' + tl.rate + '% on ' + fmtAmt(tl.base, token) + '</span><span>' + fmtAmt(tl.amount, token) + '</span></div>'
         ).join('')
-      + '<div style="font-size:16px;margin-top:4px">total · <b>' + fmtAmt(t.total, token) + '</b> ' + token + '</div>'
-      + '<div class="status" style="margin-top:2px" id="gpinv-' + pref + '-usd"></div>';
+      + '<div class="gpinv-trow gpinv-grand"><span>Total</span><span>' + fmtAmt(t.total, token) + ' ' + token + '</span></div>'
+      + '<div class="gpinv-trow gpinv-tusd" id="gpinv-' + pref + '-usd"></div>';
   }
 
   function totalsBlockHtml(pref, t, token) {
-    return '<div style="margin-top:14px;text-align:right;font-size:12px" id="gpinv-' + pref + '-totals">'
+    return '<div class="gpinv-totals" id="gpinv-' + pref + '-totals">'
       + totalsInnerHtml(pref, t, token)
       + '</div>';
   }
@@ -646,10 +839,10 @@ async function initSuite() {
     const usdEl = $('gpinv-' + pref + '-usd');
     if (usdEl) {
       const direct = fmtUsd(t.total, token, GP.state.ethPriceUsd);
-      if (direct) usdEl.textContent = '≈ ' + direct + ' usd';
+      if (direct) usdEl.textContent = '≈ ' + direct;
       else ethUsd().then(px => {
         const u = fmtUsd(t.total, token, px);
-        if (usdEl.isConnected) usdEl.textContent = u ? '≈ ' + u + ' usd' : 'usd estimate unavailable (relayer price feed offline)';
+        if (usdEl.isConnected) usdEl.textContent = u ? '≈ ' + u : 'USD estimate unavailable (relayer price feed offline)';
       });
     }
     return t;
@@ -685,24 +878,28 @@ async function initSuite() {
     const clients = loadClients();
     const catalog = loadItems();
     const d = formDraft;
-    return '<h3>' + (editId ? 'EDIT ' : 'NEW ') + kind.toUpperCase() + '</h3>'
-      + '<div class="gpinv-box">'
-      + '<div class="gpinv-lbl">CLIENT</div>'
-      + '<select id="gpinv-f-client" style="margin-top:4px"><option value="">no client</option>'
+    return '<div class="gp-card gpinv-editor">'
+      + '<h3 class="gp-h3">' + (editId ? 'Edit ' : 'New ') + kind + '</h3>'
+      + '<label class="gp-eyebrow" for="gpinv-f-client">Client</label>'
+      + '<select class="gp-select" id="gpinv-f-client"><option value="">no client</option>'
       + clients.map(c => '<option value="' + escHtml(c.id) + '"' + (d.clientId === c.id ? ' selected' : '') + '>' + escHtml(c.name) + '</option>').join('')
       + '</select>'
-      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS · TAX RATE PER ROW, DEFAULT ' + escHtml(String(p.taxPct ?? 0)) + '% FROM YOUR PROFILE</div>'
+      + '<div class="gp-eyebrow gpinv-gap">Line items · tax rate per row, default ' + escHtml(String(p.taxPct ?? 0)) + '% from your profile</div>'
       + rowsTableHtml(formRows, d.token, catalog, 'f')
       + totalsBlockHtml('f', computeTotals(formRows, null, null), d.token)
-      + '<div class="gpinv-lbl" style="margin-top:14px">TOKEN</div>'
-      + '<select id="gpinv-f-token" style="margin-top:4px">'
+      + '<div class="gpinv-grid gpinv-gap">'
+      + '<div><label class="gp-eyebrow" for="gpinv-f-token">Token</label>'
+      + '<select class="gp-select" id="gpinv-f-token">'
       + ['USDC', 'ETH'].map(t => '<option' + (d.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
-      + '</select>'
-      + '<input id="gpinv-f-note" placeholder="note (optional: prefills the payer\'s encrypted memo)" value="' + escHtml(d.note) + '">'
-      + '<input id="gpinv-f-exp" type="number" min="0" placeholder="expires in days (optional: blank = never)" value="' + escHtml(d.expDays) + '">'
+      + '</select></div>'
+      + '<div><label class="gp-eyebrow" for="gpinv-f-exp">Expires in days</label>'
+      + '<input class="gp-input" id="gpinv-f-exp" type="number" min="0" placeholder="optional: blank = never" value="' + escHtml(d.expDays) + '"></div>'
+      + '</div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-f-note">Note</label>'
+      + '<input class="gp-input" id="gpinv-f-note" placeholder="optional: prefills the payer\'s encrypted memo" value="' + escHtml(d.note) + '"></div>'
       + '<div class="gpinv-actions gpinv-sticky">'
-      + '<button data-iact="save-form">' + (editId ? 'SAVE CHANGES' : 'CREATE ' + kind.toUpperCase()) + '</button>'
-      + '<button class="ghost" data-iact="toggle-form">CANCEL</button>'
+      + '<button type="button" class="gp-btn primary" data-iact="save-form">' + (editId ? 'Save changes' : 'Create ' + kind) + '</button>'
+      + '<button type="button" class="gp-btn ghost" data-iact="toggle-form">Cancel</button>'
       + '</div>'
       + '<div class="status" id="gpinv-f-st"></div>'
       + '</div>';
@@ -728,13 +925,13 @@ async function initSuite() {
       '<tr><td>' + escHtml(it.description || 'item') + '</td>'
       + '<td>' + escHtml(it.qty) + '</td>'
       + '<td>' + fmtAmt(it.unitPrice, rec.token) + '</td>'
-      + (anyDisc ? '<td>' + (it.discountPct > 0 ? it.discountPct + '%' : '<span class="gpinv-muted">·</span>') + '</td>' : '')
+      + (anyDisc ? '<td>' + (it.discountPct > 0 ? it.discountPct + '%' : '<span class="gp-faint">·</span>') + '</td>' : '')
       + '<td>' + (it.taxPct > 0 ? it.taxPct + '%' : '0%') + '</td>'
       + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
     ).join('');
     const tls = taxLinesOf(rec);
-    return '<div class="gpinv-lbl">' + kind.toUpperCase() + ' ' + escHtml(rec.number) + ' · ' + pill(st) + '</div>'
-      + '<div class="gpinv-muted" style="font-size:12px">'
+    return '<div class="gpinv-detailhead"><span class="gp-eyebrow">' + kind + ' ' + escHtml(rec.number) + '</span>' + pill(st) + '</div>'
+      + '<div class="gp-muted gpinv-meta">'
       + 'created ' + fmtDate(rec.created)
       + (rec.clientName ? ' · client: ' + escHtml(rec.clientName) : '')
       + (rec.expiry ? ' · ' + (kind === 'invoice' ? 'due ' : 'valid until ') + fmtDate(rec.expiry) : ' · no expiry')
@@ -742,37 +939,38 @@ async function initSuite() {
       + (rec.paidAt ? ' · paid ' + fmtDate(rec.paidAt) : '')
       + (rec.estimateOf ? ' · converted from estimate' : '')
       + '</div>'
-      + '<div class="gpinv-tablewrap" style="margin-top:12px"><table><thead><tr>'
-      + '<th style="width:40%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th>' + (anyDisc ? '<th>DISC</th>' : '') + '<th>TAX</th><th style="text-align:right">AMOUNT</th>'
+      + '<div class="gp-tablewrap gpinv-detailtable"><table class="gp-table"><thead><tr>'
+      + '<th style="width:40%">Description</th><th>Qty</th><th>Unit price</th>' + (anyDisc ? '<th>Disc</th>' : '') + '<th>Tax</th><th style="text-align:right">Amount</th>'
       + '</tr></thead><tbody>' + itemRows + '</tbody></table></div>'
-      + '<div style="margin-top:10px;text-align:right;font-size:12px">'
-      + '<div>subtotal · ' + fmtAmt(rec.subtotal, rec.token) + ' ' + rec.token + '</div>'
-      + (rec.discountAmount > 0 ? '<div>discount · −' + fmtAmt(rec.discountAmount, rec.token) + ' ' + rec.token + '</div>' : '')
-      + tls.map(tl => '<div>tax ' + tl.rate + '% on ' + fmtAmt(tl.base, rec.token) + ' · ' + fmtAmt(tl.amount, rec.token) + ' ' + rec.token + '</div>').join('')
-      + '<div style="font-size:16px;margin-top:2px"><b>' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</b></div>'
-      + '<div class="status" style="margin-top:2px" data-usd data-amt="' + rec.total + '" data-token="' + rec.token + '"></div>'
-      + (st === 'PARTIAL' ? '<div class="status" style="color:#fff">paid so far · ' + fmtAmt(rec.paidAmount, rec.token) + ' ' + rec.token + ' · remaining ' + fmtAmt(round2(rec.total - rec.paidAmount), rec.token) + ' ' + rec.token + '</div>' : '')
+      + '<div class="gpinv-totals">'
+      + '<div class="gpinv-trow"><span>Subtotal</span><span>' + fmtAmt(rec.subtotal, rec.token) + ' ' + rec.token + '</span></div>'
+      + (rec.discountAmount > 0 ? '<div class="gpinv-trow"><span>Discount</span><span>−' + fmtAmt(rec.discountAmount, rec.token) + ' ' + rec.token + '</span></div>' : '')
+      + tls.map(tl => '<div class="gpinv-trow"><span>Tax ' + tl.rate + '% on ' + fmtAmt(tl.base, rec.token) + '</span><span>' + fmtAmt(tl.amount, rec.token) + ' ' + rec.token + '</span></div>').join('')
+      + '<div class="gpinv-trow gpinv-grand"><span>Total</span><span>' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</span></div>'
+      + '<div class="gpinv-trow gpinv-tusd" data-usd data-amt="' + rec.total + '" data-token="' + rec.token + '"></div>'
+      + (st === 'PARTIAL' ? '<div class="gpinv-trow"><span>Paid so far</span><span>' + fmtAmt(rec.paidAmount, rec.token) + ' ' + rec.token + '</span></div>'
+        + '<div class="gpinv-trow"><span>Remaining</span><span>' + fmtAmt(round2(rec.total - rec.paidAmount), rec.token) + ' ' + rec.token + '</span></div>' : '')
       + '</div>'
-      + (rec.note ? '<div class="status">note: ' + escHtml(rec.note) + '</div>' : '')
-      + (memo ? '<div class="status" style="color:#fff">payment memo: ' + escHtml(memo) + '</div>' : '')
-      + (rec.paidTx ? '<div class="status">payment tx: <a href="https://etherscan.io/tx/' + escHtml(rec.paidTx) + '" target="_blank" rel="noopener">' + escHtml(rec.paidTx.slice(0, 18)) + '…</a></div>' : '')
-      + '<div class="gpinv-lbl" style="margin-top:12px">PINNED STEALTH ADDRESS</div>'
+      + (rec.note ? '<div class="gp-muted gpinv-meta">note: ' + escHtml(rec.note) + '</div>' : '')
+      + (memo ? '<div class="gpinv-memo-line">payment memo: ' + escHtml(memo) + '</div>' : '')
+      + (rec.paidTx ? '<div class="gp-muted gpinv-meta">payment tx: <a href="https://etherscan.io/tx/' + escHtml(rec.paidTx) + '" target="_blank" rel="noopener">' + escHtml(rec.paidTx.slice(0, 18)) + '…</a></div>' : '')
+      + '<div class="gp-eyebrow gpinv-gap">Pinned stealth address</div>'
       + '<div class="gpinv-mono">' + escHtml(rec.stealthAddress) + '</div>'
-      + '<div class="gpinv-mono" style="margin-top:6px">' + escHtml(rec.url) + '</div>'
-      + (qrFor === rec.id ? '<div style="margin-top:12px;text-align:center"><canvas data-qr style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas></div>' : '')
+      + '<div class="gpinv-mono">' + escHtml(rec.url) + '</div>'
+      + (qrFor === rec.id ? '<div class="gpinv-qr"><canvas data-qr style="background:#fff;padding:14px;image-rendering:pixelated;max-width:100%"></canvas></div>' : '')
       + '<div class="gpinv-actions">'
-      + '<button class="ghost" data-iact="view" data-id="' + escHtml(rec.id) + '">VIEW LINK</button>'
-      + '<button class="ghost" data-iact="qr" data-id="' + escHtml(rec.id) + '">QR</button>'
-      + '<button class="ghost" data-iact="copy" data-id="' + escHtml(rec.id) + '">COPY LINK</button>'
-      + (kind === 'invoice' && st === 'OVERDUE' ? '<button class="ghost" data-iact="remind" data-id="' + escHtml(rec.id) + '">REMINDER</button>' : '')
-      + '<button class="ghost" data-iact="dup" data-id="' + escHtml(rec.id) + '">DUPLICATE</button>'
-      + '<button class="ghost" data-iact="print" data-id="' + escHtml(rec.id) + '">PRINT / PDF</button>'
-      + (st === 'DRAFT' ? '<button class="ghost" data-iact="edit" data-id="' + escHtml(rec.id) + '">EDIT</button>' : '')
-      + (st === 'DRAFT' ? '<button class="ghost" data-iact="sent" data-id="' + escHtml(rec.id) + '">MARK SENT</button>' : '')
-      + (kind === 'estimate' && st === 'SENT' ? '<button class="ghost" data-iact="accept" data-id="' + escHtml(rec.id) + '">MARK ACCEPTED</button>' : '')
-      + (kind === 'estimate' && st === 'SENT' ? '<button class="ghost" data-iact="decline" data-id="' + escHtml(rec.id) + '">MARK DECLINED</button>' : '')
-      + (kind === 'estimate' && (st === 'SENT' || st === 'ACCEPTED') ? '<button data-iact="convert" data-id="' + escHtml(rec.id) + '">CONVERT TO INVOICE</button>' : '')
-      + (st === 'DRAFT' ? '<button class="ghost" data-iact="del" data-id="' + escHtml(rec.id) + '">DELETE</button>' : '')
+      + '<button type="button" class="gp-btn small ghost" data-iact="view" data-id="' + escHtml(rec.id) + '">View link</button>'
+      + '<button type="button" class="gp-btn small ghost" data-iact="qr" data-id="' + escHtml(rec.id) + '">QR</button>'
+      + '<button type="button" class="gp-btn small ghost" data-iact="copy" data-id="' + escHtml(rec.id) + '">Copy link</button>'
+      + (kind === 'invoice' && st === 'OVERDUE' ? '<button type="button" class="gp-btn small ghost" data-iact="remind" data-id="' + escHtml(rec.id) + '">Reminder</button>' : '')
+      + '<button type="button" class="gp-btn small ghost" data-iact="dup" data-id="' + escHtml(rec.id) + '">Duplicate</button>'
+      + '<button type="button" class="gp-btn small ghost" data-iact="print" data-id="' + escHtml(rec.id) + '">Print / PDF</button>'
+      + (st === 'DRAFT' ? '<button type="button" class="gp-btn small ghost" data-iact="edit" data-id="' + escHtml(rec.id) + '">Edit</button>' : '')
+      + (st === 'DRAFT' ? '<button type="button" class="gp-btn small" data-iact="sent" data-id="' + escHtml(rec.id) + '">Mark sent</button>' : '')
+      + (kind === 'estimate' && st === 'SENT' ? '<button type="button" class="gp-btn small" data-iact="accept" data-id="' + escHtml(rec.id) + '">Mark accepted</button>' : '')
+      + (kind === 'estimate' && st === 'SENT' ? '<button type="button" class="gp-btn small ghost" data-iact="decline" data-id="' + escHtml(rec.id) + '">Mark declined</button>' : '')
+      + (kind === 'estimate' && (st === 'SENT' || st === 'ACCEPTED') ? '<button type="button" class="gp-btn small primary" data-iact="convert" data-id="' + escHtml(rec.id) + '">Convert to invoice</button>' : '')
+      + (st === 'DRAFT' ? '<button type="button" class="gp-btn small danger" data-iact="del" data-id="' + escHtml(rec.id) + '">Delete</button>' : '')
       + '</div>';
   }
 
@@ -786,28 +984,28 @@ async function initSuite() {
     const rows = [...reg].sort((a, b) => b.created - a.created);
     const shown = filter === 'ALL' ? rows : rows.filter(r => invStatus(r) === filter);
     const noun = kind === 'estimate' ? 'estimate' : 'invoice';
-    return '<div class="gpinv-actions" style="margin-top:0">'
-      + '<button data-iact="toggle-form" data-k="' + kind + '">' + (showForm && formKind === kind ? 'CANCEL' : 'NEW ' + noun.toUpperCase()) + '</button>'
+    return '<div class="gpinv-actions gpinv-paneactions">'
+      + '<button type="button" class="gp-btn primary" data-iact="toggle-form" data-k="' + kind + '">' + (showForm && formKind === kind ? 'Cancel' : 'New ' + noun) + '</button>'
       + '</div>'
       + (showForm && formKind === kind ? editorHtml() : '')
-      + '<div class="gpinv-filter">'
-      + filters.map(f => '<button class="ghost' + (filter === f ? ' on' : '') + '" data-iact="filter" data-k="' + kind + '" data-f="' + f + '">' + f + '</button>').join('')
+      + '<div class="gp-tabs gpinv-filter">'
+      + filters.map(f => '<button type="button" class="gp-tab' + (filter === f ? ' on' : '') + '" data-iact="filter" data-k="' + kind + '" data-f="' + f + '">' + f + '</button>').join('')
       + '</div>'
       + (rows.length === 0
-        ? '<div class="gpinv-empty">no ' + noun + 's yet: press NEW ' + noun.toUpperCase() + ' to create your first one. '
-          + (kind === 'invoice' ? 'tip: add clients under CUSTOMERS and reusable lines under ITEMS first, then pick them here.' : 'estimates share the client list and item catalog with invoices.') + '</div>'
+        ? '<div class="gp-empty"><div class="gp-empty-title">No ' + noun + 's yet</div>'
+          + (kind === 'invoice' ? 'Create one to get a private payment link. Add clients under Customers and reusable lines under Items first, then pick them here.' : 'Estimates share the client list and item catalog with invoices.') + '</div>'
         : shown.length === 0
-          ? '<div class="gpinv-empty">nothing with status ' + filter + ': pick another filter above.</div>'
-          : '<div class="gpinv-tablewrap"><table><thead><tr>'
-            + '<th>NUMBER</th><th>CLIENT</th><th>DATE</th><th>' + (kind === 'invoice' ? 'DUE' : 'VALID UNTIL') + '</th>'
-            + '<th style="text-align:right">TOTAL</th><th style="text-align:right">USD</th><th style="text-align:right">STATUS</th>'
+          ? '<div class="gp-empty"><div class="gp-empty-title">Nothing with status ' + filter + '</div>Pick another filter above.</div>'
+          : '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
+            + '<th>Number</th><th>Client</th><th>Date</th><th>' + (kind === 'invoice' ? 'Due' : 'Valid until') + '</th>'
+            + '<th style="text-align:right">Total</th><th style="text-align:right">USD</th><th style="text-align:right">Status</th>'
             + '</tr></thead><tbody>'
             + shown.map(rec =>
                 '<tr class="gpinv-rowbtn" data-iact="open" data-id="' + escHtml(rec.id) + '">'
                 + '<td><b>' + escHtml(rec.number) + '</b></td>'
-                + '<td>' + (rec.clientName ? escHtml(rec.clientName) : '<span class="gpinv-muted">·</span>') + '</td>'
+                + '<td>' + (rec.clientName ? escHtml(rec.clientName) : '<span class="gp-faint">·</span>') + '</td>'
                 + '<td style="white-space:nowrap">' + fmtDate(rec.created) + '</td>'
-                + '<td style="white-space:nowrap">' + (rec.expiry ? fmtDate(rec.expiry) : '<span class="gpinv-muted">·</span>') + '</td>'
+                + '<td style="white-space:nowrap">' + (rec.expiry ? fmtDate(rec.expiry) : '<span class="gp-faint">·</span>') + '</td>'
                 + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</td>'
                 + '<td style="text-align:right;white-space:nowrap" data-usd data-amt="' + rec.total + '" data-token="' + rec.token + '"></td>'
                 + '<td style="text-align:right">' + pill(invStatus(rec)) + '</td></tr>'
@@ -821,9 +1019,9 @@ async function initSuite() {
     const el = mounts.invoices;
     if (!el) return;
     const kindSwitch = mounts.estimates ? '' :
-      '<div class="gpinv-sub">'
-      + '<button data-iact="kind" data-k="invoice"' + (invKind === 'invoice' ? ' class="on"' : '') + '>INVOICES</button>'
-      + '<button data-iact="kind" data-k="estimate"' + (invKind === 'estimate' ? ' class="on"' : '') + '>ESTIMATES</button>'
+      '<div class="gp-tabs gpinv-sub">'
+      + '<button type="button" class="gp-tab' + (invKind === 'invoice' ? ' on' : '') + '" data-iact="kind" data-k="invoice">Invoices</button>'
+      + '<button type="button" class="gp-tab' + (invKind === 'estimate' ? ' on' : '') + '" data-iact="kind" data-k="estimate">Estimates</button>'
       + '</div>';
     el.innerHTML = kindSwitch + listHtml(mounts.estimates ? 'invoice' : invKind);
     afterRender(el);
@@ -845,36 +1043,41 @@ async function initSuite() {
     const inv = loadInv();
     const now = Date.now();
     el.innerHTML =
-      '<h3>ADD CUSTOMER</h3>'
-      + '<div class="gpinv-box">'
-      + '<input id="gpinv-c-name" placeholder="name" style="margin-top:0">'
-      + '<input id="gpinv-c-contact" placeholder="contact (email, telegram, …)">'
-      + '<textarea id="gpinv-c-addr" rows="2" placeholder="address lines (optional, one per line: printed on invoices)"></textarea>'
-      + '<input id="gpinv-c-vat" placeholder="VAT / tax number (optional: printed under the bill-to block)">'
-      + '<input id="gpinv-c-notes" placeholder="notes (optional)">'
-      + '<button data-iact="add-client" style="margin-top:14px">ADD CUSTOMER</button>'
+      '<h3 class="gp-h3">Add customer</h3>'
+      + '<div class="gp-card">'
+      + '<label class="gp-eyebrow" for="gpinv-c-name">Name</label>'
+      + '<input class="gp-input" id="gpinv-c-name" placeholder="e.g. Acme Ltd">'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-c-contact">Contact</label>'
+      + '<input class="gp-input" id="gpinv-c-contact" placeholder="email, telegram, …"></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-c-addr">Address lines</label>'
+      + '<textarea class="gp-textarea" id="gpinv-c-addr" rows="2" placeholder="optional, one per line: printed on invoices"></textarea></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-c-vat">VAT / tax number</label>'
+      + '<input class="gp-input" id="gpinv-c-vat" placeholder="optional: printed under the bill-to block"></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-c-notes">Notes</label>'
+      + '<input class="gp-input" id="gpinv-c-notes" placeholder="optional"></div>'
+      + '<div class="gpinv-actions"><button type="button" class="gp-btn primary" data-iact="add-client">Add customer</button></div>'
       + '<div class="status" id="gpinv-c-st"></div>'
       + '</div>'
-      + '<h3>CUSTOMERS</h3>'
+      + '<h3 class="gp-h3">Customers</h3>'
       + (clients.length
-        ? '<div class="gpinv-tablewrap"><table><thead><tr>'
-          + '<th>NAME</th><th>CONTACT</th><th style="text-align:right">OUTSTANDING</th><th style="text-align:right">PAID</th><th></th>'
+        ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
+          + '<th>Name</th><th>Contact</th><th style="text-align:right">Outstanding</th><th style="text-align:right">Paid</th><th></th>'
           + '</tr></thead><tbody>'
           + clients.map(c => {
               const mine = inv.filter(i => i.clientId === c.id);
               const tot = f => mine.filter(f).reduce((m, i) => { m[i.token] = (m[i.token] || 0) + i.total; return m; }, {});
-              const cell = m => Object.keys(m).length ? Object.keys(m).map(t => fmtAmt(m[t], t) + ' ' + t).join('<br>') : '<span class="gpinv-muted">·</span>';
+              const cell = m => Object.keys(m).length ? Object.keys(m).map(t => fmtAmt(m[t], t) + ' ' + t).join('<br>') : '<span class="gp-faint">·</span>';
               const open = i => ['SENT', 'PARTIAL', 'OVERDUE'].includes(invStatus(i, now));
               return '<tr><td><b>' + escHtml(c.name) + '</b>'
-                + (c.vatNumber ? '<div class="gpinv-muted" style="font-size:10px">tax id: ' + escHtml(c.vatNumber) + '</div>' : '')
-                + (c.notes ? '<div class="gpinv-muted" style="font-size:10px">' + escHtml(c.notes) + '</div>' : '')
-                + '</td><td>' + (c.contact ? escHtml(c.contact) : '<span class="gpinv-muted">·</span>') + '</td>'
+                + (c.vatNumber ? '<div class="gp-faint gpinv-sub">tax id: ' + escHtml(c.vatNumber) + '</div>' : '')
+                + (c.notes ? '<div class="gp-faint gpinv-sub">' + escHtml(c.notes) + '</div>' : '')
+                + '</td><td>' + (c.contact ? escHtml(c.contact) : '<span class="gp-faint">·</span>') + '</td>'
                 + '<td style="text-align:right">' + cell(tot(open)) + '</td>'
                 + '<td style="text-align:right">' + cell(tot(i => i.status === 'PAID')) + '</td>'
-                + '<td style="width:1%"><button class="ghost gpinv-x" data-iact="del-client" data-id="' + escHtml(c.id) + '" title="delete customer">×</button></td></tr>';
+                + '<td style="width:1%"><button type="button" class="gp-btn small ghost gpinv-x" data-iact="del-client" data-id="' + escHtml(c.id) + '" title="delete customer">×</button></td></tr>';
             }).join('')
           + '</tbody></table></div>'
-        : '<div class="gpinv-empty">no customers yet: add one above, then pick them when creating an invoice. outstanding and paid totals build up here as invoices move.</div>');
+        : '<div class="gp-empty"><div class="gp-empty-title">No customers yet</div>Add one above, then pick them when creating an invoice. Outstanding and paid totals build up here as invoices move.</div>');
   }
 
   // ── tab: ITEMS (reusable line-item catalog) ──
@@ -883,43 +1086,45 @@ async function initSuite() {
     if (!el) return;
     const items = loadItems();
     el.innerHTML =
-      '<h3>' + (itemEditId ? 'EDIT ITEM' : 'ADD ITEM') + '</h3>'
-      + '<div class="gpinv-box">'
-      + '<input id="gpinv-i-name" placeholder="item name (e.g. design retainer)" style="margin-top:0" value="' + escHtml(itemDraft.name) + '">'
-      + '<input id="gpinv-i-desc" placeholder="description (prefills invoice lines)" value="' + escHtml(itemDraft.description) + '">'
-      + '<div class="gpinv-grid" style="margin-top:8px">'
-      + '<div><div class="gpinv-lbl">UNIT PRICE</div><input id="gpinv-i-price" type="number" min="0" step="any" style="margin-top:4px" value="' + escHtml(itemDraft.unitPrice) + '" placeholder="0.00"></div>'
-      + '<div><div class="gpinv-lbl">TOKEN</div><select id="gpinv-i-token" style="margin-top:4px">'
+      '<h3 class="gp-h3">' + (itemEditId ? 'Edit item' : 'Add item') + '</h3>'
+      + '<div class="gp-card">'
+      + '<label class="gp-eyebrow" for="gpinv-i-name">Item name</label>'
+      + '<input class="gp-input" id="gpinv-i-name" placeholder="e.g. design retainer" value="' + escHtml(itemDraft.name) + '">'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-i-desc">Description</label>'
+      + '<input class="gp-input" id="gpinv-i-desc" placeholder="prefills invoice lines" value="' + escHtml(itemDraft.description) + '"></div>'
+      + '<div class="gpinv-grid gpinv-gap">'
+      + '<div><label class="gp-eyebrow" for="gpinv-i-price">Unit price</label><input class="gp-input" id="gpinv-i-price" type="number" min="0" step="any" value="' + escHtml(itemDraft.unitPrice) + '" placeholder="0.00"></div>'
+      + '<div><label class="gp-eyebrow" for="gpinv-i-token">Token</label><select class="gp-select" id="gpinv-i-token">'
       + ['USDC', 'ETH'].map(t => '<option' + (itemDraft.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
       + '</select></div>'
       + '</div>'
-      + '<div class="gpinv-grid" style="margin-top:8px">'
-      + '<div><div class="gpinv-lbl">TAX % (OPTIONAL: PREFILLS THE ROW RATE)</div><input id="gpinv-i-tax" type="number" min="0" step="any" style="margin-top:4px" value="' + escHtml(itemDraft.taxPct) + '" placeholder="blank = profile rate"></div>'
-      + '<div><div class="gpinv-lbl">DISCOUNT % (OPTIONAL)</div><input id="gpinv-i-disc" type="number" min="0" step="any" style="margin-top:4px" value="' + escHtml(itemDraft.discPct) + '" placeholder="0"></div>'
+      + '<div class="gpinv-grid gpinv-gap">'
+      + '<div><label class="gp-eyebrow" for="gpinv-i-tax">Tax % (optional: prefills the row rate)</label><input class="gp-input" id="gpinv-i-tax" type="number" min="0" step="any" value="' + escHtml(itemDraft.taxPct) + '" placeholder="blank = profile rate"></div>'
+      + '<div><label class="gp-eyebrow" for="gpinv-i-disc">Discount % (optional)</label><input class="gp-input" id="gpinv-i-disc" type="number" min="0" step="any" value="' + escHtml(itemDraft.discPct) + '" placeholder="0"></div>'
       + '</div>'
       + '<div class="gpinv-actions gpinv-sticky">'
-      + '<button data-iact="save-item">' + (itemEditId ? 'SAVE ITEM' : 'ADD ITEM') + '</button>'
-      + (itemEditId ? '<button class="ghost" data-iact="cancel-item">CANCEL</button>' : '')
+      + '<button type="button" class="gp-btn primary" data-iact="save-item">' + (itemEditId ? 'Save item' : 'Add item') + '</button>'
+      + (itemEditId ? '<button type="button" class="gp-btn ghost" data-iact="cancel-item">Cancel</button>' : '')
       + '</div>'
       + '<div class="status" id="gpinv-i-st"></div>'
       + '</div>'
-      + '<h3>CATALOG</h3>'
+      + '<h3 class="gp-h3">Catalog</h3>'
       + (items.length
-        ? '<div class="gpinv-tablewrap"><table><thead><tr>'
-          + '<th>NAME</th><th>DESCRIPTION</th><th>TAX</th><th style="text-align:right">UNIT PRICE</th><th></th>'
+        ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
+          + '<th>Name</th><th>Description</th><th>Tax</th><th style="text-align:right">Unit price</th><th></th>'
           + '</tr></thead><tbody>'
           + items.map(it =>
               '<tr><td><b>' + escHtml(it.name) + '</b></td>'
-              + '<td>' + (it.description ? escHtml(it.description) : '<span class="gpinv-muted">·</span>') + '</td>'
-              + '<td>' + (it.taxPct > 0 ? it.taxPct + '%' : '<span class="gpinv-muted">·</span>') + '</td>'
+              + '<td>' + (it.description ? escHtml(it.description) : '<span class="gp-faint">·</span>') + '</td>'
+              + '<td>' + (it.taxPct > 0 ? it.taxPct + '%' : '<span class="gp-faint">·</span>') + '</td>'
               + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(it.unitPrice, it.token) + ' ' + it.token + '</td>'
               + '<td style="width:1%;white-space:nowrap">'
-              + '<button class="ghost gpinv-x" data-iact="edit-item" data-id="' + escHtml(it.id) + '" title="edit item">✎</button> '
-              + '<button class="ghost gpinv-x" data-iact="del-item" data-id="' + escHtml(it.id) + '" title="delete item">×</button>'
+              + '<button type="button" class="gp-btn small ghost gpinv-x" data-iact="edit-item" data-id="' + escHtml(it.id) + '" title="edit item">✎</button> '
+              + '<button type="button" class="gp-btn small ghost gpinv-x" data-iact="del-item" data-id="' + escHtml(it.id) + '" title="delete item">×</button>'
               + '</td></tr>'
             ).join('')
           + '</tbody></table></div>'
-        : '<div class="gpinv-empty">the catalog is empty: add reusable line items above, then pick them from any invoice, estimate or recurring template row.</div>');
+        : '<div class="gp-empty"><div class="gp-empty-title">The catalog is empty</div>Add reusable line items above, then pick them from any invoice, estimate or recurring template row.</div>');
   }
 
   // ── tab: RECURRING ──
@@ -948,32 +1153,35 @@ async function initSuite() {
     const clients = loadClients();
     const catalog = loadItems();
     const d = recDraft;
-    return '<h3>' + (recEditId ? 'EDIT TEMPLATE' : 'NEW RECURRING TEMPLATE') + '</h3>'
-      + '<div class="gpinv-box">'
-      + '<div class="gpinv-lbl">CLIENT</div>'
-      + '<select id="gpinv-r-client" style="margin-top:4px"><option value="">no client</option>'
+    return '<div class="gp-card gpinv-editor">'
+      + '<h3 class="gp-h3">' + (recEditId ? 'Edit template' : 'New recurring template') + '</h3>'
+      + '<label class="gp-eyebrow" for="gpinv-r-client">Client</label>'
+      + '<select class="gp-select" id="gpinv-r-client"><option value="">no client</option>'
       + clients.map(c => '<option value="' + escHtml(c.id) + '"' + (d.clientId === c.id ? ' selected' : '') + '>' + escHtml(c.name) + '</option>').join('')
       + '</select>'
-      + '<div class="gpinv-lbl" style="margin-top:14px">LINE ITEMS · TAX RATE PER ROW</div>'
+      + '<div class="gp-eyebrow gpinv-gap">Line items · tax rate per row</div>'
       + rowsTableHtml(recRows, d.token, catalog, 'r')
       + totalsBlockHtml('r', computeTotals(recRows, null, null), d.token)
-      + '<div class="gpinv-lbl" style="margin-top:14px">TOKEN</div>'
-      + '<select id="gpinv-r-token" style="margin-top:4px">'
+      + '<div class="gpinv-grid gpinv-gap">'
+      + '<div><label class="gp-eyebrow" for="gpinv-r-token">Token</label>'
+      + '<select class="gp-select" id="gpinv-r-token">'
       + ['USDC', 'ETH'].map(t => '<option' + (d.token === t ? ' selected' : '') + '>' + t + '</option>').join('')
-      + '</select>'
-      + '<div class="gpinv-grid" style="margin-top:8px">'
-      + '<div><div class="gpinv-lbl">REPEAT EVERY</div><input id="gpinv-r-everyn" style="margin-top:4px" type="number" min="1" step="1" value="' + escHtml(d.everyN) + '"></div>'
-      + '<div><div class="gpinv-lbl">UNIT</div><select id="gpinv-r-unit" style="margin-top:4px">'
+      + '</select></div>'
+      + '<div><label class="gp-eyebrow" for="gpinv-r-note">Note</label>'
+      + '<input class="gp-input" id="gpinv-r-note" placeholder="optional: prefills the payer\'s encrypted memo" value="' + escHtml(d.note) + '"></div>'
+      + '</div>'
+      + '<div class="gpinv-grid gpinv-gap">'
+      + '<div><label class="gp-eyebrow" for="gpinv-r-everyn">Repeat every</label><input class="gp-input" id="gpinv-r-everyn" type="number" min="1" step="1" value="' + escHtml(d.everyN) + '"></div>'
+      + '<div><label class="gp-eyebrow" for="gpinv-r-unit">Unit</label><select class="gp-select" id="gpinv-r-unit">'
       + ['weeks', 'months'].map(u => '<option' + (d.unit === u ? ' selected' : '') + '>' + u + '</option>').join('')
       + '</select></div>'
       + '</div>'
-      + '<div class="gpinv-lbl" style="margin-top:12px">NEXT RUN DATE</div>'
-      + '<input id="gpinv-r-next" style="margin-top:4px" type="date" value="' + escHtml(d.next) + '">'
-      + '<input id="gpinv-r-note" placeholder="note (optional: prefills the payer\'s encrypted memo)" value="' + escHtml(d.note) + '">'
-      + '<label style="display:block;font-size:12px;margin-top:12px;cursor:pointer"><input type="checkbox" id="gpinv-r-active" style="width:auto;margin-right:6px"' + (d.active ? ' checked' : '') + '>active (inactive templates never come due)</label>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-r-next">Next run date</label>'
+      + '<input class="gp-input" id="gpinv-r-next" type="date" value="' + escHtml(d.next) + '"></div>'
+      + '<label class="gpinv-check" for="gpinv-r-active"><input type="checkbox" id="gpinv-r-active"' + (d.active ? ' checked' : '') + '>Active (paused templates never come due)</label>'
       + '<div class="gpinv-actions gpinv-sticky">'
-      + '<button data-iact="rec-save">' + (recEditId ? 'SAVE TEMPLATE' : 'CREATE TEMPLATE') + '</button>'
-      + '<button class="ghost" data-iact="rec-new">CANCEL</button>'
+      + '<button type="button" class="gp-btn primary" data-iact="rec-save">' + (recEditId ? 'Save template' : 'Create template') + '</button>'
+      + '<button type="button" class="gp-btn ghost" data-iact="rec-new">Cancel</button>'
       + '</div>'
       + '<div class="status" id="gpinv-r-st"></div>'
       + '</div>';
@@ -1000,28 +1208,28 @@ async function initSuite() {
       return '<tr><td>' + escHtml(it.description || 'item') + '</td>'
         + '<td>' + escHtml(it.qty) + '</td>'
         + '<td>' + fmtAmt(it.unitPrice, r.token) + '</td>'
-        + (anyDisc ? '<td>' + (it.discountPct > 0 ? it.discountPct + '%' : '<span class="gpinv-muted">·</span>') + '</td>' : '')
+        + (anyDisc ? '<td>' + (it.discountPct > 0 ? it.discountPct + '%' : '<span class="gp-faint">·</span>') + '</td>' : '')
         + '<td>' + rate + '%</td>'
         + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), r.token) + '</td></tr>';
     }).join('');
     const due = r.active && r.nextDate <= Date.now();
-    return '<div class="gpinv-muted" style="font-size:12px">'
+    return '<div class="gp-muted gpinv-meta">'
       + 'every ' + r.everyN + ' ' + r.unit + ' · next run ' + fmtDate(r.nextDate) + (due ? ' · due now' : '')
       + '</div>'
-      + '<div class="gpinv-tablewrap" style="margin-top:12px"><table><thead><tr>'
-      + '<th style="width:40%">DESCRIPTION</th><th>QTY</th><th>UNIT PRICE</th>' + (anyDisc ? '<th>DISC</th>' : '') + '<th>TAX</th><th style="text-align:right">AMOUNT</th>'
+      + '<div class="gp-tablewrap gpinv-detailtable"><table class="gp-table"><thead><tr>'
+      + '<th style="width:40%">Description</th><th>Qty</th><th>Unit price</th>' + (anyDisc ? '<th>Disc</th>' : '') + '<th>Tax</th><th style="text-align:right">Amount</th>'
       + '</tr></thead><tbody>' + itemRows + '</tbody></table></div>'
-      + '<div style="margin-top:10px;text-align:right;font-size:12px">'
-      + (t.discountAmount > 0 ? '<div>discount · −' + fmtAmt(t.discountAmount, r.token) + ' ' + r.token + '</div>' : '')
-      + t.taxLines.map(tl => '<div>tax ' + tl.rate + '% on ' + fmtAmt(tl.base, r.token) + ' · ' + fmtAmt(tl.amount, r.token) + ' ' + r.token + '</div>').join('')
-      + '<div style="font-size:16px;margin-top:2px"><b>' + fmtAmt(t.total, r.token) + ' ' + r.token + '</b> per run</div>'
+      + '<div class="gpinv-totals">'
+      + (t.discountAmount > 0 ? '<div class="gpinv-trow"><span>Discount</span><span>−' + fmtAmt(t.discountAmount, r.token) + ' ' + r.token + '</span></div>' : '')
+      + t.taxLines.map(tl => '<div class="gpinv-trow"><span>Tax ' + tl.rate + '% on ' + fmtAmt(tl.base, r.token) + '</span><span>' + fmtAmt(tl.amount, r.token) + ' ' + r.token + '</span></div>').join('')
+      + '<div class="gpinv-trow gpinv-grand"><span>Total</span><span>' + fmtAmt(t.total, r.token) + ' ' + r.token + ' per run</span></div>'
       + '</div>'
-      + (r.note ? '<div class="status">note: ' + escHtml(r.note) + '</div>' : '')
+      + (r.note ? '<div class="gp-muted gpinv-meta">note: ' + escHtml(r.note) + '</div>' : '')
       + '<div class="gpinv-actions">'
-      + (due ? '<button data-iact="rec-gen" data-id="' + escHtml(r.id) + '">GENERATE NOW</button>' : '')
-      + '<button class="ghost" data-iact="rec-edit" data-id="' + escHtml(r.id) + '">EDIT</button>'
-      + '<button class="ghost" data-iact="rec-toggle" data-id="' + escHtml(r.id) + '">' + (r.active ? 'PAUSE' : 'RESUME') + '</button>'
-      + '<button class="ghost" data-iact="rec-del" data-id="' + escHtml(r.id) + '">DELETE</button>'
+      + (due ? '<button type="button" class="gp-btn small primary" data-iact="rec-gen" data-id="' + escHtml(r.id) + '">Generate now</button>' : '')
+      + '<button type="button" class="gp-btn small ghost" data-iact="rec-edit" data-id="' + escHtml(r.id) + '">Edit</button>'
+      + '<button type="button" class="gp-btn small ghost" data-iact="rec-toggle" data-id="' + escHtml(r.id) + '">' + (r.active ? 'Pause' : 'Resume') + '</button>'
+      + '<button type="button" class="gp-btn small danger" data-iact="rec-del" data-id="' + escHtml(r.id) + '">Delete</button>'
       + '</div>';
   }
 
@@ -1031,21 +1239,21 @@ async function initSuite() {
     const list = loadRecurring();
     const now = Date.now();
     el.innerHTML =
-      '<div class="gpinv-actions" style="margin-top:0">'
-      + '<button data-iact="rec-new">' + (recFormOpen ? 'CANCEL' : 'NEW TEMPLATE') + '</button>'
+      '<div class="gpinv-actions gpinv-paneactions">'
+      + '<button type="button" class="gp-btn primary" data-iact="rec-new">' + (recFormOpen ? 'Cancel' : 'New template') + '</button>'
       + '</div>'
       + (recFormOpen ? recFormHtml() : '')
-      + '<h3>RECURRING TEMPLATES</h3>'
+      + '<h3 class="gp-h3">Recurring templates</h3>'
       + (list.length
-        ? '<div class="gpinv-tablewrap"><table><thead><tr>'
-          + '<th>CLIENT</th><th>FREQUENCY</th><th>NEXT RUN</th><th style="text-align:right">TOTAL / RUN</th><th style="text-align:right">STATUS</th>'
+        ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
+          + '<th>Client</th><th>Frequency</th><th>Next run</th><th style="text-align:right">Total / run</th><th style="text-align:right">Status</th>'
           + '</tr></thead><tbody>'
           + list.map(r => {
               const t = computeTotals(r.items, r.taxPct, r.discountPct);
               const due = r.active && r.nextDate <= now;
               return '<tr class="gpinv-rowbtn" data-iact="rec-open" data-id="' + escHtml(r.id) + '">'
-                + '<td><b>' + (r.clientName ? escHtml(r.clientName) : '<span class="gpinv-muted">no client</span>') + '</b>'
-                + '<div class="gpinv-muted" style="font-size:10px">' + r.items.length + ' line item' + (r.items.length === 1 ? '' : 's') + '</div></td>'
+                + '<td><b>' + (r.clientName ? escHtml(r.clientName) : '<span class="gp-faint">no client</span>') + '</b>'
+                + '<div class="gp-faint gpinv-sub">' + r.items.length + ' line item' + (r.items.length === 1 ? '' : 's') + '</div></td>'
                 + '<td style="white-space:nowrap">every ' + r.everyN + ' ' + r.unit + '</td>'
                 + '<td style="white-space:nowrap">' + fmtDate(r.nextDate) + (due ? ' ' + pill('DUE') : '') + '</td>'
                 + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(t.total, r.token) + ' ' + r.token + '</td>'
@@ -1053,7 +1261,7 @@ async function initSuite() {
                 + (recOpen === r.id ? '<tr class="gpinv-detail"><td colspan="5">' + recDetailHtml(r) + '</td></tr>' : '');
             }).join('')
           + '</tbody></table></div>'
-        : '<div class="gpinv-empty">no recurring templates yet: press NEW TEMPLATE to bill a client on a schedule. when a run comes due, GENERATE NOW creates the invoice and moves the next date forward.</div>');
+        : '<div class="gp-empty"><div class="gp-empty-title">No recurring templates yet</div>Create one to bill a client on a schedule. When a run comes due, Generate now creates the invoice and moves the next date forward.</div>');
     afterRender(el);
   }
 
@@ -1064,47 +1272,49 @@ async function initSuite() {
     const p = loadProfile();
     const accent = p.accentColor || '#fff';
     el.innerHTML =
-      '<div style="display:flex;gap:16px;align-items:center;margin-bottom:6px">'
+      '<div class="gpinv-idrow">'
       + '<div class="gpinv-mg" style="border-color:' + escHtml(accent) + '">' + escHtml(monogram(p.name)) + '</div>'
       + '<div><div style="font-weight:700">' + (p.name ? escHtml(p.name) : 'your business') + '</div>'
-      + '<div class="gpinv-muted" style="font-size:11px">' + (p.contact ? escHtml(p.contact) : 'this profile stamps every invoice, estimate and receipt.') + '</div></div>'
+      + '<div class="gp-muted gpinv-sub">' + (p.contact ? escHtml(p.contact) : 'this profile stamps every invoice, estimate and receipt.') + '</div></div>'
       + '</div>'
-      + '<h3>BUSINESS PROFILE</h3>'
-      + '<div class="gpinv-box">'
-      + '<div class="gpinv-lbl">BUSINESS NAME</div><input id="gpinv-p-name" style="margin-top:4px" value="' + escHtml(p.name) + '" placeholder="e.g. Ghost Studio">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">FROM / CONTACT LINE</div><input id="gpinv-p-contact" style="margin-top:4px" value="' + escHtml(p.contact) + '" placeholder="e.g. ben@ghoststudio.eth">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">ADDRESS LINES (ONE PER LINE: PRINTED ON DOCUMENTS)</div>'
-      + '<textarea id="gpinv-p-addr" rows="3" style="margin-top:4px" placeholder="1 Ghost Lane&#10;Berlin">' + escHtml(p.addressLines.join('\n')) + '</textarea>'
-      + '<div class="gpinv-lbl" style="margin-top:12px">VAT / TAX NUMBER (OPTIONAL: PRINTED UNDER YOUR ADDRESS)</div><input id="gpinv-p-vat" style="margin-top:4px" value="' + escHtml(p.taxNumber) + '" placeholder="e.g. NL123456789B01">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT TOKEN</div><select id="gpinv-p-token" style="margin-top:4px">'
-      + ['USDC', 'ETH'].map(t => '<option' + (p.token === t ? ' selected' : '') + '>' + t + '</option>').join('') + '</select>'
-      + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT PAYMENT TERMS</div><input id="gpinv-p-terms" style="margin-top:4px" value="' + escHtml(p.terms) + '" placeholder="payment due on receipt">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">DEFAULT TAX % (OPTIONAL: PREFILLS EVERY NEW ROW RATE)</div><input id="gpinv-p-tax" style="margin-top:4px" type="number" min="0" step="any" value="' + (p.taxPct ?? '') + '" placeholder="e.g. 21">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">ACCENT COLOR (OPTIONAL HEX: STAMPS PRINTED DOCUMENTS)</div><input id="gpinv-p-accent" style="margin-top:4px" value="' + escHtml(p.accentColor || '') + '" placeholder="#fff · blank = plain black and white">'
-      + '<div class="gpinv-lbl" style="margin-top:12px">FOOTER NOTE (PRINTED AT THE BOTTOM OF EVERY DOCUMENT)</div><input id="gpinv-p-footer" style="margin-top:4px" value="' + escHtml(p.footerNote) + '" placeholder="e.g. thank you for your business">'
-      + '<button data-iact="save-profile" style="margin-top:14px">SAVE PROFILE</button>'
+      + '<h3 class="gp-h3">Business profile</h3>'
+      + '<div class="gp-card">'
+      + '<label class="gp-eyebrow" for="gpinv-p-name">Business name</label><input class="gp-input" id="gpinv-p-name" value="' + escHtml(p.name) + '" placeholder="e.g. Ghost Studio">'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-p-contact">From / contact line</label><input class="gp-input" id="gpinv-p-contact" value="' + escHtml(p.contact) + '" placeholder="e.g. ben@ghoststudio.eth"></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-p-addr">Address lines (one per line: printed on documents)</label>'
+      + '<textarea class="gp-textarea" id="gpinv-p-addr" rows="3" placeholder="1 Ghost Lane&#10;Berlin">' + escHtml(p.addressLines.join('\n')) + '</textarea></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-p-vat">VAT / tax number (optional: printed under your address)</label><input class="gp-input" id="gpinv-p-vat" value="' + escHtml(p.taxNumber) + '" placeholder="e.g. NL123456789B01"></div>'
+      + '<div class="gpinv-grid gpinv-gap">'
+      + '<div><label class="gp-eyebrow" for="gpinv-p-token">Default token</label><select class="gp-select" id="gpinv-p-token">'
+      + ['USDC', 'ETH'].map(t => '<option' + (p.token === t ? ' selected' : '') + '>' + t + '</option>').join('') + '</select></div>'
+      + '<div><label class="gp-eyebrow" for="gpinv-p-tax">Default tax % (optional: prefills every new row rate)</label><input class="gp-input" id="gpinv-p-tax" type="number" min="0" step="any" value="' + (p.taxPct ?? '') + '" placeholder="e.g. 21"></div>'
+      + '</div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-p-terms">Default payment terms</label><input class="gp-input" id="gpinv-p-terms" value="' + escHtml(p.terms) + '" placeholder="payment due on receipt"></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-p-accent">Accent colour (optional hex: stamps printed documents)</label><input class="gp-input" id="gpinv-p-accent" value="' + escHtml(p.accentColor || '') + '" placeholder="#fff · blank = plain black and white"></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-p-footer">Footer note (printed at the bottom of every document)</label><input class="gp-input" id="gpinv-p-footer" value="' + escHtml(p.footerNote) + '" placeholder="e.g. thank you for your business"></div>'
+      + '<div class="gpinv-actions"><button type="button" class="gp-btn primary" data-iact="save-profile">Save profile</button></div>'
       + '<div class="status" id="gpinv-p-st"></div>'
       + '</div>'
-      + '<h3>NUMBERING</h3>'
-      + '<div class="gpinv-box"><div class="gpinv-grid">'
-      + '<div><div class="gpinv-lbl">NUMBER PREFIX</div><input id="gpinv-p-prefix" style="margin-top:4px" value="' + escHtml(p.prefix) + '" placeholder="GP-"></div>'
-      + '<div><div class="gpinv-lbl">NEXT NUMBER</div><input id="gpinv-p-next" style="margin-top:4px" type="number" min="1" value="' + escHtml(p.next) + '"></div>'
+      + '<h3 class="gp-h3">Numbering</h3>'
+      + '<div class="gp-card"><div class="gpinv-grid">'
+      + '<div><label class="gp-eyebrow" for="gpinv-p-prefix">Number prefix</label><input class="gp-input" id="gpinv-p-prefix" value="' + escHtml(p.prefix) + '" placeholder="GP-"></div>'
+      + '<div><label class="gp-eyebrow" for="gpinv-p-next">Next number</label><input class="gp-input" id="gpinv-p-next" type="number" min="1" value="' + escHtml(p.next) + '"></div>'
       + '</div>'
-      + '<div class="status">numbers allocate as prefix + zero-padded counter (GP-0001, GP-0002, …). invoices and estimates share the sequence.</div>'
-      + '<button data-iact="save-profile" style="margin-top:14px">SAVE NUMBERING</button></div>'
-      + '<h3>PUBLISH TO ENS</h3>'
-      + '<div class="gpinv-box">'
-      + '<div class="status" style="margin-top:0">writes a "stealth" text record on your ENS name so senders can resolve it to your stealth meta-address. the meta-address is public by design: anyone can derive fresh payment addresses from it, nobody can spend from it.</div>'
-      + '<input id="gpinv-ensname" placeholder="yourname.eth">'
-      + '<input id="gpinv-ensresolver" value="' + ENS_PUBLIC_RESOLVER + '" placeholder="resolver address">'
-      + '<button class="ghost" data-iact="ens" style="margin-top:12px">PUBLISH TO ENS</button>'
+      + '<div class="status">Numbers allocate as prefix + zero-padded counter (GP-0001, GP-0002, …). Invoices and estimates share the sequence.</div>'
+      + '<div class="gpinv-actions"><button type="button" class="gp-btn primary" data-iact="save-profile">Save numbering</button></div></div>'
+      + '<h3 class="gp-h3">Publish to ENS</h3>'
+      + '<div class="gp-card">'
+      + '<div class="status" style="margin-top:0">Writes a "stealth" text record on your ENS name so senders can resolve it to your stealth meta-address. The meta-address is public by design: anyone can derive fresh payment addresses from it, nobody can spend from it.</div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-ensname">ENS name</label><input class="gp-input" id="gpinv-ensname" placeholder="yourname.eth"></div>'
+      + '<div class="gpinv-gap"><label class="gp-eyebrow" for="gpinv-ensresolver">Resolver address</label><input class="gp-input" id="gpinv-ensresolver" value="' + ENS_PUBLIC_RESOLVER + '" placeholder="resolver address"></div>'
+      + '<div class="gpinv-actions"><button type="button" class="gp-btn primary" data-iact="ens">Publish to ENS</button></div>'
       + '<div class="status" id="gpinv-ens-st"></div>'
-      + '<div class="status">rather click through: <a id="gpinv-enslink" href="https://app.ens.domains" target="_blank" rel="noopener">open app.ens.domains</a> and set the "stealth" text record manually.</div>'
+      + '<div class="status">Prefer the web flow: <a id="gpinv-enslink" href="https://app.ens.domains" target="_blank" rel="noopener">open app.ens.domains</a> and set the "stealth" text record yourself.</div>'
       + '</div>'
-      + '<h3>EXPORT</h3>'
-      + '<div class="gpinv-box">'
-      + '<div class="status" style="margin-top:0">downloads every payment detected this session plus every invoice and estimate as one CSV: dates, amounts, usd values, statuses.</div>'
-      + '<button class="ghost" data-iact="export-csv" style="margin-top:12px">EXPORT CSV</button>'
+      + '<h3 class="gp-h3">Export</h3>'
+      + '<div class="gp-card">'
+      + '<div class="status" style="margin-top:0">Downloads every payment detected this session plus every invoice and estimate as one CSV: dates, amounts, USD values, statuses.</div>'
+      + '<div class="gpinv-actions"><button type="button" class="gp-btn" data-iact="export-csv">Export CSV</button></div>'
       + '</div>';
   }
 
@@ -1395,8 +1605,8 @@ async function initSuite() {
     }
     if (act === 'open') { openId = openId === id ? null : id; if (qrFor !== openId) qrFor = null; renderAll(); return; }
     if (act === 'qr') { openId = id; qrFor = qrFor === id ? null : id; renderAll(); return; }
-    if (act === 'copy' && rec) { copyBtn(rec.url, el, 'COPY LINK'); return; }
-    if (act === 'remind' && rec) { copyBtn(reminderText(rec, loadProfile()), el, 'REMINDER'); return; }
+    if (act === 'copy' && rec) { copyBtn(rec.url, el, 'Copy link'); return; }
+    if (act === 'remind' && rec) { copyBtn(reminderText(rec, loadProfile()), el, 'Reminder'); return; }
     if (act === 'view' && rec) { window.open(rec.url, '_blank', 'noopener'); return; }
     if (act === 'print' && rec) { printInvoice(rec); return; }
     if (act === 'edit' && rec && invStatus(rec) === 'DRAFT') {
@@ -1554,7 +1764,7 @@ async function initSuite() {
       const tax = parseFloat($('gpinv-p-tax').value);
       p.taxPct = Number.isFinite(tax) && tax > 0 ? tax : null;
       const accent = $('gpinv-p-accent').value.trim();
-      if (accent && !/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(accent)) { stEl.textContent = 'accent color must be a hex value like #ffcc00 (or blank).'; return; }
+      if (accent && !/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(accent)) { stEl.textContent = 'accent colour must be a hex value like #ffcc00 (or blank).'; return; }
       p.accentColor = accent || null;
       p.footerNote = $('gpinv-p-footer').value.trim();
       saveProfile(p); renderAll();
@@ -1683,12 +1893,12 @@ async function initSuite() {
       + '<div><h1>' + kind.toUpperCase() + '</h1><div class="num"><b>' + escHtml(i.number) + '</b></div>'
       + '<div class="num">date: ' + fmtDate(i.created) + '</div>'
       + (i.expiry ? '<div class="num">' + (kind === 'invoice' ? 'due' : 'valid until') + ': ' + fmtDate(i.expiry) + '</div>' : '') + '</div></div>'
-      + (i.clientName ? '<div style="margin-top:20px"><div class="muted">BILL TO</div><b>' + escHtml(i.clientName) + '</b>'
+      + (i.clientName ? '<div style="margin-top:20px"><div class="muted">Bill to</div><b>' + escHtml(i.clientName) + '</b>'
         + (client && client.contact ? '<div class="muted">' + escHtml(client.contact) + '</div>' : '')
         + clientAddr.map(l => '<div class="muted">' + escHtml(l) + '</div>').join('')
         + (client && client.vatNumber ? '<div class="muted">tax id: ' + escHtml(client.vatNumber) + '</div>' : '')
         + '</div>' : '')
-      + '<table><thead><tr><th style="width:44%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th>' + (anyDisc ? '<th class="r">DISC</th>' : '') + '<th class="r">TAX</th><th class="r">AMOUNT</th></tr></thead>'
+      + '<table><thead><tr><th style="width:44%">Description</th><th class="r">Qty</th><th class="r">Unit price</th>' + (anyDisc ? '<th class="r">Disc</th>' : '') + '<th class="r">Tax</th><th class="r">Amount</th></tr></thead>'
       + '<tbody>' + rows + '</tbody></table>'
       + '<div class="tot"><div>subtotal · ' + fmtAmt(i.subtotal, i.token) + ' ' + i.token + '</div>'
       + (i.discountAmount > 0 ? '<div>discount · −' + fmtAmt(i.discountAmount, i.token) + ' ' + i.token + '</div>' : '')
@@ -1696,7 +1906,7 @@ async function initSuite() {
       + '<div class="grand">total · ' + fmtAmt(i.total, i.token) + ' ' + i.token + '</div></div>'
       + (st === 'PAID' ? '<div style="text-align:right"><span class="stamp">PAID</span></div>' : '')
       + '<div class="pay"><img src="' + qr + '" alt="payment QR"><div>'
-      + '<div class="muted">PAY THIS ONE-TIME STEALTH ADDRESS</div>'
+      + '<div class="muted">Pay this one-time stealth address</div>'
       + '<div class="addr"><b>' + escHtml(i.stealthAddress) + '</b></div>'
       + '<div class="addr" style="color:#555">' + escHtml(i.url) + '</div></div></div>'
       + (i.note ? '<div class="foot">note: ' + escHtml(i.note) + '</div>' : '')
@@ -1710,26 +1920,32 @@ async function initSuite() {
   }
 
   // ── payment reconciliation: PAID arrives via GP events matching the pinned address.
-  // The pinned address is unique to the invoice, so its ETH balance is the running sum
-  // of everything paid to it; max() keeps the figure across sweeps. Sum below total is
-  // PARTIAL, at/over total flips PAID.
+  // The pinned address is unique to the invoice, so its balance is the running sum of
+  // everything paid to it: the USDC balance for token invoices (paid via payToken), the
+  // ETH balance for ETH invoices, and ETH × price as the legacy fallback for USDC
+  // invoices paid before token payments existed. max() keeps the figure across sweeps.
+  // Sum below total is PARTIAL, at/over total flips PAID.
   const partialToasted = new Set();
+  const usdcBalanceOf = new GP.ethers.Interface(['function balanceOf(address) view returns (uint256)']);
   async function syncPaid(p) {
     const all = loadInv();
     const hit = all.find(i => i.stealthAddress && i.stealthAddress.toLowerCase() === String(p.address).toLowerCase());
     if (!hit) return;
-    let balEth = null;
-    try {
-      balEth = Number(GP.fmt.formatEth(BigInt(await GP.jrpc('eth_getBalance', [hit.stealthAddress, 'latest']))));
-    } catch { /* balance best-effort: keep the previous figure */ }
-    if (balEth != null && balEth > 0) {
-      if (hit.token === 'ETH') {
-        hit.paidAmount = Math.max(hit.paidAmount || 0, round6(balEth));
-      } else {
-        const px = await ethUsd();
-        if (px) hit.paidAmount = Math.max(hit.paidAmount || 0, round2(balEth * px));
-      }
-    }
+    // balances are best-effort: each reading settles on its own, a failed one stays null
+    const settle = pr => pr.then(v => v, () => null);
+    const usdc = hit.token !== 'ETH';
+    const [balEth, tokenBal] = await Promise.all([
+      settle(GP.jrpc('eth_getBalance', [hit.stealthAddress, 'latest']).then(b => Number(GP.fmt.formatEth(BigInt(b))))),
+      usdc
+        ? settle(GP.jrpc('eth_call', [{ to: USDC_MAINNET, data: usdcBalanceOf.encodeFunctionData('balanceOf', [hit.stealthAddress]) }, 'latest'])
+          .then(r => Number(GP.ethers.formatUnits(BigInt(r), 6))))
+        : Promise.resolve(null),
+    ]);
+    // the legacy ETH × price reading is only priced when the token reading is absent
+    let px = null;
+    if (usdc && !(tokenBal > 0) && balEth > 0) px = await ethUsd();
+    const paid = paidFromBalances(hit, { balEth, tokenBal, ethPrice: px });
+    if (paid != null) hit.paidAmount = Math.max(hit.paidAmount || 0, paid);
     const ps = paymentState(hit, hit.paidAmount);
     hit.paidTx = p.tx || hit.paidTx || null;
     if (ps === 'PAID' && hit.status !== 'PAID') {
@@ -1871,14 +2087,42 @@ async function exportCsv() {
 // block has already rendered; we add a memo input and take over the announce button.
 // Invoice links (created above) pin a pre-derived stealth address so the payment lands
 // exactly on the invoice's tracked address; plain links derive fresh, as the core does.
+// On invoice links the payer also gets the bill itself above the address card: number,
+// line items (when the record lives in this browser), totals, due date, expiry state.
+// dead-link state for a meta-address that matches the st:eth:0x… shape but is not on
+// the curve (deriving, or encrypting a memo against its view key, throws "Point is not
+// on curve"). Same markup and copy as the shell's own showInvalidLink, which reasserts
+// the state when the inline module's enterPayMode runs after this module's boot.
+function showInvalidPayLink(pg) {
+  const amt = pg.querySelector('.pg-amt'); if (amt) amt.style.display = 'none';
+  pg.querySelectorAll('.cpfield, .pg-reassure, .gpinv-doc').forEach(el => el.style.display = 'none');
+  const btn = pg.querySelector('#b-announce'); if (btn) { btn.disabled = true; btn.style.display = 'none'; }
+  const ann = pg.querySelector('#v-ann'); if (ann) ann.textContent = '';
+  const inv = pg.querySelector('#st-invoice'); if (inv) inv.textContent = '';
+  if (pg.querySelector('[data-invalid-link]')) return;
+  const d = document.createElement('div');
+  d.className = 'gp-empty';
+  d.dataset.invalidLink = '1';
+  d.innerHTML = '<div class="gp-empty-title">This link is not valid</div>'
+    + 'The payment details in it do not check out, so nothing here can be paid. Ask the person who sent it for a fresh link.';
+  pg.appendChild(d);
+}
+
 function enhancePayghost() {
   const pg = document.getElementById('payghost');
   if (!pg || getComputedStyle(pg).display === 'none') return;
   const metaMatch = location.hash.match(/st:eth:0x[0-9a-fA-F]{132}/);
   if (!metaMatch) return;
+  injectFrag(); // the payer document's styles ride in the suite frag (idempotent)
   const C = GP.crypto;
   const $ = id => document.getElementById(id);
   const metaHex = metaMatch[0].slice(7);
+  // validate both compressed keys before anything derives from them: a malformed
+  // meta-address is a dead link, not a thrown module
+  try {
+    C.secp256k1.ProjectivePoint.fromHex(C.buf(metaHex).slice(0, 33));
+    C.secp256k1.ProjectivePoint.fromHex(C.buf(metaHex).slice(33, 66));
+  } catch { showInvalidPayLink(pg); return; }
   const viewPub = C.buf(metaHex).slice(33, 66);
   const params = new URLSearchParams(location.hash.includes('?') ? location.hash.slice(location.hash.indexOf('?') + 1) : '');
 
@@ -1892,28 +2136,102 @@ function enhancePayghost() {
   const addrEl = $('v-payaddr');
   if (addrEl) addrEl.textContent = target.stealth;
   const copyAddr = $('b-copyaddr');
-  if (copyAddr) copyAddr.onclick = () => copyBtn(target.stealth, copyAddr, 'COPY');
+  if (copyAddr) copyAddr.onclick = () => copyBtn(target.stealth, copyAddr, 'Copy address');
 
   const invId = params.get('inv');
   const invNum = params.get('num');
   const exp = Number(params.get('exp'));
-  const expired = Number.isFinite(exp) && exp > 0 && Date.now() > exp;
-  const stInvoice = $('st-invoice');
-  if (stInvoice && (invNum || invId)) stInvoice.textContent += ' · invoice ' + (invNum || invId);
-  if (stInvoice && expired) stInvoice.textContent += ' · THIS INVOICE HAS EXPIRED';
+  const hasExp = Number.isFinite(exp) && exp > 0;
+  const expired = hasExp && Date.now() > exp;
+
+  // ── the invoice document: what the payer is being asked to pay ──
+  // The link carries number/amount/note/expiry only; line items and the bill-to block
+  // appear when the record lives in this browser's storage (the issuer opening their
+  // own link, e.g. via VIEW LINK). Nothing here changes what the buttons below do.
+  const payRaw = params.get('pay') || '';
+  const payParts = payRaw.split(' · ');
+  const payM = payRaw.match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)/);
+  const amount = payM ? payM[1] : '';
+  const token = payM ? payM[2].toUpperCase() : '';
+  const note = payParts.length > 1 ? payParts.slice(1).join(' · ') : '';
+  const rec = invId ? (loadInv().find(x => x.id === invId) || loadEst().find(x => x.id === invId) || null) : null;
+  if (invNum || invId || amount || note || hasExp) {
+    let doc = '<div class="gpinv-doc-head">'
+      + '<span class="gp-eyebrow">' + (rec && rec.kind === 'estimate' ? 'estimate' : (invNum || invId ? 'invoice' : 'payment request')) + '</span>'
+      + (invNum ? '<span class="gpinv-doc-num">' + escHtml(invNum) + '</span>' : '')
+      + (expired ? '<span class="gp-pill danger">Expired</span>' : '')
+      + '</div>';
+    if (rec && rec.clientName) doc += '<div class="gpinv-doc-kv"><span class="gpinv-doc-k">Billed to</span><span>' + escHtml(rec.clientName) + '</span></div>';
+    if (rec) {
+      doc += '<div class="gp-tablewrap gpinv-doc-items"><table class="gp-table"><thead><tr>'
+        + '<th>Description</th><th>Qty</th><th style="text-align:right">Amount</th></tr></thead><tbody>'
+        + rec.items.map(it => '<tr><td>' + escHtml(it.description || 'item') + '</td><td>' + escHtml(it.qty) + '</td>'
+          + '<td style="text-align:right">' + fmtAmt((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>').join('')
+        + '</tbody></table></div>'
+        + '<div class="gpinv-totals gpinv-doc-totals">'
+        + '<div class="gpinv-trow"><span>Subtotal</span><span>' + fmtAmt(rec.subtotal, rec.token) + '</span></div>'
+        + (rec.discountAmount > 0 ? '<div class="gpinv-trow"><span>Discount</span><span>−' + fmtAmt(rec.discountAmount, rec.token) + '</span></div>' : '')
+        + taxLinesOf(rec).map(tl => '<div class="gpinv-trow"><span>Tax ' + tl.rate + '% on ' + fmtAmt(tl.base, rec.token) + '</span><span>' + fmtAmt(tl.amount, rec.token) + '</span></div>').join('')
+        + '</div>';
+    }
+    const amountDisp = token === 'USDC'
+      ? Number(amount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      : amount;
+    // the shell shows its own amount hero for ETH and USDC links (enterPayMode's
+    // .pg-amt), so the document only builds its amount block for other tokens
+    if (amount && token !== 'ETH' && token !== 'USDC') {
+      doc += '<div class="gpinv-doc-duebox">'
+        + '<div class="gp-eyebrow">' + (expired ? 'amount due · invoice expired' : 'amount due') + '</div>'
+        + '<div class="gpinv-doc-amount">' + escHtml(amountDisp) + ' <span class="gpinv-doc-token">' + escHtml(token) + '</span></div>'
+        + '</div>';
+    }
+    if (note) doc += '<div class="gpinv-doc-kv"><span class="gpinv-doc-k">Note</span><span>' + escHtml(note) + '</span></div>';
+    if (hasExp) doc += '<div class="gpinv-doc-kv"><span class="gpinv-doc-k">' + (expired ? 'Expired' : 'Due') + '</span><span>' + fmtDate(exp) + '</span></div>';
+    if (expired) doc += '<div class="gpinv-doc-settle gpinv-doc-expired">This invoice has expired. Do not pay it: ask the issuer for a fresh link.</div>';
+    else if (amount && token === 'USDC') doc += '<div class="gpinv-doc-settle">Priced in USDC: paying approves the exact amount and sends it, batched into one confirmation where your wallet supports it, two transactions otherwise. The announcement rides the same call, so the recipient\'s scanner finds the payment.</div>';
+    const docEl = document.createElement('div');
+    docEl.className = 'gpinv-doc';
+    docEl.innerHTML = doc;
+    // the bill sits between the shell's invoice line and the payment mechanics
+    const anchor = pg.querySelector('.cpfield') || pg.querySelector('.card, .gp-card');
+    if (anchor) pg.insertBefore(docEl, anchor); else pg.appendChild(docEl);
+  }
 
   const btn = $('b-announce');
   if (!btn) return;
   const memoInput = document.createElement('input');
   memoInput.id = 'gpinv-memo';
+  memoInput.className = 'gp-input';
   memoInput.maxLength = 280;
-  memoInput.placeholder = 'memo (optional: encrypted, only the recipient can read it)';
+  memoInput.placeholder = 'optional · encrypted: only the recipient can read it';
   // the invoice note travels in the pay= param and prefills the payer's memo, so it
   // lands in the encrypted announcement memo on payment
-  const payParts = (params.get('pay') || '').split(' · ');
   if (payParts.length > 1) memoInput.value = payParts.slice(1).join(' · ').slice(0, 280);
-  btn.parentNode.insertBefore(memoInput, btn);
+  const memoLbl = document.createElement('label');
+  memoLbl.className = 'gp-eyebrow';
+  memoLbl.htmlFor = 'gpinv-memo';
+  memoLbl.textContent = 'Memo for the recipient';
+  const memoWrap = document.createElement('div');
+  memoWrap.className = 'gpinv-memo';
+  memoWrap.appendChild(memoLbl);
+  memoWrap.appendChild(memoInput);
+  btn.parentNode.insertBefore(memoWrap, btn);
   if (expired) btn.disabled = true;
+  // the label says what the click does: an ETH amount pays and announces in one
+  // transaction; a USDC amount approves + pays real USDC (one confirmation where the
+  // wallet batches, two transactions otherwise); anything else announces only
+  let payValue = 0n;
+  const ethM = payRaw.match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*ETH/i);
+  if (ethM) { try { payValue = GP.ethers.parseEther(ethM[1]); } catch { payValue = 0n; } }
+  const usdcUnits = token === 'USDC' ? parseTokenUnits(amount, 'USDC') : null;
+  btn.textContent = payValue > 0n ? 'Pay and announce with my wallet'
+    : usdcUnits ? 'Pay ' + amount + ' USDC and announce with my wallet'
+    : 'Announce the payment with my wallet';
+  // a USDC amount the token cannot carry (over 6 decimals) is a dead link, not an announce
+  if (token === 'USDC' && amount && !usdcUnits) {
+    btn.disabled = true;
+    $('v-ann').textContent = 'Bad USDC amount in this link · ask the issuer for a fresh one.';
+  }
 
   btn.onclick = async () => {
     if (expired) { $('v-ann').textContent = 'invoice expired: ask for a fresh link.'; return; }
@@ -1927,16 +2245,42 @@ function enhancePayghost() {
         return;
       }
     }
-    // invoice amount (ETH only): "25 ETH · note" → the value of the payment call
+    // invoice amount: "25 ETH · note" pays via pay(); "25 USDC · note" approves + pays real USDC
     let value = 0n;
     const pm = (params.get('pay') || '').match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*ETH/i);
     if (pm) { try { value = GP.ethers.parseEther(pm[1]); } catch { value = 0n; } }
     const PAA = GP.const && GP.const.PAY_AND_ANNOUNCE;
+    const md = metadataHex ? C.buf(metadataHex) : Uint8Array.from([target.viewTag]);
+    if (usdcUnits && PAA) {
+      // approve + payToken: one confirmation where the wallet batches (EIP-5792), two
+      // transactions otherwise. The encrypted memo rides the payToken call's metadata.
+      btn.disabled = true;
+      const setSt = m => { $('v-ann').textContent = m; };
+      try {
+        const account = (await GP.state.walletRequest('eth_requestAccounts', []))[0];
+        const calls = buildTokenPayCalls({
+          ethers: GP.ethers, tokenAddr: USDC_MAINNET, spender: PAA, stealth: target.stealth,
+          amountUnits: usdcUnits, ephPub: target.ephPub, metadata: md,
+        });
+        const res = await sendTokenPayment({
+          walletRequest: (m2, p2) => GP.state.walletRequest(m2, p2),
+          jrpc: (m2, p2) => GP.jrpc(m2, p2),
+          account, calls, say: setSt,
+          pollMs: Number(window.GP_PAY_POLL_MS) || 3000,
+        });
+        setSt('Paid ' + amount + ' USDC and announced' + (res.via === 'batch' ? ' in one confirmation (EIP-5792)' : '')
+          + (res.hash ? ' · tx ' + res.hash : (res.confirmed ? '' : ' · submitted, still pending'))
+          + (memo ? ' · encrypted memo attached' : ''));
+      } catch (e) {
+        btn.disabled = false;
+        setSt(tokenPayErrorText(e));
+      }
+      return;
+    }
     if (PAA) {
       // one transaction: payment + announcement + (optional) encrypted memo via PayAndAnnounce
       try {
         $('v-ann').textContent = 'paying + announcing in one transaction…';
-        const md = metadataHex ? C.buf(metadataHex) : Uint8Array.from([target.viewTag]);
         const payData = new GP.ethers.Interface(['function pay(address stealth, bytes ephPub, bytes metadata) payable'])
           .encodeFunctionData('pay', [target.stealth, target.ephPub, md]);
         const account = (await GP.state.walletRequest('eth_requestAccounts', []))[0];
@@ -1965,7 +2309,6 @@ function enhancePayghost() {
     if (!window.ethereum) return alert('no wallet found');
     const signer = await new GP.ethers.BrowserProvider(window.ethereum).getSigner();
     const ann = new GP.ethers.Contract(GP.const.ANNOUNCER, ['function announce(uint256,address,bytes,bytes)'], signer);
-    const md = metadataHex ? C.buf(metadataHex) : Uint8Array.from([target.viewTag]);
     const tx = await ann.announce(1, target.stealth, target.ephPub, md);
     $('v-ann').textContent = 'announced: ' + tx.hash + (memo ? ' · encrypted memo attached' : '');
   };

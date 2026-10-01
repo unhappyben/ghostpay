@@ -1,8 +1,11 @@
 // gp-inbox.mjs · GHOSTPAY payment inbox + token detection. Module contract: docs/GP-API.md.
-// Renders into the #gp-inbox mount (step 4). Load AFTER the core inline script:
-//   <script type="module" src="./gp-inbox.mjs"></script>
-// Markup comes from frag-inbox.html (pasted into #gp-inbox by the integrator, or fetched
-// and injected by this module, with an embedded copy as the offline fallback).
+// The ONE payment list: rendered by this module into both inbox mounts, FUNDS step 3
+// (#gp-inbox, canonical ids) and GET PAID's payments section (#r-rows). All payment
+// data comes from app-core's scanner: GP.state.payments plus the payment/swept events.
+// Load AFTER app-core.mjs: <script type="module" src="./gp-inbox.mjs"></script>
+// Markup comes from frag-inbox.html (fetched and injected by this module, with an
+// embedded copy as the offline fallback). The frag's rules are scoped to the
+// .gp-inbox-root class so every mounted instance shares them.
 // app-core's module graph can delay window.GP assembly past this module's
 // evaluation (the same race gp-invoices/gp-reports handle): wait for it instead of dying.
 const GP = await (async () => {
@@ -13,6 +16,10 @@ const GP = await (async () => {
   return null;
 })();
 if (!GP) throw new Error('gp-inbox: window.GP never appeared · load this module after the core inline script');
+// the homepage's standalone shim (app-core failed to load) is not enough: no events,
+// no scan, no pp helpers. Stay out rather than mount a dead list.
+const FULL_CORE = typeof GP.on === 'function' && typeof GP.jrpc === 'function' && !!(GP.pp && GP.crypto && GP.state);
+if (!FULL_CORE) console.warn('gp-inbox: app-core API incomplete (shim GP) · inbox disabled');
 const ethers = GP.ethers;
 
 const TOKENS = [
@@ -24,19 +31,26 @@ const TOKENS = [
 const USDC = TOKENS[0];
 const BALANCE_OF = '0x70a08231';
 const PP_MIN = 10000000000000000n; // 0.01 ETH: below this a deposit cannot enter Privacy Pools
-const PP_LOG_CHUNK = 5000;         // mirrors the core cardState deposit search (drpc caps ~10k)
+const PP_LOG_CHUNK = 5000;         // drpc eth_getLogs caps out around 10k blocks
 const SWEEPETH_IFACE = new ethers.Interface(['function sweepETH(address to)']);
 const USDC_712_DOMAIN = { name: 'USD Coin', version: '2', chainId: 1, verifyingContract: USDC.addr };
 const USDC_712_TYPES = { TransferWithAuthorization: [
   { name: 'from', type: 'address' }, { name: 'to', type: 'address' }, { name: 'value', type: 'uint256' },
   { name: 'validAfter', type: 'uint256' }, { name: 'validBefore', type: 'uint256' }, { name: 'nonce', type: 'bytes32' },
 ] };
+const BATCH_MAX = 20;                          // serve.mjs accepts 1-20 sweeps per eip7702-intent-batch
+const GATE_KEY = 'gp-money:backup-gate';       // gp-money's secret-backup gate (read-only here)
 
 // pill ladder; 'direct' is a terminal off-ladder state for sweeps that skip the pool
 const STAGES = ['detected', 'sweeping', 'in_pool', 'asp_pending', 'withdrawable', 'withdrawn'];
 const PILL_TEXT = {
   detected: 'DETECTED', sweeping: 'SWEEPING', in_pool: 'IN POOL', asp_pending: 'ASP PENDING',
   withdrawable: 'WITHDRAWABLE', withdrawn: 'WITHDRAWN', direct: 'SWEPT DIRECT',
+};
+// display tone per stage: pending states dim/info, terminal states ok
+const PILL_TONE = {
+  detected: 'dim', sweeping: 'info', in_pool: 'info', asp_pending: 'dim',
+  withdrawable: 'ok', withdrawn: 'ok', direct: 'ok',
 };
 const stageRank = s => s === 'direct' ? 99 : STAGES.indexOf(s);
 
@@ -89,7 +103,7 @@ function getAsp() {
 }
 const fetchJson = async u => { const r = await fetch(u); if (!r.ok) throw new Error('http ' + r.status); return r.json(); };
 
-// ── deposit + withdrawal trace (mirrors the core cardState logic) ──
+// ── deposit + withdrawal trace (the pool/ASP lifecycle tracing lives in this module) ──
 async function findDeposit(addr, fromBlock) {
   const topic = GP.pp.PP_IFACE.getEvent('Deposited').topicHash;
   const depTopic = ethers.zeroPadValue(addr, 32);
@@ -158,56 +172,319 @@ const usdStr = n => '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, 
 const fmtToken = (sym, bal) => { const t = TOKENS.find(x => x.sym === sym); return trim(ethers.formatUnits(bal, t.dec)); };
 const short = a => a.slice(0, 10) + '…' + a.slice(-6);
 
-// ── rows ──
-const rows = new Map(); // addrLower → { rec, el, refs, ethBal, tokens, deposit, busy }
-let rowsEl = null, statusEl = null, rootEl = null;
+// ── instances + rows ──
+// One logical row set rendered into every mounted inbox instance (FUNDS #gp-inbox and
+// GET PAID #r-rows). insts: { root, rowsEl, statusEl, emptyEl, batchEl }. A row's views
+// map each instance root to that instance's DOM ({ el, refs }).
+const insts = [];
+const rows = new Map(); // addrLower → { rec, views: Map(root → { el, refs }), ethBal, tokens, deposit, busy }
+
+// batch selection (pool-sized ETH payments, swept together as one eip7702-intent-batch):
+// one shared selection across instances. Everything renders only while the relayer
+// advertises a BatchRelayer (GET /health batchRelayer non-null); otherwise zero UI trace.
+const batch = { allowed: false, sel: new Set(), busy: false, broadcasting: false, artifact: null };
 
 function ensureRow(rec) {
   const key = rec.address.toLowerCase();
   if (rows.has(key)) return rows.get(key);
-  const el = document.createElement('div');
-  el.className = 'gp-row';
-  const addrEl = document.createElement('div'); addrEl.className = 'gp-addr'; addrEl.textContent = short(rec.address);
-  addrEl.title = rec.address;
-  const meta = document.createElement('div'); meta.className = 'gp-meta';
-  const labelEl = document.createElement('span'); labelEl.className = 'gp-label';
-  const tokensEl = document.createElement('div'); tokensEl.className = 'gp-tokens'; tokensEl.style.display = 'none';
-  const pill = document.createElement('span'); pill.className = 'gp-pill dim'; pill.textContent = '…';
-  const note = document.createElement('div'); note.className = 'gp-note'; note.style.display = 'none';
-  const actions = document.createElement('div'); actions.className = 'gp-actions';
-  const panel = document.createElement('div'); panel.className = 'gp-panel'; panel.style.display = 'none';
-  el.append(addrEl, meta, labelEl, tokensEl, pill, note, actions, panel);
-  rowsEl.appendChild(el);
-  const row = { rec, el, refs: { addrEl, meta, labelEl, tokensEl, pill, note, actions, panel }, ethBal: null, tokens: {}, deposit: null, busy: false };
+  const row = { rec, views: new Map(), ethBal: null, tokens: {}, deposit: null, busy: false };
   rows.set(key, row);
-  wireLabel(row);
+  for (const inst of insts) {
+    const el = document.createElement('div');
+    el.className = 'gp-row';
+    const head = document.createElement('div'); head.className = 'gp-rowhead';
+    const addrEl = document.createElement('div'); addrEl.className = 'gp-addr'; addrEl.textContent = short(rec.address);
+    addrEl.title = rec.address;
+    const pill = document.createElement('span'); pill.className = 'gp-pill dim'; pill.textContent = '…';
+    head.append(addrEl, pill);
+    const meta = document.createElement('div'); meta.className = 'gp-meta';
+    const labelEl = document.createElement('span'); labelEl.className = 'gp-label';
+    const tokensEl = document.createElement('div'); tokensEl.className = 'gp-tokens'; tokensEl.style.display = 'none';
+    const note = document.createElement('div'); note.className = 'gp-note'; note.style.display = 'none';
+    const actions = document.createElement('div'); actions.className = 'gp-actions';
+    const panel = document.createElement('div'); panel.className = 'gp-panel'; panel.style.display = 'none';
+    el.append(head, meta, labelEl, tokensEl, note, actions, panel);
+    inst.rowsEl.appendChild(el);
+    const view = { el, refs: { addrEl, meta, labelEl, tokensEl, pill, note, actions, panel, check: null } };
+    row.views.set(inst.root, view);
+    wireLabel(row, view);
+    syncRowCheckbox(row);
+  }
   return row;
 }
 
-function wireLabel(row) {
-  const { labelEl } = row.refs;
-  const paint = () => {
+function wireLabel(row, view) {
+  const { labelEl } = view.refs;
+  const paint = v => {
     const l = getLabel(row.rec.address);
-    labelEl.textContent = 'label: ' + (l || 'add +');
-    labelEl.style.color = l ? '#fff' : '#555';
+    v.refs.labelEl.textContent = 'label: ' + (l || 'add +');
+    v.refs.labelEl.classList.toggle('set', !!l);
   };
-  paint();
+  paint(view);
   labelEl.onclick = () => {
     const cur = getLabel(row.rec.address);
     const inp = document.createElement('input');
     inp.type = 'text'; inp.value = cur; inp.placeholder = 'local label (this device only)';
-    inp.style.marginTop = '4px';
+    inp.className = 'gp-input gp-label-edit';
     labelEl.replaceWith(inp);
     inp.focus();
     const commit = () => {
       setLabel(row.rec.address, inp.value.trim());
       inp.replaceWith(labelEl);
-      paint();
+      for (const v of row.views.values()) paint(v); // the label shows in every instance
       GP.toast(inp.value.trim() ? 'label saved' : 'label cleared');
     };
     inp.onkeydown = e => { if (e.key === 'Enter') inp.blur(); if (e.key === 'Escape') { inp.value = cur; inp.blur(); } };
     inp.onblur = commit;
   };
+}
+
+// ── batch sweep UI (dark-shipped: renders only when the relayer advertises a BatchRelayer) ──
+function batchEligible(row) {
+  const p = getPill(row.rec.address);
+  const stageKnown = p && stageRank(p.stage) >= stageRank('in_pool');
+  return !row.rec.swept && !stageKnown && row.ethBal !== null && row.ethBal >= PP_MIN;
+}
+
+async function refreshBatchGate() {
+  try {
+    const caps = GP.relayerCaps ? await GP.relayerCaps() : null;
+    batch.allowed = !!(caps && caps.batchRelayer);
+  } catch { batch.allowed = false; }
+  if (!batch.allowed) { batch.sel.clear(); batch.artifact = null; }
+  for (const row of rows.values()) syncRowCheckbox(row);
+  renderBatchBar();
+}
+
+// the row checkbox comes and goes with eligibility + the relayer gate: never a dead control
+function syncRowCheckbox(row) {
+  const want = batch.allowed && batchEligible(row);
+  let removed = false;
+  for (const view of row.views.values()) {
+    let cb = view.refs.check;
+    if (want && !cb) {
+      cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'gp-rowcheck';
+      cb.title = 'Select for a batch sweep';
+      cb.setAttribute('aria-label', 'Select ' + short(row.rec.address) + ' for a batch sweep');
+      cb.checked = batch.sel.has(row.rec.address.toLowerCase());
+      cb.onchange = () => {
+        const k = row.rec.address.toLowerCase();
+        if (cb.checked) {
+          if (batch.sel.size >= BATCH_MAX) {
+            cb.checked = false;
+            GP.toast('A batch carries at most ' + BATCH_MAX + ' sweeps');
+            return;
+          }
+          batch.sel.add(k);
+        } else batch.sel.delete(k);
+        for (const v of row.views.values()) if (v.refs.check && v.refs.check !== cb) v.refs.check.checked = cb.checked;
+        renderBatchBar();
+      };
+      view.refs.check = cb;
+      view.refs.addrEl.insertAdjacentElement('beforebegin', cb);
+      view.el.classList.add('has-check');
+    } else if (!want && cb) {
+      cb.remove();
+      view.refs.check = null;
+      view.el.classList.remove('has-check');
+      removed = true;
+    } else if (cb) {
+      cb.checked = batch.sel.has(row.rec.address.toLowerCase());
+    }
+  }
+  if (removed) {
+    batch.sel.delete(row.rec.address.toLowerCase());
+    renderBatchBar();
+  }
+}
+
+// each instance's batch container keeps a stable skeleton: a status line the arming and
+// broadcast flows write into, and a body that holds the selection bar or the preview.
+function ensureBatchSkeleton(el) {
+  if (el._st) return;
+  el._st = document.createElement('div');
+  el._st.className = 'gp-note';
+  el._st.style.display = 'none';
+  el._body = document.createElement('div');
+  el.append(el._st, el._body);
+}
+function batchSay(html) {
+  for (const inst of insts) {
+    const el = inst.batchEl;
+    if (!el) continue;
+    ensureBatchSkeleton(el);
+    el.style.display = 'block';
+    el._st.style.display = html ? 'block' : 'none';
+    el._st.innerHTML = html || '';
+  }
+}
+
+function renderBatchBar() {
+  for (const inst of insts) {
+    const el = inst.batchEl;
+    if (!el) continue;
+    ensureBatchSkeleton(el);
+    if (!batch.allowed) { el.style.display = 'none'; el._st.textContent = ''; el._body.textContent = ''; continue; }
+    if (batch.artifact) continue; // the preview owns the body until the broadcast resolves
+    el._body.textContent = '';
+    const n = batch.sel.size;
+    if (!n) { el.style.display = el._st.textContent ? 'block' : 'none'; continue; }
+    el.style.display = 'block';
+    const line = document.createElement('div');
+    line.className = 'gp-batch-line';
+    const cnt = document.createElement('span');
+    cnt.textContent = n + ' selected';
+    line.appendChild(cnt);
+    const btn = document.createElement('button');
+    btn.className = 'gp-btn small primary';
+    btn.textContent = 'Sweep together';
+    btn.disabled = n < 2 || batch.busy;
+    btn.onclick = armBatch;
+    line.appendChild(btn);
+    const clr = document.createElement('button');
+    clr.className = 'gp-btn small ghost';
+    clr.textContent = 'Clear';
+    clr.onclick = () => { batch.sel.clear(); for (const row of rows.values()) syncRowCheckbox(row); renderBatchBar(); };
+    line.appendChild(clr);
+    el._body.appendChild(line);
+    const warn = document.createElement('div');
+    warn.className = 'gp-note';
+    warn.style.display = 'block';
+    warn.textContent = 'A batch sweep moves the selected addresses in one transaction: it links them onchain. Sweep individually when the linkage matters.';
+    el._body.appendChild(warn);
+    if (n < 2) {
+      const hint = document.createElement('div');
+      hint.className = 'gp-note';
+      hint.style.display = 'block';
+      hint.textContent = 'Select at least two payments for a batch sweep.';
+      el._body.appendChild(hint);
+    }
+  }
+}
+
+// one click: force a fresh arm for every selected payment (each generates and downloads
+// its pp-secret NOW, serialized behind app-core's arm queue), then assemble one batch
+// artifact. The backup gate applies per secret: a pending gate blocks arming, and the
+// secrets this click downloads re-arm it, so the broadcast refuses until the backup is
+// confirmed in the gp-money gate on the FUNDS tab.
+async function armBatch() {
+  if (batch.busy || batch.artifact) return;
+  if (lsGet(GATE_KEY, null)) {
+    batchSay('A withdrawal-secret backup is still unconfirmed. Confirm it in the backup gate on the FUNDS tab before arming more sweeps.');
+    return;
+  }
+  batch.busy = true;
+  renderBatchBar();
+  try {
+    if (!GP.state.keys || !GP.state.keys.spendPriv)
+      throw new Error('watch-only session: your spend key is never stored on this device. Reconnect, generate your stealth keys again (same wallet, same keys), then retry.');
+    const addrs = [...batch.sel];
+    const sweeps = [];
+    let i = 0;
+    for (const a of addrs) {
+      i++;
+      batchSay('Arming ' + i + ' of ' + addrs.length + ' · the pp-secret-' + a.slice(2, 10) + '.json file downloads now. Keep every file: each one withdraws its own deposit.');
+      const armed = await GP.armPayment(a);
+      if (!armed || !armed.artifact)
+        throw new Error('could not arm ' + short(a) + ' (relayer without sweeperV2, or the balance dropped below the pool minimum). Nothing was broadcast: rescan and retry.');
+      sweeps.push(armed.artifact);
+    }
+    batch.artifact = { kind: 'eip7702-intent-batch', chainId: GP.const.CHAIN_ID, sweeps };
+    batchSay('');
+    renderBatchPreview();
+  } catch (e) {
+    batchSay('Error: ' + e.message);
+  } finally {
+    batch.busy = false;
+    renderBatchBar();
+  }
+}
+
+function renderBatchPreview() {
+  for (const inst of insts) {
+    const el = inst.batchEl;
+    if (!el || !batch.artifact) continue;
+    ensureBatchSkeleton(el);
+    el.style.display = 'block';
+    el._body.textContent = '';
+    const n = batch.artifact.sweeps.length;
+    const prev = document.createElement('div');
+    prev.className = 'gp-note gp-prev';
+    prev.textContent = 'signed · ' + n + ' sweeps in one transaction · valid 24h · one pp-secret file per payment downloaded: keep every file, each withdraws its own deposit';
+    const warn = document.createElement('div');
+    warn.className = 'gp-note';
+    warn.style.display = 'block';
+    warn.textContent = 'This batch links the ' + n + ' swept addresses onchain.';
+    const bBc = document.createElement('button');
+    bBc.className = 'gp-btn primary block';
+    bBc.textContent = 'BROADCAST VIA RELAYER';
+    const bCp = document.createElement('button');
+    bCp.className = 'gp-btn ghost block';
+    bCp.textContent = 'Copy artifact';
+    bCp.onclick = () => { navigator.clipboard.writeText(JSON.stringify(batch.artifact, null, 2)); GP.toast('artifact copied'); };
+    el._body.append(prev, warn, bBc, bCp);
+    bBc.onclick = () => broadcastBatch();
+  }
+}
+
+async function broadcastBatch() {
+  if (batch.broadcasting || !batch.artifact) return;
+  if (lsGet(GATE_KEY, null)) {
+    batchSay('Confirm the downloaded secret files in the backup gate on the FUNDS tab first: no broadcast without a confirmed backup.');
+    return;
+  }
+  batch.broadcasting = true;
+  for (const inst of insts) {
+    const b = inst.batchEl && inst.batchEl._body && inst.batchEl._body.querySelector('.gp-btn.primary');
+    if (b) b.disabled = true;
+  }
+  const artifact = batch.artifact;
+  const addrs = artifact.sweeps.map(s => s.stealthAddress);
+  for (const a of addrs) putPill(a, { stage: 'sweeping', sweepTx: null, direct: false });
+  if (!document.getElementById('gp-pulse-style')) {
+    const s = document.createElement('style');
+    s.id = 'gp-pulse-style';
+    s.textContent = '.gp-pulse{display:inline-block;animation:gpPulse 1.2s ease-in-out infinite}@keyframes gpPulse{0%,100%{opacity:.25}50%{opacity:1}}';
+    document.head.appendChild(s);
+  }
+  const t0 = Date.now();
+  let phase = 'broadcasting via relayer', extra = '5-45s privacy delay';
+  const tick = setInterval(() => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    batchSay('<span class="gp-pulse">&#9679;</span> ' + phase + ' · ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') + (extra ? ' · ' + extra : ''));
+  }, 1000);
+  const out = await GP.relaySweep(artifact, h => {
+    phase = 'pending'; extra = 'tx ' + h.slice(0, 14) + '… · explorers show it only once mined';
+    for (const a of addrs) putPill(a, { sweepTx: h });
+  });
+  clearInterval(tick);
+  if (out && out.hash) {
+    const link = ' · <a href="https://etherscan.io/tx/' + out.hash + '" target="_blank" rel="noopener">etherscan</a>';
+    if (out.status === 'confirmed') {
+      // the core fans the confirmation out as one 'swept' event per address: the rows
+      // advance their own pills. Here only the selection + preview reset.
+      batchSay('&#10003; confirmed' + (out.block ? ' in block ' + out.block.toLocaleString() : '') + ' · ' + addrs.length + ' sweeps in one tx ' + out.hash.slice(0, 14) + '…' + link);
+      batch.artifact = null;
+      batch.sel.clear();
+      for (const a of addrs) { const r = rows.get(a.toLowerCase()); if (r) syncRowCheckbox(r); }
+      renderBatchBar();
+      return;
+    }
+    if (out.status === 'reverted') {
+      batchSay('tx reverted onchain · ' + out.hash + ' · the artifacts stay valid: Copy artifact and retry, or sweep individually.');
+    } else {
+      batchSay('still pending after 10 minutes · tx ' + out.hash.slice(0, 14) + '…' + link + ' · it is in the private mempool, it usually lands within a few more minutes.');
+    }
+  } else {
+    batchSay('relayer broadcast failed: ' + ((out && out.error) || 'unknown') + ' · the artifacts stay valid: Copy artifact and retry via relay.mjs.');
+  }
+  batch.broadcasting = false;
+  for (const inst of insts) {
+    const b = inst.batchEl && inst.batchEl._body && inst.batchEl._body.querySelector('.gp-btn.primary');
+    if (b) b.disabled = false;
+  }
 }
 
 async function refreshRow(row) {
@@ -229,69 +506,89 @@ async function refreshRow(row) {
     const stage = await computeStage(row);
     if (!p || stageRank(stage) > stageRank(p.stage)) putPill(addr, { stage });
     renderRow(row, stage);
+    syncRowCheckbox(row);
   } catch { /* leave last rendered state */ }
   finally { row.busy = false; }
 }
 
 async function renderRow(row, stage) {
-  const { meta, tokensEl, pill, note, actions } = row.refs;
   const addr = row.rec.address;
   const prices = await getPrices();
-  // line 1: balance + detected time
+  const syms = Object.keys(row.tokens);
+  const pillTok = (getPill(addr) || {}).tokenSwept || {};
+  const tokUsd = s => {
+    const px = s === 'WETH' ? prices.eth : prices.usdc;
+    return px ? ' ≈ ' + usdStr(Number(ethers.formatUnits(row.tokens[s], TOKENS.find(x => x.sym === s).dec)) * px) : '';
+  };
+  // line 1: balance + detected time. A token-paid address holds tokens, not ETH: lead
+  // with the token balance instead of a misleading 0 ETH.
   let balTxt = 'balance unknown';
   if (row.ethBal !== null) {
-    balTxt = GP.fmt.formatEth(row.ethBal) + ' ETH';
-    const usd = GP.fmt.formatUsd(GP.fmt.formatEth(row.ethBal), prices.eth);
-    if (usd) balTxt += ' · ' + usd;
+    if (row.ethBal === 0n && syms.length) {
+      balTxt = syms.map(s => fmtToken(s, row.tokens[s]) + ' ' + s + tokUsd(s)).join(' · ');
+    } else {
+      balTxt = GP.fmt.formatEth(row.ethBal) + ' ETH';
+      const usd = GP.fmt.formatUsd(GP.fmt.formatEth(row.ethBal), prices.eth);
+      if (usd && row.ethBal > 0n) balTxt += ' · ' + usd;
+    }
   }
   let timeTxt = 'block ' + row.rec.block.toLocaleString();
   try { timeTxt = await blockTime(row.rec.block); } catch { /* keep block number */ }
-  meta.textContent = balTxt + ' · detected ' + timeTxt;
-  // token line
-  const syms = Object.keys(row.tokens);
-  const pillTok = (getPill(addr) || {}).tokenSwept || {};
-  if (syms.length || Object.keys(pillTok).length) {
-    tokensEl.style.display = 'block';
-    tokensEl.textContent = '';
+  // token line (skipped when the balance line already leads with those same tokens:
+  // a token-only address shows its balance once)
+  const leadWithTokens = row.ethBal !== null && row.ethBal === 0n && syms.length > 0;
+  let tokensTxt = null;
+  {
     const parts = [];
-    for (const s of syms) {
-      let t = fmtToken(s, row.tokens[s]) + ' ' + s;
-      const px = s === 'WETH' ? prices.eth : prices.usdc;
-      if (px) t += ' ≈ ' + usdStr(Number(ethers.formatUnits(row.tokens[s], TOKENS.find(x => x.sym === s).dec)) * px);
-      parts.push(t);
-    }
+    if (!leadWithTokens) for (const s of syms) parts.push(fmtToken(s, row.tokens[s]) + ' ' + s + tokUsd(s));
     for (const s of Object.keys(pillTok)) if (!syms.includes(s)) parts.push(s + ' swept ✓');
-    tokensEl.textContent = parts.join(' · ');
-  } else {
-    tokensEl.style.display = 'none';
+    if (parts.length) tokensTxt = parts.join(' · ');
   }
-  // pill
-  pill.textContent = PILL_TEXT[stage] || stage.toUpperCase();
-  pill.classList.toggle('dim', stage === 'detected' || stage === 'asp_pending');
   // note line
   let noteTxt = '';
   if (stage === 'asp_pending') noteTxt = 'deposits wait for the association-set provider to approve them. usually hours. funds are safe.';
-  else if (stage === 'withdrawable') noteTxt = 'ASP approved: withdraw in step 5 with your pp-secret file.';
-  else if (stage === 'in_pool' && row.deposit) noteTxt = 'pool deposit ' + GP.fmt.formatEth(row.deposit.value) + ' ETH @ block ' + row.deposit.block.toLocaleString() + '. tracing ASP…';
+  else if (stage === 'withdrawable') noteTxt = 'ASP approved: withdraw in step 4 with your pp-secret file.';
+  else if (stage === 'in_pool' && row.deposit) noteTxt = 'pool deposit ' + GP.fmt.formatEth(row.deposit.value) + ' ETH · block ' + row.deposit.block.toLocaleString() + '. tracing ASP…';
   else if (stage === 'sweeping') noteTxt = 'sweep broadcast. this line advances when the tx confirms.';
-  else if (stage === 'detected' && row.ethBal !== null && row.ethBal > 0n && row.ethBal >= PP_MIN) noteTxt = 'pool-ready: use SWEEP THIS on the payment card above to enter Privacy Pools.';
-  note.style.display = noteTxt ? 'block' : 'none';
-  note.textContent = noteTxt;
-  // actions
-  actions.textContent = '';
-  const live = stage === 'detected' || stage === 'sweeping';
-  if (live && row.tokens.USDC) {
-    const b = document.createElement('button');
-    b.textContent = 'SWEEP USDC';
-    b.onclick = () => openUsdcSweep(row);
-    actions.appendChild(b);
-  }
-  if (live && row.ethBal !== null && row.ethBal > 0n && row.ethBal < PP_MIN) {
-    const b = document.createElement('button');
-    b.className = 'ghost';
-    b.textContent = 'SWEEP DIRECT';
-    b.onclick = () => openDirectSweep(row);
-    actions.appendChild(b);
+  else if (stage === 'detected' && row.ethBal !== null && row.ethBal > 0n && row.ethBal >= PP_MIN) noteTxt = 'pool-ready: sweep this address into Privacy Pools from this row.';
+  else if (stage === 'detected' && (row.ethBal === null || row.ethBal === 0n) && syms.length) noteTxt = 'token balance, no ETH: sweep the token from this row. the pool path is ETH-only.';
+  for (const view of row.views.values()) {
+    const { meta, tokensEl, pill, note, actions } = view.refs;
+    const balEl = document.createElement('span'); balEl.className = 'gp-bal'; balEl.textContent = balTxt;
+    const whenEl = document.createElement('span'); whenEl.className = 'gp-when'; whenEl.textContent = 'detected ' + timeTxt;
+    meta.replaceChildren(balEl, document.createTextNode(' · '), whenEl);
+    if (tokensTxt) { tokensEl.style.display = 'block'; tokensEl.textContent = tokensTxt; }
+    else tokensEl.style.display = 'none';
+    pill.textContent = PILL_TEXT[stage] || stage.toUpperCase();
+    pill.className = 'gp-pill ' + (PILL_TONE[stage] || 'dim');
+    note.style.display = noteTxt ? 'block' : 'none';
+    note.textContent = noteTxt;
+    // actions
+    actions.textContent = '';
+    const live = stage === 'detected' || stage === 'sweeping';
+    if (live && row.tokens.USDC) {
+      const b = document.createElement('button');
+      b.className = 'gp-btn small';
+      b.textContent = 'Sweep USDC';
+      b.onclick = () => openUsdcSweep(row, view);
+      actions.appendChild(b);
+    }
+    // pool-sized ETH: the app-core sweep surface (arm → secret → SIGN SWEEP → broadcast
+    // on the FUNDS tab, gp-money interceptions intact). GP.sweepPayment routes there.
+    if (live && row.ethBal !== null && row.ethBal >= PP_MIN && GP.sweepPayment) {
+      const b = document.createElement('button');
+      b.className = 'gp-btn small';
+      b.textContent = 'Sweep to pool';
+      b.onclick = () => GP.sweepPayment(addr);
+      actions.appendChild(b);
+    }
+    if (live && row.ethBal !== null && row.ethBal > 0n && row.ethBal < PP_MIN) {
+      const b = document.createElement('button');
+      b.className = 'gp-btn small ghost';
+      b.textContent = 'Sweep direct';
+      b.onclick = () => openDirectSweep(row, view);
+      actions.appendChild(b);
+    }
   }
 }
 
@@ -299,7 +596,7 @@ async function renderRow(row, stage) {
 function stealthWallet(rec) {
   const keys = GP.state.keys;
   if (!keys || !keys.spendPriv) {
-    throw new Error('watch-only session: your spend key is never stored on this device. RE-CONNECT, GENERATE MY STEALTH KEYS, then retry.');
+    throw new Error('watch-only session: your spend key is never stored on this device. Re-connect, Generate my stealth keys, then retry.');
   }
   const { sh } = GP.crypto.check(keys.viewPriv, keys.spendPub, rec.ephPub, rec.address);
   const w = new ethers.Wallet(GP.crypto.stealthKey(keys.spendPriv, sh));
@@ -307,13 +604,14 @@ function stealthWallet(rec) {
   return w;
 }
 
-function panelBase(row, noteTxt) {
-  const { panel } = row.refs;
+function panelBase(view, noteTxt) {
+  const { panel } = view.refs;
   panel.textContent = '';
   panel.style.display = 'block';
   const note = document.createElement('div'); note.className = 'gp-note'; note.textContent = noteTxt;
   const amt = document.createElement('div'); amt.className = 'gp-tokens';
   const dest = document.createElement('input'); dest.type = 'text'; dest.placeholder = 'destination address (0x…)';
+  dest.className = 'gp-input';
   if (GP.state.address) dest.value = GP.state.address;
   const st = document.createElement('div'); st.className = 'gp-note';
   panel.append(note, amt, dest, st);
@@ -322,10 +620,10 @@ function panelBase(row, noteTxt) {
 }
 
 function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
-  const prev = document.createElement('div'); prev.className = 'gp-note'; prev.style.color = '#fff';
+  const prev = document.createElement('div'); prev.className = 'gp-note gp-prev';
   prev.textContent = 'signed · ' + summary;
-  const bBc = document.createElement('button'); bBc.textContent = 'BROADCAST VIA RELAYER';
-  const bCp = document.createElement('button'); bCp.className = 'ghost'; bCp.textContent = 'COPY ARTIFACT';
+  const bBc = document.createElement('button'); bBc.className = 'gp-btn primary block'; bBc.textContent = 'BROADCAST VIA RELAYER';
+  const bCp = document.createElement('button'); bCp.className = 'gp-btn ghost block'; bCp.textContent = 'Copy artifact';
   bCp.onclick = () => { navigator.clipboard.writeText(JSON.stringify(artifact, null, 2)); GP.toast('artifact copied'); };
   panel.append(prev, bBc, bCp);
   bBc.onclick = async () => {
@@ -333,7 +631,7 @@ function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
     onRelayed();
     row._pendingArt = artifact;
     // live broadcast lifecycle: a static line reads as dead during the minutes this takes.
-    // pulsing dot + elapsed timer while the relayer works, then the hash, then the outcome.
+    // pulsing dot + elapsed timer while the relayer works, then the hash once broadcast, then the outcome.
     if (!document.getElementById('gp-pulse-style')) {
       const s = document.createElement('style');
       s.id = 'gp-pulse-style';
@@ -357,12 +655,12 @@ function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
         return;
       }
       if (out.status === 'reverted') {
-        st.textContent = 'tx REVERTED onchain · ' + out.hash + ' · the artifact stays valid: COPY ARTIFACT and retry.';
+        st.textContent = 'tx reverted onchain · ' + out.hash + ' · the artifact stays valid: Copy artifact and retry.';
       } else {
         st.innerHTML = 'still pending after 10 minutes · tx ' + out.hash.slice(0, 14) + '…' + link + ' · it is in the private mempool, it usually lands within a few more minutes.';
       }
     } else {
-      st.textContent = 'relayer broadcast failed: ' + ((out && out.error) || 'unknown') + ' · the artifact stays valid: COPY ARTIFACT and retry via relay.mjs.';
+      st.textContent = 'relayer broadcast failed: ' + ((out && out.error) || 'unknown') + ' · the artifact stays valid: Copy artifact and retry via relay.mjs.';
     }
     bBc.disabled = false;
   };
@@ -370,12 +668,12 @@ function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
 
 // USDC: gasless EIP-3009 transferWithAuthorization, signed by the stealth key. Direct transfer,
 // not a pool deposit (the pool path is ETH-only in the current sweeper).
-function openUsdcSweep(row) {
+function openUsdcSweep(row, view) {
   const rec = row.rec;
-  const { panel, amt, dest, st } = panelBase(row,
-    'USDC sweep is an EIP-3009 transferWithAuthorization: gasless for this address, signed by the stealth key. it moves USDC straight to your destination, it does NOT enter Privacy Pools.');
+  const { panel, amt, dest, st } = panelBase(view,
+    'USDC sweep is an EIP-3009 transferWithAuthorization: gasless for this address, signed by the stealth key. it moves USDC straight to your destination, it does not enter Privacy Pools.');
   amt.textContent = 'amount: ' + fmtToken('USDC', row.tokens.USDC) + ' USDC (full balance)';
-  const b = document.createElement('button'); b.textContent = 'SIGN USDC SWEEP';
+  const b = document.createElement('button'); b.className = 'gp-btn primary block'; b.textContent = 'Sign USDC sweep';
   panel.appendChild(b);
   b.onclick = async () => {
     try {
@@ -404,12 +702,12 @@ function openUsdcSweep(row) {
 // dust ETH (< 0.01): cannot enter Privacy Pools, so offer a direct sweep to a destination.
 // With a sweeperV2 relayer this is a signed intent (action 0); older relayers get the
 // legacy eip7702-sweep artifact (sweepETH calldata picked by the app, carried by the relayer).
-function openDirectSweep(row) {
+function openDirectSweep(row, view) {
   const rec = row.rec;
-  const { panel, amt, dest, st } = panelBase(row,
+  const { panel, amt, dest, st } = panelBase(view,
     'privacy note: direct sweeps skip the pool, so the destination sees this address.');
   amt.textContent = 'amount: ' + GP.fmt.formatEth(row.ethBal) + ' ETH (full balance, below the 0.01 pool minimum)';
-  const b = document.createElement('button'); b.textContent = 'SIGN DIRECT SWEEP';
+  const b = document.createElement('button'); b.className = 'gp-btn primary block'; b.textContent = 'Sign direct sweep';
   panel.appendChild(b);
   b.onclick = async () => {
     try {
@@ -452,10 +750,14 @@ function openDirectSweep(row) {
 function syncRows() {
   for (const rec of GP.state.payments) ensureRow(rec);
   const n = rows.size;
-  rootEl.style.display = n ? 'block' : 'none';
-  if (statusEl) statusEl.textContent = n
-    ? n + ' payment' + (n === 1 ? '' : 's') + ' tracked · labels and pill state stay on this device'
-    : '';
+  for (const inst of insts) {
+    // visible while unlocked even when empty: the empty state explains what lands here
+    inst.root.style.display = (n || GP.state.unlocked) ? 'block' : 'none';
+    if (inst.emptyEl) inst.emptyEl.style.display = n ? 'none' : 'block';
+    if (inst.statusEl) inst.statusEl.textContent = n
+      ? n + ' payment' + (n === 1 ? '' : 's') + ' tracked · labels and pill state stay on this device'
+      : '';
+  }
 }
 
 let refreshing = false;
@@ -468,48 +770,111 @@ async function refreshAll() {
   } finally { refreshing = false; }
 }
 
+// inject the frag into one mount. The <style> block mounts once (into <head>); every
+// instance gets a deep copy of the root markup with the ids stripped (they are re-homed
+// onto the canonical FUNDS instance afterwards, one copy each, per docs/GP-API.md).
+async function mountInto(mountEl, { heading }) {
+  let html = null;
+  try { const r = await fetch('./frag-inbox.html'); if (r.ok) html = await r.text(); } catch { /* static open: use the embedded copy */ }
+  html = html || FRAG_FALLBACK;
+  // parsed, not regexed: the frag's own comment block may mention the style tag
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  if (!document.getElementById('gp-inbox-style')) {
+    const style = doc.querySelector('style');
+    if (style) {
+      const styleEl = document.createElement('style');
+      styleEl.id = 'gp-inbox-style';
+      styleEl.textContent = style.textContent;
+      document.head.appendChild(styleEl);
+    }
+  }
+  const src = doc.querySelector('.gp-inbox-root');
+  if (!src) return;
+  const root = document.importNode(src, true);
+  root.removeAttribute('id');
+  root.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+  if (!heading) { const h = root.querySelector('.gp-inbox-h'); if (h) h.remove(); }
+  mountEl.appendChild(root);
+  insts.push({
+    root,
+    rowsEl: root.querySelector('.gp-inbox-rows'),
+    statusEl: root.querySelector('.gp-inbox-status'),
+    emptyEl: root.querySelector('.gp-empty'),
+    batchEl: root.querySelector('.gp-inbox-batch'),
+  });
+}
+
 async function mount() {
   const m = document.getElementById('gp-inbox');
-  if (!m) return;
-  if (!document.getElementById('gp-inbox-root')) {
-    let html = null;
-    try { const r = await fetch('./frag-inbox.html'); if (r.ok) html = await r.text(); } catch { /* static open: use the embedded copy */ }
-    m.insertAdjacentHTML('beforeend', html || FRAG_FALLBACK);
-  }
-  rootEl = document.getElementById('gp-inbox-root');
-  rowsEl = document.getElementById('gp-inbox-rows');
-  statusEl = document.getElementById('gp-inbox-status');
+  if (m) await mountInto(m, { heading: true });
+  const rr = document.getElementById('r-rows');
+  if (rr) await mountInto(rr, { heading: false });
+  if (!insts.length) return;
+  // re-home the canonical ids onto the FUNDS instance (the frag carries them, but only
+  // one copy of each id may exist in the document)
+  const canon = insts[0];
+  canon.root.id = 'gp-inbox-root';
+  if (canon.statusEl) canon.statusEl.id = 'gp-inbox-status';
+  if (canon.batchEl) canon.batchEl.id = 'gp-inbox-batch';
+  if (canon.rowsEl) canon.rowsEl.id = 'gp-inbox-rows';
 }
 
 // offline fallback: identical copy of frag-inbox.html
 const FRAG_FALLBACK = `<style>
-  #gp-inbox-root h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:28px 0 6px; }
-  .gp-row { border:1px solid #333; padding:16px; margin-top:12px; }
-  .gp-row .gp-addr { font-weight:700; font-size:12px; word-break:break-all; }
-  .gp-row .gp-meta { color:#777; font-size:11px; margin:6px 0 4px; }
-  .gp-row .gp-tokens { font-size:12px; margin-top:6px; }
-  .gp-row .gp-note { color:#666; font-size:11px; margin-top:6px; }
-  .gp-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px; letter-spacing:.15em; margin-top:8px; }
-  .gp-pill.dim { border-color:#444; color:#888; }
-  .gp-label { border-bottom:1px dashed #444; cursor:text; }
-  .gp-label:hover { color:#fff; }
-  .gp-actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
-  .gp-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
-  .gp-panel { border:1px solid #444; padding:12px; margin-top:10px; }
-  .gp-panel .gp-note:first-child { margin-top:0; }
-  .gp-panel button { margin-top:8px; }
-  @media (max-width:700px) { .gp-actions { flex-direction:column; } .gp-actions button { width:100%; } }
+  .gp-inbox-root .gp-inbox-h { font-family:var(--gp-font-display); font-size:var(--gp-fs-h3); font-weight:500;
+    color:var(--gp-fg); margin:32px 0 4px; }
+  .gp-inbox-status { color:var(--gp-muted); font-size:var(--gp-fs-small); }
+  .gp-inbox-root .gp-empty { margin-top:12px; }
+  .gp-inbox-root .gp-row { background:var(--gp-bg-raise); border:1px solid var(--gp-line);
+    border-radius:var(--gp-radius); padding:18px 20px; margin-top:12px; }
+  .gp-inbox-root .gp-rowhead { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .gp-inbox-root .gp-row.has-check .gp-rowhead { display:grid; grid-template-columns:auto 1fr auto; }
+  .gp-inbox-root .gp-rowcheck { width:18px; height:18px; margin:2px 0 0; accent-color:var(--gp-accent); flex:none; }
+  .gp-inbox-root .gp-addr { font-weight:700; font-size:var(--gp-fs-small); word-break:break-all; }
+  .gp-inbox-root .gp-rowhead .gp-pill { flex:none; }
+  .gp-inbox-root .gp-meta { font-size:var(--gp-fs-small); margin:8px 0 0; }
+  .gp-inbox-root .gp-bal { color:var(--gp-fg); font-weight:500; }
+  .gp-inbox-root .gp-when { color:var(--gp-faint); }
+  .gp-inbox-root .gp-label { display:inline-block; margin-top:6px; cursor:text; color:var(--gp-faint);
+    border-bottom:1px dashed var(--gp-line-strong); }
+  .gp-inbox-root .gp-label.set { color:var(--gp-muted); }
+  .gp-inbox-root .gp-label:hover { color:var(--gp-fg); border-bottom-color:var(--gp-fg); }
+  .gp-inbox-root .gp-label-edit { margin-top:8px; max-width:360px; }
+  .gp-inbox-root .gp-tokens { font-size:var(--gp-fs-small); color:var(--gp-fg); margin-top:8px; }
+  .gp-inbox-root .gp-note { color:var(--gp-muted); font-size:var(--gp-fs-small); margin-top:8px; }
+  .gp-inbox-root .gp-prev { color:var(--gp-fg); margin-top:10px; }
+  .gp-inbox-root .gp-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  .gp-inbox-root .gp-actions .gp-btn { flex:1 1 auto; }
+  .gp-inbox-root .gp-panel { background:var(--gp-bg-inset); border:1px solid var(--gp-line);
+    border-radius:var(--gp-radius-sm); padding:16px; margin-top:12px; }
+  .gp-inbox-root .gp-panel .gp-note:first-child { margin-top:0; }
+  .gp-inbox-root .gp-panel .gp-tokens { margin:8px 0; }
+  .gp-inbox-root .gp-panel .gp-btn { margin-top:10px; }
+  .gp-inbox-root .gp-panel a { color:var(--gp-accent); }
+  .gp-inbox-root .gp-inbox-batch { background:var(--gp-bg-raise); border:1px solid var(--gp-accent);
+    border-radius:var(--gp-radius); padding:14px 16px; margin-top:14px; }
+  .gp-inbox-root .gp-batch-line { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    font-size:var(--gp-fs-small); color:var(--gp-fg); }
+  @media (max-width:700px) {
+    .gp-inbox-root .gp-row { padding:16px; }
+    .gp-inbox-root .gp-actions { flex-direction:column; }
+    .gp-inbox-root .gp-actions .gp-btn { width:100%; }
+  }
 </style>
-<div id="gp-inbox-root" style="display:none">
-  <h2>PAYMENT INBOX</h2>
-  <div class="status" id="gp-inbox-status" style="margin-top:0"></div>
-  <div id="gp-inbox-rows"></div>
+<div id="gp-inbox-root" class="gp-inbox-root" style="display:none">
+  <h2 class="gp-inbox-h">Payment inbox</h2>
+  <div class="status gp-inbox-status" id="gp-inbox-status" style="margin-top:0"></div>
+  <div class="gp-inbox-batch" id="gp-inbox-batch" style="display:none"></div>
+  <div id="gp-inbox-rows" class="gp-inbox-rows"></div>
+  <div class="gp-empty" style="display:none"><div class="gp-empty-title">No payments tracked yet</div>
+    When the scanner finds a payment to one of your stealth addresses it lands here, with its balance and sweep state. Labels and pill state stay on this device.</div>
 </div>`;
 
 await mount();
-if (rootEl) {
+if (insts.length && FULL_CORE) {
   syncRows();
   refreshAll();
+  refreshBatchGate(); // batch UI renders only if the relayer advertises a BatchRelayer
 
   GP.on('payment', rec => { ensureRow(rec); syncRows(); refreshRow(rows.get(rec.address.toLowerCase())); });
   GP.on('swept', d => {
@@ -533,12 +898,13 @@ if (rootEl) {
     }
     refreshRow(row);
   });
-  GP.on('withdrawn', d => {
-    const addr = ((d && (d.stealthAddress || d.address)) || '').toLowerCase();
-    if (rows.has(addr)) { putPill(addr, { stage: 'withdrawn' }); refreshRow(rows.get(addr)); }
-  });
   GP.on('session', ({ type }) => {
-    if (type === 'forgotten') { rows.clear(); rowsEl.textContent = ''; rootEl.style.display = 'none'; return; }
+    if (type === 'forgotten') {
+      rows.clear();
+      batch.sel.clear(); batch.artifact = null;
+      for (const inst of insts) { inst.rowsEl.textContent = ''; inst.root.style.display = 'none'; }
+      return;
+    }
     syncRows();
     refreshAll();
   });

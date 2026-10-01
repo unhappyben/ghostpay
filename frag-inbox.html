@@ -1,25 +1,55 @@
-<!-- GHOSTPAY inbox fragment · rendered by gp-inbox.mjs into the #gp-inbox mount (step 4, after the sweeper UI).
-     Either paste this block inside <div id="gp-inbox"></div>, or let gp-inbox.mjs fetch + inject it itself. -->
+<!-- GHOSTPAY inbox fragment · rendered by gp-inbox.mjs into every inbox mount
+     (#gp-inbox on FUNDS, canonical ids; #r-rows on GET PAID, class-only copy without
+     the heading). The module fetches this file, mounts the <style> once, and injects
+     the root markup per instance; FRAG_FALLBACK in gp-inbox.mjs is a byte-identical
+     copy of everything below this comment. Rules are scoped to the .gp-inbox-root
+     class (not the id) so every mounted instance shares them. -->
 <style>
-  #gp-inbox-root h2 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:28px 0 6px; }
-  .gp-row { border:1px solid #333; padding:16px; margin-top:12px; }
-  .gp-row .gp-addr { font-weight:700; font-size:12px; word-break:break-all; }
-  .gp-row .gp-meta { color:#777; font-size:11px; margin:6px 0 4px; }
-  .gp-row .gp-tokens { font-size:12px; margin-top:6px; }
-  .gp-row .gp-note { color:#666; font-size:11px; margin-top:6px; }
-  .gp-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px; letter-spacing:.15em; margin-top:8px; }
-  .gp-pill.dim { border-color:#444; color:#888; }
-  .gp-label { border-bottom:1px dashed #444; cursor:text; }
-  .gp-label:hover { color:#fff; }
-  .gp-actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
-  .gp-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
-  .gp-panel { border:1px solid #444; padding:12px; margin-top:10px; }
-  .gp-panel .gp-note:first-child { margin-top:0; }
-  .gp-panel button { margin-top:8px; }
-  @media (max-width:700px) { .gp-actions { flex-direction:column; } .gp-actions button { width:100%; } }
+  .gp-inbox-root .gp-inbox-h { font-family:var(--gp-font-display); font-size:var(--gp-fs-h3); font-weight:500;
+    color:var(--gp-fg); margin:32px 0 4px; }
+  .gp-inbox-status { color:var(--gp-muted); font-size:var(--gp-fs-small); }
+  .gp-inbox-root .gp-empty { margin-top:12px; }
+  .gp-inbox-root .gp-row { background:var(--gp-bg-raise); border:1px solid var(--gp-line);
+    border-radius:var(--gp-radius); padding:18px 20px; margin-top:12px; }
+  .gp-inbox-root .gp-rowhead { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .gp-inbox-root .gp-row.has-check .gp-rowhead { display:grid; grid-template-columns:auto 1fr auto; }
+  .gp-inbox-root .gp-rowcheck { width:18px; height:18px; margin:2px 0 0; accent-color:var(--gp-accent); flex:none; }
+  .gp-inbox-root .gp-addr { font-weight:700; font-size:var(--gp-fs-small); word-break:break-all; }
+  .gp-inbox-root .gp-rowhead .gp-pill { flex:none; }
+  .gp-inbox-root .gp-meta { font-size:var(--gp-fs-small); margin:8px 0 0; }
+  .gp-inbox-root .gp-bal { color:var(--gp-fg); font-weight:500; }
+  .gp-inbox-root .gp-when { color:var(--gp-faint); }
+  .gp-inbox-root .gp-label { display:inline-block; margin-top:6px; cursor:text; color:var(--gp-faint);
+    border-bottom:1px dashed var(--gp-line-strong); }
+  .gp-inbox-root .gp-label.set { color:var(--gp-muted); }
+  .gp-inbox-root .gp-label:hover { color:var(--gp-fg); border-bottom-color:var(--gp-fg); }
+  .gp-inbox-root .gp-label-edit { margin-top:8px; max-width:360px; }
+  .gp-inbox-root .gp-tokens { font-size:var(--gp-fs-small); color:var(--gp-fg); margin-top:8px; }
+  .gp-inbox-root .gp-note { color:var(--gp-muted); font-size:var(--gp-fs-small); margin-top:8px; }
+  .gp-inbox-root .gp-prev { color:var(--gp-fg); margin-top:10px; }
+  .gp-inbox-root .gp-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  .gp-inbox-root .gp-actions .gp-btn { flex:1 1 auto; }
+  .gp-inbox-root .gp-panel { background:var(--gp-bg-inset); border:1px solid var(--gp-line);
+    border-radius:var(--gp-radius-sm); padding:16px; margin-top:12px; }
+  .gp-inbox-root .gp-panel .gp-note:first-child { margin-top:0; }
+  .gp-inbox-root .gp-panel .gp-tokens { margin:8px 0; }
+  .gp-inbox-root .gp-panel .gp-btn { margin-top:10px; }
+  .gp-inbox-root .gp-panel a { color:var(--gp-accent); }
+  .gp-inbox-root .gp-inbox-batch { background:var(--gp-bg-raise); border:1px solid var(--gp-accent);
+    border-radius:var(--gp-radius); padding:14px 16px; margin-top:14px; }
+  .gp-inbox-root .gp-batch-line { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    font-size:var(--gp-fs-small); color:var(--gp-fg); }
+  @media (max-width:700px) {
+    .gp-inbox-root .gp-row { padding:16px; }
+    .gp-inbox-root .gp-actions { flex-direction:column; }
+    .gp-inbox-root .gp-actions .gp-btn { width:100%; }
+  }
 </style>
-<div id="gp-inbox-root" style="display:none">
-  <h2>PAYMENT INBOX</h2>
-  <div class="status" id="gp-inbox-status" style="margin-top:0"></div>
-  <div id="gp-inbox-rows"></div>
+<div id="gp-inbox-root" class="gp-inbox-root" style="display:none">
+  <h2 class="gp-inbox-h">Payment inbox</h2>
+  <div class="status gp-inbox-status" id="gp-inbox-status" style="margin-top:0"></div>
+  <div class="gp-inbox-batch" id="gp-inbox-batch" style="display:none"></div>
+  <div id="gp-inbox-rows" class="gp-inbox-rows"></div>
+  <div class="gp-empty" style="display:none"><div class="gp-empty-title">No payments tracked yet</div>
+    When the scanner finds a payment to one of your stealth addresses it lands here, with its balance and sweep state. Labels and pill state stay on this device.</div>
 </div>

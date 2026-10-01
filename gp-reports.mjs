@@ -289,35 +289,51 @@ function paymentMap() {
   return m;
 }
 
+// The document accent: the profile colour when set, else the live --gp-accent token
+// (the profile hook applies it to <html>), else the design-system default amber.
 function accentOf(p) {
+  const hex = s => /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(s);
   const a = String(p.accentColor || '').trim();
-  return /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(a) ? a : '#000';
+  if (hex(a)) return a;
+  try {
+    const c = getComputedStyle(document.documentElement).getPropertyValue('--gp-accent').trim();
+    if (hex(c)) return c;
+  } catch { /* no DOM: the default below applies */ }
+  return '#d9a441';
 }
 
-// ── print document: invoice + estimate, Zoho-clean, monochrome with the profile
-// accent only in the header bar. Installed as window.GPINVPrint; gp-invoices.mjs
-// defers to it from its own printInvoice and passes a helpers bag ({profile, fmtAmt,
-// fmtDate, invStatus, qrDataUrl, ethUsd, memo, …}) this build uses when present.
+// ── print document: invoice + receipt (a paid invoice) + estimate. A clean white
+// business document: warm near-black text, hairline rules, grouped tax lines, the
+// profile accent only in the top bar, IBM Plex Mono from the same vendored woff2
+// files the app uses. Installed as window.GPINVPrint; gp-invoices.mjs defers to it
+// from its own printInvoice and passes a helpers bag ({profile, fmtAmt, fmtDate,
+// invStatus, qrDataUrl, ethUsd, memo, …}) this build uses when present.
 async function printDocument(rec, helpers) {
   const h = helpers || {};
   const p = h.profile || loadProfile();
   const fmtA = h.fmtAmt || fmtAmt;
-  const fmtD = h.fmtDate || fmtDate;
   const kind = rec.kind === 'estimate' ? 'estimate' : 'invoice';
-  const title = kind === 'estimate' ? 'ESTIMATE' : 'INVOICE';
-  const accent = accentOf(p);
   const st = h.invStatus ? h.invStatus(rec) : derivedStatus(rec);
-  const watermark = st === 'PAID' ? 'PAID' : (st === 'OVERDUE' ? 'OVERDUE' : '');
+  const paid = kind === 'invoice' && st === 'PAID';
+  const title = kind === 'estimate' ? 'Estimate' : (paid ? 'Receipt' : 'Invoice');
+  const accent = accentOf(p);
+  const watermark = paid ? 'Paid' : (st === 'OVERDUE' ? 'Overdue' : '');
   const client = rec.clientId ? loadClients().find(c => c.id === rec.clientId) : null;
 
+  // document money: grouped thousands for stablecoins, trimmed decimals for ETH;
+  // dates in british short form (10 Sept 2026)
+  const fmtD = (n, token) => token === 'ETH' ? fmtA(n, token)
+    : Number(n).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtDocDate = ts => new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+
   let qr = null;
-  if (kind === 'invoice' && rec.url) {
+  if (kind === 'invoice' && !paid && rec.url) {
     try { qr = await (h.qrDataUrl || qrDataUrl)(rec.url); } catch { /* QR optional: print without it */ }
   }
   const px = await (h.ethUsd || ethUsd)();
   const totalUsd = (h.fmtUsd || fmtUsd)(rec.total, rec.token, px);
 
-  const w = window.open('', '_blank', 'width=680,height=900');
+  const w = window.open('', '_blank', 'width=720,height=900');
   if (!w) { GP.toast('popup blocked: allow popups to print'); return; }
 
   const addressLines = Array.isArray(p.addressLines) ? p.addressLines.filter(Boolean) : [];
@@ -326,77 +342,117 @@ async function printDocument(rec, helpers) {
   const rows = (rec.items || []).map(it =>
     '<tr><td>' + escHtml(it.description || 'item') + '</td>'
     + '<td class="r">' + escHtml(it.qty) + '</td>'
-    + '<td class="r">' + fmtA(it.unitPrice, rec.token) + '</td>'
+    + '<td class="r">' + fmtD(it.unitPrice, rec.token) + '</td>'
     + (anyDisc ? '<td class="r">' + (it.discountPct > 0 ? it.discountPct + '%' : '·') + '</td>' : '')
     + '<td class="r">' + (it.taxPct > 0 ? it.taxPct + '%' : '0%') + '</td>'
-    + '<td class="r">' + fmtA((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
+    + '<td class="r">' + fmtD((parseFloat(it.qty) || 0) * (parseFloat(it.unitPrice) || 0), rec.token) + '</td></tr>'
   ).join('');
   const discount = Number(rec.discountAmount) || 0;
   const tls = taxLinesOf(rec);
 
-  w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + kind + ' ' + escHtml(rec.number || '') + '</title>'
+  const footLines = [];
+  if (kind === 'estimate') footLines.push('this is an estimate, not a payment request.');
+  if (rec.note) footLines.push('note: ' + escHtml(rec.note));
+  if (h.memo) footLines.push('payment memo: ' + escHtml(h.memo));
+  if (p.terms) footLines.push('terms: ' + escHtml(p.terms));
+  if (p.footerNote) footLines.push(escHtml(p.footerNote));
+
+  // the popup starts on about:blank: the vendored fonts need absolute same-origin URLs
+  const face = wt => '@font-face{font-family:\'IBM Plex Mono\';font-style:normal;font-weight:' + wt
+    + ';font-display:swap;src:url(\'' + new URL('./vendor/fonts/ibm-plex-mono-latin-' + wt + '-normal.woff2', location.href).href + '\') format(\'woff2\')}';
+  const metaRow = (k, v) => '<div class="mrow"><span class="k">' + k + '</span><span>' + v + '</span></div>';
+
+  w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + (paid ? 'receipt' : kind) + ' ' + escHtml(rec.number || '') + '</title>'
     + '<style>'
-    + 'body{font-family:\'IBM Plex Mono\',monospace;background:#fff;color:#000;padding:0 0 40px;font-size:12px;line-height:1.6;max-width:660px;margin:0 auto}'
-    + '.bar{height:8px;background:' + accent + '}'
-    + '.inner{padding:28px 40px 0}'
-    + '.top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #000;padding-bottom:20px}'
-    + '.mg{width:52px;height:52px;border:2px solid #000;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;letter-spacing:.1em}'
-    + '.biz{font-size:15px;font-weight:700;margin-top:10px}.muted{color:#555;font-size:10px;letter-spacing:.15em}'
-    + '.addrline{color:#333;font-size:11px}'
-    + 'h1{font-size:22px;letter-spacing:.15em;margin:0;text-align:right}.num{text-align:right;font-size:12px;margin-top:4px}'
-    + 'table{width:100%;border-collapse:collapse;margin-top:22px}th{font-size:10px;letter-spacing:.2em;color:#555;text-align:left;font-weight:400;border-bottom:1px solid #000;padding:6px 0}'
-    + 'td{padding:8px 0;border-bottom:1px solid #ccc;vertical-align:top}.r{text-align:right;white-space:nowrap}'
-    + '.tot{margin-top:14px;text-align:right}.tot div{margin:2px 0}.grand{font-size:18px;font-weight:700;border-top:2px solid #000;padding-top:8px;margin-top:8px}'
-    + '.pay{margin-top:26px;border:1px solid #000;padding:16px;display:flex;gap:18px;align-items:center}'
-    + '.pay img{image-rendering:pixelated;width:150px;flex:none}.payaddr{word-break:break-all;font-size:11px;margin-top:6px}'
-    + '.foot{margin-top:22px;border-top:1px solid #000;padding-top:12px;font-size:11px;color:#333}'
-    + '.wm{position:fixed;top:42%;left:50%;transform:translate(-50%,-50%) rotate(-18deg);font-size:92px;font-weight:700;letter-spacing:.2em;color:rgba(0,0,0,.07);border:8px solid rgba(0,0,0,.09);padding:6px 34px;white-space:nowrap}'
-    + '@media print{.bar{-webkit-print-color-adjust:exact;print-color-adjust:exact}}'
+    + face(400) + face(500) + face(700)
+    + '@page{margin:14mm}'
+    + '*{box-sizing:border-box;margin:0;padding:0}'
+    + 'body{font-family:\'IBM Plex Mono\',ui-monospace,Menlo,monospace;background:#fff;color:#1a1815;font-size:12px;line-height:1.55;max-width:680px;margin:0 auto;padding:0 0 48px}'
+    + '.bar{height:6px;background:' + accent + ';-webkit-print-color-adjust:exact;print-color-adjust:exact}'
+    + '.inner{padding:34px 44px 0}'
+    + '.head{display:flex;justify-content:space-between;align-items:flex-start;gap:32px}'
+    + '.id{display:flex;gap:14px;align-items:flex-start;min-width:0}'
+    + '.mg{width:46px;height:46px;flex:none;border:2px solid #1a1815;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;letter-spacing:.08em}'
+    + '.biz{font-size:14px;font-weight:700}'
+    + '.k{font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:#8a857b}'
+    + '.contact{font-size:10.5px;color:#5c574e;margin-top:2px}'
+    + '.addr{font-size:11px;color:#3d3a34;margin-top:1px}'
+    + '.meta{flex:none;text-align:right}'
+    + '.docnum{font-size:24px;font-weight:700;letter-spacing:-.02em;margin:3px 0 10px}'
+    + '.mrow{display:flex;justify-content:flex-end;gap:14px;font-size:11px;margin-top:3px}'
+    + '.mrow .k{padding-top:2px}'
+    + '.bill{margin-top:30px}'
+    + '.billname{font-size:12.5px;font-weight:700;margin-top:5px}'
+    + 'table.items{width:100%;border-collapse:collapse;margin-top:26px}'
+    + 'table.items th{font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:#8a857b;font-weight:500;text-align:left;padding:0 0 7px;border-bottom:1px solid #1a1815}'
+    + 'table.items td{padding:9px 0;border-bottom:1px solid #e6e2d9;vertical-align:top}'
+    + '.r{text-align:right;white-space:nowrap}'
+    + '.tot{margin:14px 0 0 auto;width:300px}'
+    + '.trow{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:11.5px}'
+    + '.trow .tl{color:#5c574e}'
+    + '.grand{border-top:2px solid #1a1815;margin-top:8px;padding-top:9px;font-size:15px;font-weight:700}'
+    + '.grand .tl{color:#1a1815}'
+    + '.usd{text-align:right;font-size:10px;color:#8a857b;margin-top:3px}'
+    + '.pay{margin-top:30px;border:1px solid #1a1815;padding:18px;display:flex;gap:20px;align-items:center}'
+    + '.pay img{image-rendering:pixelated;width:116px;flex:none}'
+    + '.payaddr{word-break:break-all;font-size:11px;margin-top:6px}'
+    + '.payurl{word-break:break-all;font-size:10px;color:#5c574e;margin-top:6px}'
+    + '.foot{margin-top:26px;border-top:1px solid #1a1815;padding-top:12px}'
+    + '.fline{font-size:10.5px;color:#5c574e;margin-top:4px}'
+    + '.fline:first-child{margin-top:0}'
+    + '.wm{position:fixed;top:42%;left:50%;transform:translate(-50%,-50%) rotate(-18deg);font-size:88px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:rgba(26,24,21,.06);border:8px solid rgba(26,24,21,.08);padding:4px 32px;white-space:nowrap}'
+    + '@media print{body{padding-bottom:0}}'
     + '</style></head><body>'
     + '<div class="bar"></div>'
     + (watermark ? '<div class="wm">' + watermark + '</div>' : '')
     + '<div class="inner">'
-    + '<div class="top"><div><div class="mg">' + escHtml(monogram(p.name)) + '</div>'
+    + '<div class="head"><div class="id"><div class="mg">' + escHtml(monogram(p.name)) + '</div><div>'
     + '<div class="biz">' + escHtml(p.name || 'GHOSTPAY') + '</div>'
-    + (p.contact ? '<div class="muted">' + escHtml(p.contact) + '</div>' : '')
-    + addressLines.map(l => '<div class="addrline">' + escHtml(l) + '</div>').join('')
-    + (p.taxNumber ? '<div class="addrline">tax id: ' + escHtml(p.taxNumber) + '</div>' : '')
-    + '</div>'
-    + '<div><h1>' + title + '</h1><div class="num"><b>' + escHtml(rec.number || '') + '</b></div>'
-    + '<div class="num">date: ' + fmtD(rec.created) + '</div>'
-    + (rec.expiry ? '<div class="num">' + (kind === 'estimate' ? 'valid until' : 'due') + ': ' + fmtD(rec.expiry) + '</div>' : '')
+    + (p.contact ? '<div class="contact">' + escHtml(p.contact) + '</div>' : '')
+    + addressLines.map(l => '<div class="addr">' + escHtml(l) + '</div>').join('')
+    + (p.taxNumber ? '<div class="addr">tax id: ' + escHtml(p.taxNumber) + '</div>' : '')
+    + '</div></div>'
+    + '<div class="meta"><div class="k">' + title + '</div>'
+    + '<div class="docnum">' + escHtml(rec.number || '') + '</div>'
+    + metaRow('issued', fmtDocDate(rec.created))
+    + (rec.expiry ? metaRow(kind === 'estimate' ? 'valid until' : 'due', fmtDocDate(rec.expiry)) : '')
+    + (paid && rec.paidAt ? metaRow('paid', fmtDocDate(rec.paidAt)) : '')
     + '</div></div>'
     + (rec.clientName || client
-      ? '<div style="margin-top:20px"><div class="muted">BILL TO</div><b>' + escHtml(rec.clientName || (client && client.name) || '') + '</b>'
-        + (client && client.contact ? '<div class="addrline">' + escHtml(client.contact) + '</div>' : '')
-        + clientAddr.map(l => '<div class="addrline">' + escHtml(l) + '</div>').join('')
-        + (client && client.vatNumber ? '<div class="addrline">tax id: ' + escHtml(client.vatNumber) + '</div>' : '')
+      ? '<div class="bill"><div class="k">bill to</div><div class="billname">' + escHtml(rec.clientName || (client && client.name) || '') + '</div>'
+        + (client && client.contact ? '<div class="addr">' + escHtml(client.contact) + '</div>' : '')
+        + clientAddr.map(l => '<div class="addr">' + escHtml(l) + '</div>').join('')
+        + (client && client.vatNumber ? '<div class="addr">tax id: ' + escHtml(client.vatNumber) + '</div>' : '')
         + '</div>'
       : '')
-    + '<table><thead><tr><th style="width:44%">DESCRIPTION</th><th class="r">QTY</th><th class="r">UNIT PRICE</th>' + (anyDisc ? '<th class="r">DISC</th>' : '') + '<th class="r">TAX</th><th class="r">AMOUNT</th></tr></thead>'
+    + '<table class="items"><thead><tr><th style="width:44%">Description</th><th class="r">Qty</th><th class="r">Unit price</th>' + (anyDisc ? '<th class="r">Disc</th>' : '') + '<th class="r">Tax</th><th class="r">Amount</th></tr></thead>'
     + '<tbody>' + rows + '</tbody></table>'
-    + '<div class="tot"><div>subtotal · ' + fmtA(rec.subtotal, rec.token) + ' ' + rec.token + '</div>'
-    + (discount > 0 ? '<div>discount · -' + fmtA(discount, rec.token) + ' ' + rec.token + '</div>' : '')
-    + tls.map(tl => '<div>tax ' + tl.rate + '% on ' + fmtA(tl.base, rec.token) + ' · ' + fmtA(tl.amount, rec.token) + ' ' + rec.token + '</div>').join('')
-    + '<div class="grand">total · ' + fmtA(rec.total, rec.token) + ' ' + rec.token + '</div>'
-    + (totalUsd ? '<div class="muted" style="margin-top:2px">≈ ' + totalUsd + ' usd</div>' : '')
+    + '<div class="tot"><div class="trow"><span class="tl">subtotal</span><span>' + fmtD(rec.subtotal, rec.token) + ' ' + rec.token + '</span></div>'
+    + (discount > 0 ? '<div class="trow"><span class="tl">discount</span><span>−' + fmtD(discount, rec.token) + ' ' + rec.token + '</span></div>' : '')
+    + tls.map(tl => '<div class="trow"><span class="tl">tax ' + tl.rate + '% on ' + fmtD(tl.base, rec.token) + '</span><span>' + fmtD(tl.amount, rec.token) + ' ' + rec.token + '</span></div>').join('')
+    + '<div class="trow grand"><span class="tl">' + (paid ? 'total paid' : 'total') + '</span><span>' + fmtD(rec.total, rec.token) + ' ' + rec.token + '</span></div>'
+    + (totalUsd ? '<div class="usd">≈ ' + totalUsd + ' usd</div>' : '')
     + '</div>'
     + (kind === 'invoice' && rec.stealthAddress
-      ? '<div class="pay">' + (qr ? '<img src="' + qr + '" alt="payment QR">' : '') + '<div>'
-        + '<div class="muted">PAY THIS ONE-TIME STEALTH ADDRESS</div>'
-        + '<div class="payaddr"><b>' + escHtml(rec.stealthAddress) + '</b></div>'
-        + (rec.url ? '<div class="payaddr" style="color:#555">' + escHtml(rec.url) + '</div>' : '')
-        + '</div></div>'
+      ? (paid
+        ? '<div class="pay"><div><div class="k">paid to this one-time stealth address</div>'
+          + '<div class="payaddr"><b>' + escHtml(rec.stealthAddress) + '</b></div>'
+          + (rec.paidTx ? '<div class="payurl">tx: ' + escHtml(rec.paidTx) + '</div>' : '')
+          + '</div></div>'
+        : '<div class="pay">' + (qr ? '<img src="' + qr + '" alt="payment QR">' : '') + '<div>'
+          + '<div class="k">pay this one-time stealth address</div>'
+          + '<div class="payaddr"><b>' + escHtml(rec.stealthAddress) + '</b></div>'
+          + (rec.url ? '<div class="payurl">' + escHtml(rec.url) + '</div>' : '')
+          + '</div></div>')
       : '')
-    + (kind === 'estimate' ? '<div class="foot">this is an estimate, not a payment request.</div>' : '')
-    + (rec.note ? '<div class="foot">note: ' + escHtml(rec.note) + '</div>' : '')
-    + (h.memo ? '<div class="foot">payment memo: ' + escHtml(h.memo) + '</div>' : '')
-    + (p.terms ? '<div class="foot">terms: ' + escHtml(p.terms) + '</div>' : '')
-    + (p.footerNote ? '<div class="foot">' + escHtml(p.footerNote) + '</div>' : '')
+    + (footLines.length ? '<div class="foot">' + footLines.map(l => '<div class="fline">' + l + '</div>').join('') + '</div>' : '')
     + '</div></body></html>');
   w.document.close();
-  w.focus();
-  w.print();
+  // wait for the vendored fonts (bounded) so the printed pdf keeps the typeface
+  const go = () => { w.focus(); w.print(); };
+  if (w.document.fonts && w.document.fonts.ready) {
+    Promise.race([w.document.fonts.ready, new Promise(r => setTimeout(r, 1500))]).then(go, go);
+  } else go();
 }
 
 // ── dashboard + reports UI ──
@@ -405,13 +461,21 @@ function init(dashMount, repsMount) {
   const dashView = dashMount ? (document.getElementById('gpr-dash-view') || dashMount) : null;
   const repsView = repsMount ? (document.getElementById('gpr-reports-view') || repsMount) : null;
 
-  const pill = st => '<span class="gp-pill' + (st === 'DRAFT' || st === 'OVERDUE' ? ' dim' : '') + '">' + st + '</span>';
-  const moneyLines = (m, big) => {
+  // status pill: semantic tones (paid ok, overdue danger, draft dim, the rest info),
+  // sentence-case label
+  const pill = st => {
+    const tone = (st === 'PAID' || st === 'ACCEPTED') ? ' ok'
+      : (st === 'OVERDUE' || st === 'DECLINED') ? ' danger'
+      : st === 'DRAFT' ? ' dim' : ' info';
+    return '<span class="gp-pill' + tone + '">' + st.slice(0, 1) + st.slice(1).toLowerCase() + '</span>';
+  };
+  // stat-card numbers on the .gp-stat primitive: big number, token unit, usd line
+  const moneyLines = m => {
     const keys = Object.keys(m);
-    if (!keys.length) return '<div class="' + (big ? 'gpr-big' : '') + '">0</div>';
+    if (!keys.length) return '<div class="gp-stat-num">0</div>';
     return keys.sort().map(t =>
-      '<div class="' + (big ? 'gpr-big' : '') + '">' + fmtAmt(m[t], t) + ' <span class="gpr-unit">' + t + '</span></div>'
-      + '<div class="status" style="margin-top:2px" data-usd data-amt="' + m[t] + '" data-token="' + t + '"></div>'
+      '<div class="gp-stat-num">' + fmtAmt(m[t], t) + ' <span class="gp-stat-unit">' + t + '</span></div>'
+      + '<div class="gpr-usd" data-usd data-amt="' + m[t] + '" data-token="' + t + '"></div>'
     ).join('');
   };
   const moneyCell = m => {
@@ -452,7 +516,7 @@ function init(dashMount, repsMount) {
 
     const buckets = agingBuckets(inv, now);
     const bucketDefs = [
-      ['CURRENT', buckets.current], ['1-7 DAYS', buckets.d1_7], ['8-30 DAYS', buckets.d8_30], ['>30 DAYS', buckets.d30p],
+      ['Current', buckets.current], ['1-7 days', buckets.d1_7], ['8-30 days', buckets.d8_30], ['>30 days', buckets.d30p],
     ];
     // bar width follows the money, not the count: USDC at face value, ETH at the last
     // known strip price; with no price (or all-zero buckets) fall back to invoice count
@@ -462,24 +526,22 @@ function init(dashMount, repsMount) {
     const maxW = Math.max(...weights);
     const maxCount = Math.max(1, ...bucketDefs.map(([, rs]) => rs.length));
     const totalUnpaid = bucketDefs.reduce((s, [, rs]) => s + rs.length, 0);
-    const bucketRows = totalUnpaid === 0
-      ? '<div class="gpr-empty">nothing unpaid: sent invoices age here by days past due.</div>'
-      : bucketDefs.map(([lbl, rs], i) => {
-          const m = {};
-          for (const r of rs) addRec(m, r);
-          const val = Object.keys(m).length ? Object.keys(m).sort().map(t => fmtAmt(m[t], t) + ' ' + t).join(' · ') : '·';
-          const w = maxW > 0 ? weights[i] / maxW * 100 : rs.length / maxCount * 100;
-          return '<div class="gpr-barrow"><span class="gpr-barlbl">' + lbl + '</span>'
-            + '<div class="gpr-bar"><div class="gpr-barfill' + (i ? ' dim' : '') + '" style="width:' + (rs.length ? Math.max(2, Math.round(w)) : 0) + '%"></div></div>'
-            + '<span class="gpr-barval"><b>' + val + '</b> · ' + rs.length + ' inv</span></div>';
-        }).join('');
+    const bucketRows = bucketDefs.map(([lbl, rs], i) => {
+      const m = {};
+      for (const r of rs) addRec(m, r);
+      const val = Object.keys(m).length ? Object.keys(m).sort().map(t => fmtAmt(m[t], t) + ' ' + t).join(' · ') : '·';
+      const w = maxW > 0 ? weights[i] / maxW * 100 : rs.length / maxCount * 100;
+      return '<div class="gpr-barrow"><span class="gpr-barlbl">' + lbl + '</span>'
+        + '<span class="gpr-bar"><span class="gpr-barfill sev-' + i + '" style="width:' + (rs.length ? Math.max(2, Math.round(w)) : 0) + '%"></span></span>'
+        + '<span class="gpr-barval"><b>' + val + '</b><span class="gpr-barcnt"> · ' + rs.length + (rs.length === 1 ? ' invoice' : ' invoices') + '</span></span></div>';
+    }).join('');
 
     // recent activity: created / sent / paid events + payments seen onchain this session
     const ev = [];
     for (const rec of inv) {
-      ev.push({ ts: rec.created, text: rec.number + ' created · ' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + (rec.clientName ? ' · ' + rec.clientName : '') });
-      if (rec.sentAt) ev.push({ ts: rec.sentAt, text: rec.number + ' marked sent' });
-      if (rec.paidAt) ev.push({ ts: rec.paidAt, text: rec.number + ' paid' });
+      ev.push({ ts: rec.created, dot: '', text: rec.number + ' created · ' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + (rec.clientName ? ' · ' + rec.clientName : '') });
+      if (rec.sentAt) ev.push({ ts: rec.sentAt, dot: ' accent', text: rec.number + ' marked sent' });
+      if (rec.paidAt) ev.push({ ts: rec.paidAt, dot: ' ok', text: rec.number + ' paid' });
     }
     ev.sort((a, b) => b.ts - a.ts);
     const sessionEv = [];
@@ -491,23 +553,29 @@ function init(dashMount, repsMount) {
     const recent = ev.slice(0, 8);
     const activityHtml = (recent.length || sessionEv.length)
       ? '<div class="gp-tablewrap"><table class="gp-table"><tbody>'
-        + recent.map(e => '<tr><td class="gp-muted" style="white-space:nowrap">' + fmtDate(e.ts) + '</td><td>' + escHtml(e.text) + '</td></tr>').join('')
-        + sessionEv.slice(0, 4).map(e => '<tr><td class="gp-muted" style="white-space:nowrap">session</td><td>' + escHtml(e.text) + '</td></tr>').join('')
+        + recent.map(e => '<tr><td class="gpr-when">' + fmtDate(e.ts) + '</td><td><span class="gpr-dot' + e.dot + '"></span>' + escHtml(e.text) + '</td></tr>').join('')
+        + sessionEv.slice(0, 4).map(e => '<tr><td class="gpr-when">session</td><td><span class="gpr-dot info"></span>' + escHtml(e.text) + '</td></tr>').join('')
         + '</tbody></table></div>'
-      : '<div class="gpr-empty">nothing yet: create an invoice in the INVOICES tab and it shows up here.</div>';
+      : '<div class="gp-empty"><div class="gp-empty-title">No activity yet</div>Create an invoice in the invoices tab and it shows up here.</div>';
 
     dashView.innerHTML =
       '<div class="gpr-cards">'
-      + '<div class="gp-card gpr-stat">' + moneyLines(outstanding, true) + '<div class="gp-label">TOTAL OUTSTANDING</div></div>'
-      + '<div class="gp-card gpr-stat">' + moneyLines(overdue, true) + '<div class="gp-label">OVERDUE</div></div>'
-      + '<div class="gp-card gpr-stat">' + moneyLines(paidMonth, true) + '<div class="gp-label">PAID THIS MONTH</div></div>'
-      + '<div class="gp-card gpr-stat"><div class="gpr-big">' + drafts + '</div><div class="gp-label">DRAFTS</div></div>'
+      + '<div class="gp-stat"><div class="gp-stat-label">Total outstanding</div>' + moneyLines(outstanding) + '</div>'
+      + '<div class="gp-stat"><div class="gp-stat-label">Overdue</div>' + moneyLines(overdue) + '</div>'
+      + '<div class="gp-stat"><div class="gp-stat-label">Paid this month</div>' + moneyLines(paidMonth) + '</div>'
+      + '<div class="gp-stat"><div class="gp-stat-label">Drafts</div><div class="gp-stat-num">' + drafts + '</div></div>'
       + '</div>'
-      + '<div class="gpr-section">AGING · UNPAID SENT INVOICES</div>'
-      + '<div class="gp-card" style="margin-top:0">' + (bucketRows || '') + '</div>'
+      + '<div class="gpr-section">Aging · unpaid sent invoices</div>'
+      + (totalUnpaid === 0
+        ? '<div class="gp-empty"><div class="gp-empty-title">Nothing unpaid</div>Sent invoices age here by days past due.</div>'
+        : '<div class="gp-card gpr-aging">' + bucketRows + '</div>')
       + '<div class="gpr-split">'
-      + '<div><div class="gpr-section" style="margin-top:0">RECENT ACTIVITY</div>' + activityHtml + '</div>'
-      + '<div><div class="gpr-section" style="margin-top:0">TOP CLIENTS</div><div id="gpr-topclients"><div class="status">ranking by invoiced total…</div></div></div>'
+      + '<div><div class="gpr-section">Recent activity</div>' + activityHtml + '</div>'
+      + '<div><div class="gpr-section">Top clients</div><div id="gpr-topclients">'
+      + '<span class="gp-skeleton" style="height:16px;width:72%;margin:12px 0"></span>'
+      + '<span class="gp-skeleton" style="height:16px;width:56%;margin:12px 0"></span>'
+      + '<span class="gp-skeleton" style="height:16px;width:64%;margin:12px 0"></span>'
+      + '</div></div>'
       + '</div>';
     fillUsd(dashView);
     renderTopClients(inv);
@@ -532,11 +600,11 @@ function init(dashMount, repsMount) {
     const rows = [...byClient.values()].sort((a, b) => b.usd - a.usd).slice(0, 5);
     el.innerHTML = rows.length
       ? '<div class="gp-tablewrap"><table class="gp-table"><tbody>' + rows.map((r, i) =>
-          '<tr><td class="gp-muted" style="width:1%">' + (i + 1) + '</td><td><b>' + escHtml(r.name) + '</b></td>'
-          + '<td style="text-align:right;white-space:nowrap">' + moneyCell(r.totals) + '</td></tr>'
+          '<tr><td class="gpr-rank">' + (i + 1) + '</td><td><b>' + escHtml(r.name) + '</b></td>'
+          + '<td class="gpr-r gpr-nowrap">' + moneyCell(r.totals) + '</td></tr>'
         ).join('') + '</tbody></table></div>'
-        + (px == null ? '<div class="status">usd ranking unavailable: relayer price feed offline, order is approximate.</div>' : '')
-      : '<div class="gpr-empty">no invoiced clients yet.</div>';
+        + (px == null ? '<div class="gpr-footnote">usd ranking unavailable: relayer price feed offline, order is approximate.</div>' : '')
+      : '<div class="gp-empty"><div class="gp-empty-title">No invoiced clients yet</div>Clients rank here by invoiced total once invoices leave draft.</div>';
   }
 
   // ── REPORTS ──
@@ -556,17 +624,19 @@ function init(dashMount, repsMount) {
     return d.getTime();
   };
   const REPORTS = [
-    { key: 'client', title: 'SALES BY CLIENT' },
-    { key: 'month', title: 'SALES BY MONTH' },
-    { key: 'aging', title: 'AGING DETAIL' },
-    { key: 'tax', title: 'TAX BY RATE' },
+    { key: 'client', title: 'Sales by client' },
+    { key: 'month', title: 'Sales by month' },
+    { key: 'aging', title: 'Aging detail' },
+    { key: 'tax', title: 'Tax by rate' },
   ];
 
   const rangeHtml = key =>
     '<div class="gpr-range">'
-    + '<input type="date" data-gpr-from="' + key + '" value="' + dstr(ranges[key].from) + '">'
-    + '<input type="date" data-gpr-to="' + key + '" value="' + dstr(ranges[key].to) + '">'
-    + '<button class="ghost" data-gpr="csv" data-report="' + key + '">CSV</button>'
+    + '<span class="gp-eyebrow">from</span>'
+    + '<input class="gp-input" type="date" data-gpr-from="' + key + '" value="' + dstr(ranges[key].from) + '">'
+    + '<span class="gp-eyebrow">to</span>'
+    + '<input class="gp-input" type="date" data-gpr-to="' + key + '" value="' + dstr(ranges[key].to) + '">'
+    + '<button type="button" class="gp-btn ghost small" data-gpr="csv" data-report="' + key + '">CSV</button>'
     + '</div>';
 
   function reportTable(key) {
@@ -579,34 +649,34 @@ function init(dashMount, repsMount) {
       const rows = salesByClient(inv, loadClients(), from, endOfTo, now);
       return rows.length
         ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
-          + '<th>CLIENT</th><th style="text-align:right">INVOICED</th><th style="text-align:right">PAID</th><th style="text-align:right">OUTSTANDING</th>'
+          + '<th>Client</th><th class="gpr-r">Invoiced</th><th class="gpr-r">Paid</th><th class="gpr-r">Outstanding</th>'
           + '</tr></thead><tbody>'
           + rows.map(r =>
               '<tr><td><b>' + (r.name ? escHtml(r.name) : '<span class="gp-muted">(no client)</span>') + '</b></td>'
-              + '<td style="text-align:right">' + moneyCell(r.invoiced) + '</td>'
-              + '<td style="text-align:right">' + moneyCell(r.paid) + '</td>'
-              + '<td style="text-align:right">' + moneyCell(r.outstanding) + '</td></tr>'
+              + '<td class="gpr-r">' + moneyCell(r.invoiced) + '</td>'
+              + '<td class="gpr-r">' + moneyCell(r.paid) + '</td>'
+              + '<td class="gpr-r">' + moneyCell(r.outstanding) + '</td></tr>'
             ).join('')
           + '</tbody></table></div>'
-        : '<div class="gpr-empty">no invoices in this range.</div>';
+        : '<div class="gp-empty"><div class="gp-empty-title">No invoices in this range</div>Sales appear once an invoice leaves draft inside the selected dates.</div>';
     }
     if (key === 'month') {
       const rows = salesByMonth(inv, from, endOfTo, now);
       return rows.length
         ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
-          + '<th>MONTH</th><th style="text-align:right">INVOICED</th><th style="text-align:right">PAID</th>'
+          + '<th>Month</th><th class="gpr-r">Invoiced</th><th class="gpr-r">Paid</th>'
           + '</tr></thead><tbody>'
           + rows.map(r =>
               '<tr><td><b>' + r.month + '</b></td>'
-              + '<td style="text-align:right">' + moneyCell(r.invoiced) + '</td>'
-              + '<td style="text-align:right">' + moneyCell(r.paid) + '</td></tr>'
+              + '<td class="gpr-r">' + moneyCell(r.invoiced) + '</td>'
+              + '<td class="gpr-r">' + moneyCell(r.paid) + '</td></tr>'
             ).join('')
           + '</tbody></table></div>'
-        : '<div class="gpr-empty">no months in this range.</div>';
+        : '<div class="gp-empty"><div class="gp-empty-title">No months in this range</div>Widen the dates: one row per month, latest 12.</div>';
     }
     if (key === 'tax') {
       const rows = taxReport(inv, from, endOfTo, now);
-      if (!rows.length) return '<div class="gpr-empty">no taxed invoices in this range: per-line tax rates total up here across sent and paid invoices.</div>';
+      if (!rows.length) return '<div class="gp-empty"><div class="gp-empty-title">No taxed invoices in this range</div>Per-line tax rates total up here across sent and paid invoices.</div>';
       const tot = { base: {}, tax: {} };
       for (const r of rows) {
         for (const t of Object.keys(r.base)) addMoney(tot.base, t, r.base[t]);
@@ -618,43 +688,44 @@ function init(dashMount, repsMount) {
         return moneyCell(m);
       };
       return '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
-        + '<th>RATE</th><th style="text-align:right">BASE</th><th style="text-align:right">TAX</th><th style="text-align:right">TOTAL</th>'
+        + '<th>Rate</th><th class="gpr-r">Base</th><th class="gpr-r">Tax</th><th class="gpr-r">Total</th>'
         + '</tr></thead><tbody>'
         + rows.map(r =>
             '<tr><td><b>' + r.rate + '%</b></td>'
-            + '<td style="text-align:right">' + moneyCell(r.base) + '</td>'
-            + '<td style="text-align:right">' + moneyCell(r.tax) + '</td>'
-            + '<td style="text-align:right">' + sumCell(r.base, r.tax) + '</td></tr>'
+            + '<td class="gpr-r">' + moneyCell(r.base) + '</td>'
+            + '<td class="gpr-r">' + moneyCell(r.tax) + '</td>'
+            + '<td class="gpr-r">' + sumCell(r.base, r.tax) + '</td></tr>'
           ).join('')
-        + '<tr><td><b>TOTAL</b></td>'
-        + '<td style="text-align:right"><b>' + moneyCell(tot.base) + '</b></td>'
-        + '<td style="text-align:right"><b>' + moneyCell(tot.tax) + '</b></td>'
-        + '<td style="text-align:right"><b>' + sumCell(tot.base, tot.tax) + '</b></td></tr>'
+        + '<tr class="gpr-totalrow"><td><b>Total</b></td>'
+        + '<td class="gpr-r"><b>' + moneyCell(tot.base) + '</b></td>'
+        + '<td class="gpr-r"><b>' + moneyCell(tot.tax) + '</b></td>'
+        + '<td class="gpr-r"><b>' + sumCell(tot.base, tot.tax) + '</b></td></tr>'
         + '</tbody></table></div>'
-        + '<div class="status">base and tax across PAID + SENT invoices created in range, grouped by the per-line tax rate on each invoice.</div>';
+        + '<div class="gpr-footnote">base and tax across paid and sent invoices created in range, grouped by the per-line tax rate on each invoice.</div>';
     }
     const rows = agingDetail(inv, from, endOfTo, now);
     return rows.length
       ? '<div class="gp-tablewrap"><table class="gp-table"><thead><tr>'
-        + '<th>NUMBER</th><th>CLIENT</th><th>CREATED</th><th>DUE</th><th style="text-align:right">DAYS OVER</th><th style="text-align:right">TOTAL</th><th style="text-align:right">STATUS</th>'
+        + '<th>Number</th><th>Client</th><th>Created</th><th>Due</th><th class="gpr-r">Days over</th><th class="gpr-r">Total</th><th class="gpr-r">Status</th>'
         + '</tr></thead><tbody>'
         + rows.map(({ rec, status, days }) =>
             '<tr><td><b>' + escHtml(rec.number) + '</b></td>'
             + '<td>' + (rec.clientName ? escHtml(rec.clientName) : '<span class="gp-muted">·</span>') + '</td>'
-            + '<td style="white-space:nowrap">' + fmtDate(rec.created) + '</td>'
-            + '<td style="white-space:nowrap">' + (rec.expiry ? fmtDate(rec.expiry) : '<span class="gp-muted">never</span>') + '</td>'
-            + '<td style="text-align:right">' + (days || '·') + '</td>'
-            + '<td style="text-align:right;white-space:nowrap">' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</td>'
-            + '<td style="text-align:right">' + pill(status) + '</td></tr>'
+            + '<td class="gpr-nowrap">' + fmtDate(rec.created) + '</td>'
+            + '<td class="gpr-nowrap">' + (rec.expiry ? fmtDate(rec.expiry) : '<span class="gp-muted">never</span>') + '</td>'
+            + '<td class="gpr-r">' + (days || '<span class="gp-muted">·</span>') + '</td>'
+            + '<td class="gpr-r gpr-nowrap">' + fmtAmt(rec.total, rec.token) + ' ' + rec.token + '</td>'
+            + '<td class="gpr-r">' + pill(status) + '</td></tr>'
           ).join('')
         + '</tbody></table></div>'
-      : '<div class="gpr-empty">nothing unpaid in this range.</div>';
+      : '<div class="gp-empty"><div class="gp-empty-title">Nothing unpaid in this range</div>Unpaid sent invoices appear here, oldest first.</div>';
   }
 
   function renderReports() {
     if (!repsView) return;
     repsView.innerHTML = REPORTS.map(r =>
-      '<div class="gpr-section">' + r.title + '</div>' + rangeHtml(r.key) + '<div data-gpr-table="' + r.key + '">' + reportTable(r.key) + '</div>'
+      '<div class="gpr-report"><div class="gpr-section">' + r.title + '</div>' + rangeHtml(r.key)
+      + '<div data-gpr-table="' + r.key + '">' + reportTable(r.key) + '</div></div>'
     ).join('');
   }
 

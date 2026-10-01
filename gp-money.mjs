@@ -11,8 +11,8 @@
 // untouched. The core handlers themselves are never edited.
 //
 // 1. #b-sweep, label "SIGN SWEEP": GATED. Backup-gate check first, then the sweep
-//    preview interstitial (from/balance/destination/fee floor/sweeper). CONFIRM sets
-//    the one-shot bypass and re-clicks; CANCEL leaves the core handler unfired.
+//    preview interstitial (from/balance/destination/fee floor/sweeper). Confirm sets
+//    the one-shot bypass and re-clicks; Cancel leaves the core handler unfired.
 // 2. #b-sweep, label "BROADCAST VIA RELAYER": DECORATED, never blocked. Starts the
 //    relay progress view. NOTE: index.html's broadcast button calls the internal
 //    relaySweep() directly, not GP.relaySweep, so this click hook (plus the
@@ -24,7 +24,7 @@
 // 4. #v-secret MutationObserver: the core writes the pp-secret JSON into #v-secret
 //    when the auto-download fires. That arms the secret-backup gate
 //    (localStorage "gp-money:backup-gate"): further SIGN SWEEP clicks are blocked
-//    until CONFIRM BACKUP SAVED or a successful file re-upload check.
+//    until the backup is confirmed, or proven via a successful file re-upload check.
 // 5. #st-broadcast MutationObserver: picks the tx hash out of the core's broadcast
 //    status line, then polls GET ./status/<hash> every 5s for the progress view.
 // 6. GP.relaySweep: WRAPPED (property reassigned, window.GP itself untouched) so
@@ -164,7 +164,7 @@ async function onSignSweepGated() {
   if (gate) {
     showGate(gate);
     $('gm-gate').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    GP.toast('confirm your withdrawal-secret backup before sweeping another payment');
+    GP.toast('Confirm your withdrawal-secret backup before sweeping another payment');
     return;
   }
   const ok = await runPreview();
@@ -173,11 +173,12 @@ async function onSignSweepGated() {
 
 function row(parent, k, v) {
   const d = document.createElement('div');
-  d.className = 'gm-row';
+  d.className = 'gp-kv';
   const a = document.createElement('span');
-  a.className = 'gm-k';
+  a.className = 'gp-k';
   a.textContent = k;
   const b = document.createElement('b');
+  b.className = 'gp-v';
   b.textContent = v;
   d.append(a, b);
   parent.appendChild(d);
@@ -196,10 +197,10 @@ async function runPreview() {
 
   const body = $('gm-preview-body');
   body.textContent = '';
-  row(body, 'FROM (STEALTH)', addr);
+  row(body, 'From (stealth address)', addr);
   const eth = bal != null ? GP.fmt.formatEth(bal) : null;
-  row(body, 'BALANCE', eth != null ? eth + ' ETH' + usdOf(eth) : 'unknown (RPC unreachable)');
-  row(body, 'DESTINATION', 'Privacy Pools ETH deposit · 0xbow entrypoint ' + short(GP.pp.PP_ENTRYPOINT));
+  row(body, 'Balance', eth != null ? eth + ' ETH' + usdOf(eth) : 'Unknown (RPC unreachable)');
+  row(body, 'Destination', 'Privacy Pools ETH deposit · 0xbow entrypoint ' + short(GP.pp.PP_ENTRYPOINT));
   let pre = null, sweeper = GP.const.SWEEPER, isIntent = false;
   const armedArt = GP.state.armedIntent ? GP.state.armedIntent(addr) : null;
   if (armedArt) {
@@ -211,22 +212,30 @@ async function runPreview() {
     const a = JSON.parse($('v-artifact').textContent);
     if (a && a.precommitment && String(a.stealthAddress || '').toLowerCase() === addr.toLowerCase()) pre = a.precommitment;
   } catch { /* no live artifact */ }
-  row(body, 'PRECOMMITMENT', pre
+  row(body, 'Precommitment', pre
     ? short(pre) + ' · from the signed artifact on this card'
-    : 'generated fresh at signing (random nullifier) · shown in the secret file + artifact right after');
-  row(body, 'RELAYER FEE FLOOR', feeBps != null
+    : 'Generated fresh at signing (random nullifier) · shown in the secret file and artifact right after');
+  row(body, 'Relayer fee floor', feeBps != null
     ? feeBps + ' bps (' + (feeBps / 100).toFixed(2) + '%)'
       + (bal != null ? ' = ' + GP.fmt.formatEth(bal * BigInt(feeBps) / 10000n) + ' ETH' : '')
-    : 'unknown (relayer offline)');
-  row(body, 'SWEEPER CONTRACT', sweeper + ' · etherscan.io/address/' + sweeper);
+    : 'Unknown (relayer offline)');
+  row(body, 'Sweeper contract', sweeper);
   const note = document.createElement('div');
   note.className = 'gm-note';
-  note.style.color = '#444';
-  note.textContent = isIntent
-    ? 'signed intent sweep (SweeperV2): destination, fee and deadline come from your signature, the relayer cannot change them. '
-      + 'gas is paid by the relayer. the pp-secret file already downloaded when this payment was armed: it is the only way to withdraw later.'
-    : 'the v1 sweep deposits the full balance; the fee floor applies to intent sweeps. '
-      + 'gas is paid by the relayer. the pp-secret file downloads the moment you sign: it is the only way to withdraw later.';
+  note.textContent = (isIntent
+    ? 'Signed intent sweep (SweeperV2): destination, fee and deadline come from your signature and the relayer cannot change them. '
+    : 'The v1 sweep deposits the full balance; the fee floor applies to intent sweeps. ')
+    + 'Gas is paid by the relayer. '
+    + (isIntent
+      ? 'The pp-secret file already downloaded when this payment was armed: it is the only way to withdraw later. '
+      : 'The pp-secret file downloads the moment you sign: it is the only way to withdraw later. ')
+    + 'Signing happens on this device; keys never leave it. ';
+  const scan = document.createElement('a');
+  scan.href = 'https://etherscan.io/address/' + sweeper;
+  scan.target = '_blank';
+  scan.rel = 'noopener';
+  scan.textContent = 'Sweeper contract on etherscan';
+  note.appendChild(scan);
   body.appendChild(note);
 
   return new Promise(res => {
@@ -264,18 +273,18 @@ async function updateCost() {
     const body = $('gm-cost-body');
     body.textContent = '';
     const eth = bal != null ? GP.fmt.formatEth(bal) : null;
-    row(body, 'ARMED', short(addr) + (eth != null ? ' · ' + eth + ' ETH' + usdOf(eth) : ' · balance unknown'));
-    row(body, 'RELAYER FEE FLOOR', feeBps != null ? feeBps + ' bps (' + (feeBps / 100).toFixed(2) + '%)' : 'unknown (relayer offline)');
+    row(body, 'Armed', short(addr) + (eth != null ? ' · ' + eth + ' ETH' + usdOf(eth) : ' · balance unknown'));
+    row(body, 'Relayer fee floor', feeBps != null ? feeBps + ' bps (' + (feeBps / 100).toFixed(2) + '%)' : 'Unknown (relayer offline)');
     const gwei = gas != null ? (Number(gas) / 1e9).toFixed(2) + ' gwei' : 'unknown';
-    let costTxt = 'unknown';
+    let costTxt = 'Unknown';
     if (gas != null) {
       const costEth = GP.fmt.formatEth(gas * EST_SWEEP_GAS);
       costTxt = '~' + costEth + ' ETH' + usdOf(costEth) + ' at ' + gwei + ' · paid by the relayer';
     }
-    row(body, 'EST. NETWORK COST', costTxt);
-    row(body, 'NET INTO THE POOL', eth != null
+    row(body, 'Estimated network cost', costTxt);
+    row(body, 'Net into the pool', eth != null
       ? eth + ' ETH' + usdOf(eth) + ' · v1 sweeps deposit the full balance'
-      : 'unknown');
+      : 'Unknown');
     $('gm-cost-min').style.display = (bal != null && bal < PP_MIN_WEI) ? 'block' : 'none';
     box.style.display = 'block';
     armedAddr = addr;
@@ -289,8 +298,8 @@ function beginRelayProgress() {
   progress.polls = 0;
   if (progress.timer) { clearInterval(progress.timer); progress.timer = null; }
   $('gm-progress').style.display = 'block';
-  setProgressLine1('<span class="gm-pulse"></span>signed · relaying (the relayer adds a random delay to protect your timing)');
-  setProgressLine2('waiting for the relayer to hand back a tx hash…');
+  setProgressLine1('<span class="gm-pulse"></span>Signed · relaying: the relayer adds a random delay to protect your timing');
+  setProgressLine2('Waiting for the relayer to hand back a transaction hash…');
   $('gm-progress').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
@@ -310,9 +319,9 @@ function wireBroadcastObserver() {
 async function trackHash(hash) {
   progress.hash = hash;
   progress.polls = 0;
-  setProgressLine1('<span class="gm-pulse"></span>broadcast · pending ' + short(hash)
+  setProgressLine1('<span class="gm-pulse"></span>Broadcast · pending ' + short(hash)
     + ' · <a href="https://etherscan.io/tx/' + hash + '" target="_blank" rel="noopener">etherscan</a>');
-  setProgressLine2('polling the relayer every 5s for confirmation…');
+  setProgressLine2('Polling the relayer every 5s for confirmation…');
   progress.timer = setInterval(() => pollStatus(hash), 5000);
   pollStatus(hash);
 }
@@ -326,13 +335,13 @@ async function pollStatus(hash) {
     const j = await r.json();
     if (j.status === 'confirmed') return setConfirmed(hash, j.blockNumber);
     if (j.status === 'failed') return setFailed(hash);
-    setProgressLine2('pending · poll ' + progress.polls + ' · still waiting for a block…');
+    setProgressLine2('Pending · poll ' + progress.polls + ' · still waiting for a block…');
   } catch (e) {
-    setProgressLine2('status poll failed (' + e.message + ') · retrying…');
+    setProgressLine2('Status poll failed (' + e.message + ') · retrying…');
   }
   if (progress.polls >= 120) {
     stopPolling();
-    setProgressLine2('still pending after 10 minutes · check <a href="https://etherscan.io/tx/' + hash + '" target="_blank" rel="noopener">etherscan</a>.');
+    setProgressLine2('Still pending after 10 minutes · check <a href="https://etherscan.io/tx/' + hash + '" target="_blank" rel="noopener">etherscan</a>.');
   }
 }
 
@@ -341,17 +350,18 @@ function stopPolling() { if (progress.timer) { clearInterval(progress.timer); pr
 function setConfirmed(hash, blockNumber) {
   stopPolling();
   progress.active = false;
-  setProgressLine1('<span class="gm-ok">CONFIRMED'
+  setProgressLine1('<span class="gp-pill ok">Confirmed</span>'
     + (blockNumber != null ? ' in block ' + Number(blockNumber).toLocaleString() : '')
-    + ' · ' + short(hash) + '</span>');
-  setProgressLine2('<a href="https://etherscan.io/tx/' + hash + '" target="_blank" rel="noopener">view on etherscan: ' + hash + '</a>');
+    + ' · ' + short(hash));
+  setProgressLine2('<a href="https://etherscan.io/tx/' + hash + '" target="_blank" rel="noopener">View on etherscan: ' + hash + '</a>');
 }
 
 function setFailed(hash) {
   stopPolling();
   progress.active = false;
-  setProgressLine1('<span class="gm-bad">FAILED · ' + short(hash) + ' · the sweep reverted onchain or was dropped</span>');
-  setProgressLine2('hit RESCAN above, re-arm the payment, and SIGN SWEEP again. the signed artifact is single-use (the nonce moves on).');
+  setProgressLine1('<span class="gp-pill danger">Failed</span> ' + short(hash)
+    + ' · the sweep reverted onchain or was dropped');
+  setProgressLine2('Rescan, re-arm the payment, then SIGN SWEEP again. The signed artifact is single-use: the nonce moves on.');
 }
 
 // the core emits "swept" when its own receipt poll confirms; reconcile in case ./status lags.
@@ -382,15 +392,15 @@ function wireSecretObserver() {
 function showGate(g) {
   const body = $('gm-gate-body');
   body.textContent = '';
-  row(body, 'NEW SECRET', g.stealthAddress ? 'pp-secret for ' + short(g.stealthAddress) : 'pp-secret downloaded');
-  row(body, 'PRECOMMITMENT', short(g.precommitment));
+  row(body, 'New secret', g.stealthAddress ? 'pp-secret for ' + short(g.stealthAddress) : 'pp-secret downloaded');
+  row(body, 'Precommitment', short(g.precommitment));
   $('gm-gate-status').textContent = '';
   $('gm-gate-file').value = '';
   $('gm-gate').style.display = 'block';
 }
 
 function wireGate() {
-  $('gm-gate-confirm').onclick = () => { clearGate(); GP.toast('backup confirmed · sweeping re-enabled'); };
+  $('gm-gate-confirm').onclick = () => { clearGate(); GP.toast('Backup confirmed · sweeping re-enabled'); };
   $('gm-gate-file').onchange = async e => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
@@ -399,15 +409,15 @@ function wireGate() {
     if (!g) { st.textContent = ''; return; }
     try {
       const j = JSON.parse(await f.text());
-      if (!j.nullifier || !j.secret || !j.precommitment) throw new Error('file is missing nullifier, secret, or precommitment');
+      if (!j.nullifier || !j.secret || !j.precommitment) throw new Error('the file is missing its nullifier, secret or precommitment');
       if (String(j.nullifier).toLowerCase() !== String(g.nullifier).toLowerCase())
         throw new Error('nullifier mismatch: this file is for a different deposit');
       if (GP.crypto.poseidon2([BigInt(j.nullifier), BigInt(j.secret)]) !== BigInt(g.precommitment))
         throw new Error('poseidon2(nullifier, secret) does not match the precommitment: file corrupt or edited');
       clearGate();
-      GP.toast('backup verified · sweeping re-enabled');
+      GP.toast('Backup verified · sweeping re-enabled');
     } catch (err) {
-      st.textContent = 'check failed: ' + err.message;
+      st.textContent = 'Check failed: ' + err.message;
     }
   };
 }
@@ -441,12 +451,12 @@ async function checkRecipient(rcpt) {
 function showFreshWarning(rcpt, info) {
   const body = $('gm-fresh-body');
   body.textContent = '';
-  row(body, 'RECIPIENT', rcpt);
+  row(body, 'Recipient', rcpt);
   if (info) {
-    row(body, 'NONCE', String(info.nonce) + (info.nonce > 0 ? ' · this address has sent transactions' : ''));
-    row(body, 'ETH BALANCE', GP.fmt.formatEth(info.bal) + ' ETH' + usdOf(GP.fmt.formatEth(info.bal)));
+    row(body, 'Nonce', String(info.nonce) + (info.nonce > 0 ? ' · this address has sent transactions' : ''));
+    row(body, 'ETH balance', GP.fmt.formatEth(info.bal) + ' ETH' + usdOf(GP.fmt.formatEth(info.bal)));
   } else {
-    row(body, 'HISTORY CHECK', 'FAILED · RPC unreachable, history unknown');
+    row(body, 'History check', 'Failed: RPC unreachable, history unknown');
   }
   $('gm-fresh').style.display = 'block';
   $('gm-fresh').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -485,35 +495,35 @@ function wireBackup() {
   const st = $('gm-backup-status');
   $('gm-backup-export').onclick = async () => {
     const p1 = $('gm-backup-pass').value, p2 = $('gm-backup-pass2').value;
-    if (!p1) { st.textContent = 'set a passcode first.'; return; }
-    if (p1 !== p2) { st.textContent = 'passcodes do not match.'; return; }
-    if (p1.length < 8) { st.textContent = 'passcode too short: use 12+ characters.'; return; }
+    if (!p1) { st.textContent = 'Set a passcode first.'; return; }
+    if (p1 !== p2) { st.textContent = 'Passcodes do not match.'; return; }
+    if (p1.length < 8) { st.textContent = 'Passcode too short: use 12+ characters.'; return; }
     try {
-      st.textContent = 'encrypting (PBKDF2 x600,000)…';
+      st.textContent = 'Encrypting (PBKDF2 x600,000)…';
       const payload = collectBackup();
       const n = Object.keys(payload.items).length;
       const enc = await backupEncrypt(JSON.stringify(payload), p1);
       downloadFile('ghostpay-backup-' + new Date().toISOString().slice(0, 10) + '.json', enc);
-      st.textContent = 'exported ' + n + ' key(s), encrypted. store the file like a key: it holds your watch-only session'
+      st.textContent = 'Exported ' + n + ' key(s), encrypted. Store the file like a key: it holds your watch-only session'
         + (n ? ' and everything else restorable on this device.' : '.');
-    } catch (e) { st.textContent = 'export failed: ' + e.message; }
+    } catch (e) { st.textContent = 'Export failed: ' + e.message; }
   };
   $('gm-backup-import').onclick = async () => {
     const f = $('gm-backup-file').files && $('gm-backup-file').files[0];
     const pass = $('gm-backup-pass').value;
-    if (!f) { st.textContent = 'pick a backup file first.'; return; }
-    if (!pass) { st.textContent = 'enter the backup passcode in the first passcode field.'; return; }
+    if (!f) { st.textContent = 'Pick a backup file first.'; return; }
+    if (!pass) { st.textContent = 'Enter the backup passcode in the first passcode field.'; return; }
     try {
-      st.textContent = 'decrypting (PBKDF2 x600,000)…';
+      st.textContent = 'Decrypting (PBKDF2 x600,000)…';
       const payload = JSON.parse(await backupDecrypt(await f.text(), pass));
       if (!payload || payload.v !== 1 || payload.app !== 'ghostpay' || !payload.items || typeof payload.items !== 'object')
         throw new Error('decrypted payload is not a ghostpay backup');
       const keys = Object.keys(payload.items);
       for (const k of keys) localStorage.setItem(k, String(payload.items[k]));
-      st.textContent = 'imported ' + keys.length + ' key(s). importing overwrote same-named keys on this device. reload to apply.';
+      st.textContent = 'Imported ' + keys.length + ' key(s). Importing overwrote same-named keys on this device. Reload to apply.';
       $('gm-backup-reload').style.display = 'block';
     } catch (e) {
-      st.textContent = 'import failed: ' + (e && e.name === 'OperationError' ? 'wrong passcode or corrupt file' : e.message);
+      st.textContent = 'Import failed: ' + (e && e.name === 'OperationError' ? 'wrong passcode or corrupt file' : e.message);
     }
   };
   $('gm-backup-reload').onclick = () => location.reload();

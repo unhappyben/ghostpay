@@ -36,7 +36,7 @@ local_prep() {
   step "fetch + checkout $BRANCH (local)"
   git fetch origin "$BRANCH"
   CURRENT="$(git rev-parse --abbrev-ref HEAD)"
-  if [ "" != "" ]; then git checkout -B "" FETCH_HEAD 2>/dev/null || git checkout ""; fi
+  if [ "$CURRENT" != "$BRANCH" ]; then git checkout -B "$BRANCH" FETCH_HEAD 2>/dev/null || git checkout "$BRANCH"; fi
   git pull --ff-only origin "$BRANCH"
   step "npm ci"
   npm ci
@@ -96,7 +96,7 @@ step "pull $BRANCH into $APP_DIR"
 cd "$APP_DIR"
 git fetch origin "$BRANCH"
 CURRENT="$(git rev-parse --abbrev-ref HEAD)"
-if [ "" != "" ]; then git checkout -B "" FETCH_HEAD 2>/dev/null || git checkout ""; fi
+if [ "$CURRENT" != "$BRANCH" ]; then git checkout -B "$BRANCH" FETCH_HEAD 2>/dev/null || git checkout "$BRANCH"; fi
 git pull --ff-only origin "$BRANCH"
 
 step "npm ci"

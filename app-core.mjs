@@ -78,7 +78,7 @@ const intentDomain = stealth => ({ name: 'GhostpaySweeper', version: '1', chainI
 const SWEEPER_IFACE = new ethers.Interface([
   'function sweepToPrivacyPoolsETH(uint256 precommitment)'
 ]);
-const copy = (txt, btn) => { navigator.clipboard.writeText(txt); btn.textContent = 'COPIED ✓'; setTimeout(()=>btn.textContent=btn.dataset.t, 1200); };
+const copy = (txt, btn) => { navigator.clipboard.writeText(txt); btn.textContent = 'Copied ✓'; setTimeout(()=>btn.textContent=btn.dataset.t, 1200); };
 document.querySelectorAll('button').forEach(b => b.dataset.t = b.textContent);
 
 // ── ui-core: event hub, toast, session persistence ──
@@ -128,7 +128,7 @@ function renderRecvRecovery() {
   if (!el) {
     el = document.createElement('div');
     el.id = 'recv-recovery';
-    el.style.cssText = 'border:1px solid #fff;padding:14px;margin:12px 0;font-size:12px;line-height:1.7';
+    el.style.cssText = 'border:1px solid var(--gp-line-strong);border-radius:var(--gp-radius-sm);padding:14px;margin:12px 0;font-size:12px;line-height:1.7';
     host.insertBefore(el, host.children[1] || null);
   }
   el.innerHTML = '';
@@ -140,13 +140,12 @@ function renderRecvRecovery() {
   const row = document.createElement('div');
   row.style.cssText = 'margin-top:10px;display:flex;gap:10px';
   const bAnn = document.createElement('button');
-  bAnn.textContent = 'ANNOUNCE NOW';
-  bAnn.style.cssText = 'width:auto;padding:8px 16px;font-size:11px';
+  bAnn.textContent = 'Announce now';
+  bAnn.className = 'gp-btn small primary';
   bAnn.onclick = async () => { bAnn.disabled = true; await announceRecv(r); bAnn.disabled = false; };
   const bDrop = document.createElement('button');
-  bDrop.textContent = 'FORGET IT';
-  bDrop.className = 'ghost';
-  bDrop.style.cssText = 'width:auto;padding:8px 16px;font-size:11px';
+  bDrop.textContent = 'Forget it';
+  bDrop.className = 'gp-btn small ghost';
   bDrop.onclick = () => dropRecvRecord(r.stealth);
   row.appendChild(bAnn); row.appendChild(bDrop);
   el.appendChild(row);
@@ -347,7 +346,7 @@ $('b-gen').onclick = async () => {
   recordRecv(W.recv);
   $('c-recv').style.display = 'block';
   $('v-recv').textContent = W.recv.stealth;
-  $('st-announce').textContent = 'share this 0x address to get paid. payment links announce automatically when the payer pays; ANNOUNCE IT is only needed for raw-address payments.';
+  $('st-announce').textContent = 'share this 0x address to get paid. payment links announce automatically when the payer pays; Announce it is only needed for raw-address payments.';
   $('d-meta').style.display = 'block';
   $('v-meta').textContent = W.meta;
   $('st-gen').textContent = 'done. your keys regenerate from the same signature any time, any device.';
@@ -403,7 +402,7 @@ async function announceRecv(rec) {
             dropRecvRecord(stealth); // confirmed onchain: the scanner covers recovery from here
             return;
           }
-          if (s.status === 'failed') { st('announce tx REVERTED onchain · ' + j.hash + ' · hit ANNOUNCE IT to retry.'); return; }
+          if (s.status === 'failed') { st('announce tx reverted onchain · ' + j.hash + ' · hit Announce it to retry.'); return; }
         } catch { /* keep polling */ }
       }
       st('still pending after 10 minutes · ' + j.hash + ' · it is in the private mempool, it usually lands within a few more minutes.');
@@ -450,80 +449,23 @@ async function jrpc(method, params) {
 }
 let scanSeq = 0;
 let scanBusy = false;
-const payments = [];      // GP.state.payments: one record per rendered payment card
+const payments = [];      // GP.state.payments: one record per discovered payment
 const seenPays = new Set(); // dedupe tx:addr across incremental scans; cleared on full scans
-// per-card lifecycle state, best-effort and async: balance → swept → PP deposit →
-// ASP → withdrawn. Any RPC/ASP failure leaves the balance-only state; the mySeq
-// guard stops a superseded scan from writing into freshly rendered cards.
-async function cardState(div, btn, addr, payBlock, mySeq, getAsp) {
-  const state = document.createElement('div');
-  state.className = 'meta';
-  const setState = t => { if (mySeq === scanSeq) state.textContent = t; };
-  try {
-    const bal = BigInt(await jrpc('eth_getBalance', [addr, 'latest']));
-    const nonce = BigInt(await jrpc('eth_getTransactionCount', [addr, 'latest']));
-    if (mySeq !== scanSeq) return;
-    div.insertBefore(state, btn);
-    if (bal > 0n) {
-      setState('LIVE · ' + ethers.formatEther(bal) + ' ETH · sweepable');
-      return;
-    }
-    // swept: dim, kill the button, then trace the deposit lifecycle
-    div.classList.add('swept');
-    div.classList.remove('armed');
-    btn.disabled = true;
-    btn.textContent = 'ALREADY SWEPT';
-    let txt = 'SWEPT · 0 balance' + (nonce > 0n ? ' · nonce ' + nonce : '');
-    setState(txt);
-    // PP deposit from this stealth address. The deposit always lands AFTER the payment
-    // block (usually within minutes); the search is capped at payment block + 100k to
-    // bound RPC time, newest first, <=5k-block chunks.
-    let dep = null;
-    try {
-      const topic = PP_IFACE.getEvent('Deposited').topicHash;
-      const depTopic = ethers.zeroPadValue(addr, 32);
-      const end = Math.min(payBlock + 100000, parseInt(await jrpc('eth_blockNumber', []), 16));
-      for (let e2 = end; e2 >= payBlock && !dep; e2 -= PP_LOG_CHUNK) {
-        const s2 = Math.max(e2 - PP_LOG_CHUNK + 1, payBlock);
-        const logs = await jrpc('eth_getLogs', [{ address: PP_POOL, topics: [topic, depTopic], fromBlock: '0x' + s2.toString(16), toBlock: '0x' + e2.toString(16) }]);
-        if (logs.length) {
-          const p = PP_IFACE.parseLog(logs[logs.length - 1]);
-          dep = { label: BigInt(p.args._label), value: BigInt(p.args._value), block: parseInt(logs[logs.length - 1].blockNumber, 16) };
-        }
-      }
-    } catch { /* deposit search failed: keep the balance-only state */ }
-    if (mySeq !== scanSeq) return;
-    if (dep) {
-      txt += ' → PP deposit ' + ethers.formatEther(dep.value) + ' ETH @ block ' + dep.block.toLocaleString();
-      setState(txt);
-      try {
-        const asp = await getAsp();
-        txt += asp.has(dep.label) ? ' · ASP approved' : ' · ASP screening';
-        setState(txt);
-      } catch { /* ASP unreachable: leave the state without ASP status */ }
-    }
-    // withdrawal state from the local tracking record (nullifier only, written at sweep time)
-    try {
-      const rec = JSON.parse(localStorage.getItem('ghostpay:ppnote:' + addr.toLowerCase()) || 'null');
-      if (rec && rec.nullifier) {
-        const spent = BigInt(await ppCall(PP_IFACE.encodeFunctionData('nullifierHashes', [spentNullifierHash(BigInt(rec.nullifier))])));
-        txt += spent !== 0n ? ' · WITHDRAWN' : ' · in pool (withdrawable)';
-        setState(txt);
-      }
-    } catch { /* no tracking record or RPC failed: skip */ }
-  } catch { /* balance check failed: leave the card enabled, no state line */ }
-}
-// scan(opts): full rescan by default (wipes + re-renders #payments). {append:true} keeps the
-// existing cards and only appends newly discovered payments (the 60s background poll uses
-// this, resuming from the stored cursor). {quiet:true} leaves the status line alone unless
+// scan(opts): full rescan by default (resets GP.state.payments; #payments is kept wiped:
+// the inbox module owns all payment rendering now). {append:true} keeps the existing
+// records and only appends newly discovered payments (the 60s background poll uses this,
+// resuming from the stored cursor). {quiet:true} leaves the status line alone unless
 // something new was found or the scan failed. {from:N} overrides the from-block.
+// Every status-line write is mirrored as a 'scan' event ({ phase, text }) so the GET
+// PAID tab can show the same line without owning a scanner of its own.
 async function scan(opts = {}) {
+  const sayScan = (phase, text) => { $('st-scan').textContent = text; gpEmit('scan', { phase, text }); };
   const append = !!opts.append, quiet = !!opts.quiet;
   if (scanBusy && append) return payments; // a scan is in flight: skip this background tick
   scanBusy = true;
   const mySeq = ++scanSeq;
   if (!append) { $('payments').innerHTML = ''; seenPays.clear(); payments.length = 0; }
-  if (!quiet) $('st-scan').textContent = 'scanning announcements…';
+  if (!quiet) sayScan('start', 'scanning announcements…');
   try {
     const topic0 = ethers.id('Announcement(uint256,address,address,bytes,bytes)');
     const t1 = ethers.zeroPadValue('0x01', 32);
@@ -545,7 +487,7 @@ async function scan(opts = {}) {
         try {
           const res = await jrpc('eth_getLogs', [{ address: ANNOUNCER, topics: [topic0, t1], fromBlock: '0x' + f.toString(16), toBlock: '0x' + t.toString(16) }]);
           logs.push(...res); done++;
-          if (!quiet) $('st-scan').textContent = 'scanning blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ' · ' + logs.length + ' announcements found so far…';
+          if (!quiet) sayScan('progress', 'scanning blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ' · ' + logs.length + ' announcements found so far…');
         } catch (e) {
           if (t - f + 1 > 10000) { for (let g = f; g <= t; g += 10000) ranges.push([g, Math.min(g + 9999, t), 0]); }
           else if (r[2] < 3) { r[2]++; ranges.push(r); await new Promise(x => setTimeout(x, 600)); }
@@ -555,17 +497,7 @@ async function scan(opts = {}) {
     }
     await Promise.all(Array.from({ length: 6 }, worker));
     if (mySeq !== scanSeq) return payments;
-    if (!quiet) $('st-scan').textContent = logs.length + ' announcements. filtering…';
-    // ASP snapshot: fetched at most once per scan (live SCOPE() call + mt-leaves),
-    // shared by every card that finds a PP deposit.
-    let aspPromise = null;
-    const getAsp = () => aspPromise ??= (async () => {
-      const scope = BigInt(await ppCall(PP_IFACE.encodeFunctionData('SCOPE', [])));
-      const res = await fetch(PP_ASP + '/mt-leaves', { headers: { 'X-Pool-Scope': scope.toString() } });
-      if (!res.ok) throw new Error('ASP leaves fetch failed (' + res.status + ')');
-      const { aspLeaves } = await res.json();
-      return new Set(aspLeaves.map(x => BigInt(x)));
-    })();
+    if (!quiet) sayScan('filter', logs.length + ' announcements. filtering…');
     let found = 0;
     for (const l of logs) {
       const [ephPub, metadata] = ethers.AbiCoder.defaultAbiCoder().decode(['bytes','bytes'], l.data);
@@ -577,31 +509,23 @@ async function scan(opts = {}) {
       if (seenPays.has(dedupeKey)) continue;
       seenPays.add(dedupeKey);
       found++;
-      const div = document.createElement('div');
-      div.className = 'pay';
-      div.innerHTML = '<div class="addr">' + addr + '</div><div class="meta">block ' + parseInt(l.blockNumber,16) + ' · tx ' + l.transactionHash.slice(0,16) + '…</div>';
-      const b = document.createElement('button');
-      b.textContent = 'SWEEP THIS';
-      b.onclick = () => sweepUI(addr, ephPub, div);
-      div.appendChild(b);
-      $('payments').appendChild(div);
       const rec = { address: addr, ephPub, block: parseInt(l.blockNumber, 16), tx: l.transactionHash, swept: false, fresh: append };
       payments.push(rec);
       gpEmit('payment', rec);
       queueArm(rec); // silent auto-arm: intent signed + secret downloaded the moment a payment is found
-      // lifecycle state line: LIVE / SWEPT / PP deposit / ASP / WITHDRAWN (async, best-effort)
-      cardState(div, b, addr, parseInt(l.blockNumber, 16), mySeq, getAsp);
     }
     // advance the cursor only on a fully clean scan, so unreachable ranges are never skipped for good
     if (!failed) localStorage.setItem(cursorKey, String(latest));
     if (!quiet || found) {
-      $('st-scan').textContent = (found ? found + (append ? ' new ' : ' ') + 'payment(s) found. sweep when ready.' : 'nothing in this range. if you expected older payments, type an earlier from-block below and rescan.')
+      sayScan('done', (found
+          ? found + (append ? ' new' : '') + ' payment' + (found === 1 ? '' : 's') + ' found. sweep when ready.'
+          : 'nothing in this range. if you expected older payments, type an earlier from-block below and rescan.')
         + ' (blocks ' + fromBlock.toLocaleString() + ' → ' + latest.toLocaleString() + ')'
-        + (failed ? ' (' + failed + ' block range(s) unreachable · rescan to retry)' : '')
-        + (failed ? '' : ' · cursor saved · next scan resumes from block ' + latest.toLocaleString() + '. type a from-block above to rescan earlier.');
+        + (failed ? ' (' + failed + ' block range' + (failed === 1 ? '' : 's') + ' unreachable · rescan to retry)' : '')
+        + (failed ? '' : ' · cursor saved · next scan resumes from block ' + latest.toLocaleString() + '. type a from-block above to rescan earlier.'));
     }
     return payments;
-  } catch (e) { $('st-scan').textContent = 'scan failed: ' + e.message; return payments; }
+  } catch (e) { sayScan('error', 'scan failed: ' + e.message); return payments; }
   finally { scanBusy = false; }
 }
 
@@ -638,21 +562,29 @@ async function relaySweep(artifact, onHash) {
       const rcpt = await jrpc('eth_getTransactionReceipt', [j.hash]);
       if (rcpt) {
         if (rcpt.status === '0x1') {
-          stHtml('CONFIRMED in block ' + parseInt(rcpt.blockNumber, 16) + ' · ' + j.hash + txLink(j.hash)
-            + (artifact.precommitment ? ' · PP deposit sent · withdrawal after ASP review, using your downloaded secret file.' : ''));
-          const rec = payments.find(p => p.address.toLowerCase() === String(artifact.stealthAddress || '').toLowerCase());
-          if (rec) rec.swept = true;
-          gpEmit('swept', { hash: j.hash, block: parseInt(rcpt.blockNumber, 16), artifact, payment: rec || null });
-          return { hash: j.hash, status: 'confirmed', block: parseInt(rcpt.blockNumber, 16) };
+          // batch artifacts confirm as one transaction but sweep many addresses: emit one
+          // 'swept' per inner sweep so every consumer (inbox pills, recv-record pruning,
+          // reports) works unchanged, exactly as if each had been relayed on its own.
+          const inner = artifact.kind === 'eip7702-intent-batch' && Array.isArray(artifact.sweeps) ? artifact.sweeps : [artifact];
+          stHtml('confirmed in block ' + parseInt(rcpt.blockNumber, 16) + ' · ' + j.hash + txLink(j.hash)
+            + (inner.length > 1 ? ' · ' + inner.length + ' sweeps confirmed in one transaction · withdraw each after ASP review with its downloaded secret file.'
+            : artifact.precommitment ? ' · pool deposit sent · withdraw after ASP review with your downloaded secret file.' : ''));
+          const block = parseInt(rcpt.blockNumber, 16);
+          for (const a of inner) {
+            const rec = payments.find(p => p.address.toLowerCase() === String(a.stealthAddress || '').toLowerCase());
+            if (rec) rec.swept = true;
+            gpEmit('swept', { hash: j.hash, block, artifact: a, payment: rec || null });
+          }
+          return { hash: j.hash, status: 'confirmed', block };
         }
-        stHtml('tx REVERTED onchain · ' + j.hash + txLink(j.hash) + ' · copy the artifact and retry via relay.mjs if the failure was transient.');
+        stHtml('tx reverted onchain · ' + j.hash + txLink(j.hash) + ' · copy the artifact and retry via relay.mjs if the failure was transient.');
         return { hash: j.hash, status: 'reverted' };
       }
     }
     stHtml('still pending after 10 minutes · ' + j.hash + txLink(j.hash) + ' · check a block explorer.');
     return { hash: j.hash, status: 'timeout' };
   } catch (e) {
-    st('relayer broadcast failed: ' + e.message + ' · artifact is still valid, COPY ARTIFACT and use relay.mjs.');
+    st('relayer broadcast failed: ' + e.message + ' · artifact is still valid, Copy artifact and use relay.mjs.');
     return { status: 'error', error: e.message };
   }
 }
@@ -672,7 +604,8 @@ function relayerCaps() {
     let health = null, minFeeBps = 30;
     try { const r = await fetch('./health'); if (r.ok) health = await r.json(); } catch { /* relayer offline: legacy flow */ }
     try { const r = await fetch('./fee'); if (r.ok) { const j = await r.json(); if (Number.isFinite(j.minFeeBps)) minFeeBps = j.minFeeBps; } } catch { /* keep the 30 bps default */ }
-    return { sweeperV2: !!(health && health.sweeperV2), sweeperV2Addr: (health && health.sweeperV2) || null, minFeeBps };
+    return { sweeperV2: !!(health && health.sweeperV2), sweeperV2Addr: (health && health.sweeperV2) || null,
+      batchRelayer: (health && health.batchRelayer) || null, minFeeBps };
   })();
   return capsPromise;
 }
@@ -680,11 +613,11 @@ function relayerCaps() {
 // armed intent artifacts by lowercase stealth address: { artifact, nonce, deadline }
 const armedIntents = new Map();
 
-async function armIntent(rec) {
+async function armIntent(rec, force) {
   if (!W || !W.spendPriv || !W.viewPriv || !rec || !rec.ephPub) return null;
   const key = rec.address.toLowerCase();
   const prev = armedIntents.get(key);
-  if (prev && prev.deadline > Math.floor(Date.now() / 1000) + 300) return prev; // still valid: arm once per payment
+  if (!force && prev && prev.deadline > Math.floor(Date.now() / 1000) + 300) return prev; // still valid: arm once per payment
   const caps = await relayerCaps();
   if (!caps.sweeperV2) return null; // old relayer: the legacy arm flow runs at SIGN SWEEP time
   const addr = rec.address;
@@ -721,7 +654,7 @@ async function armIntent(rec) {
     }));
   } catch { /* storage blocked/full: tracking is best-effort, the sweep is unaffected */ }
   showSecret(
-    'PRIVACY POOLS WITHDRAWAL SECRET · KEEP this file: it is your withdrawal secret. lose it and the deposit is gone forever.'
+    'Withdrawal secret · Privacy Pools · keep the downloaded file safe: it is your withdrawal secret. lose it and the deposit is gone forever.'
       + ' the app keeps a local tracking key (nullifier only · it cannot withdraw) so the scanner can show this deposit\'s state.',
     JSON.stringify(secretFile, null, 2),
     'pp-secret-' + addr.slice(2, 10) + '.json',
@@ -750,24 +683,54 @@ function queueArm(rec) {
   return armChain;
 }
 
-async function sweepUI(addr, ephPub, card) {
-  // (re)arm: clicking SWEEP THIS on another card moves the arming to that address.
-  document.querySelectorAll('.pay.armed').forEach(d => d.classList.remove('armed'));
+// forced fresh arm for one detected payment, serialized behind any auto-arms: a new
+// pp-secret is generated and downloaded NOW (in this session, on the user's gesture),
+// and a fresh intent + 7702 authorization is signed. The batch sweep UI arms every
+// selected payment through here so each secret file provably exists before broadcast.
+// Resolves the armed { artifact, nonce, deadline }, or null (watch-only, old relayer,
+// below the pool minimum). Rejects on RPC/signing failure.
+function armPayment(addr) {
+  const rec = payments.find(p => p.address.toLowerCase() === String(addr || '').toLowerCase());
+  if (!rec) return Promise.resolve(null);
+  // the queue itself never stays rejected: one failed arm must not skip every later arm
+  const next = armChain.catch(() => {}).then(() => armIntent(rec, true));
+  armChain = next.catch(() => {});
+  return next;
+}
+
+// the inbox row's pool-sweep entry: arms the FUNDS sweeper UI for a detected payment
+// exactly as the retired .pay card's Sweep this button did. The sweep surface (SIGN
+// SWEEP, secret card, broadcast) lives on the FUNDS tab, so route there first when
+// another tab is showing; gp-money's interceptions cover it unchanged from any entry.
+function sweepPayment(addr) {
+  const rec = payments.find(p => p.address.toLowerCase() === String(addr || '').toLowerCase());
+  if (!rec) { toast('payment not found on this device · rescan and retry'); return; }
+  if (!$('sweeper-ui')) return;
+  const go = () => sweepUI(rec.address, rec.ephPub);
+  const funds = $('route-funds');
+  if (funds && funds.style.display === 'none') {
+    location.hash = '#/funds';
+    setTimeout(go, 80); // let the hash router reveal FUNDS before sweepUI scrolls to it
+  } else go();
+}
+
+async function sweepUI(addr, ephPub) {
+  // entering the sweep for a payment (re)arms this surface to that address. The retired
+  // .pay cards used to take an .armed highlight; the inbox rows carry the state now.
   // sub-minimum guard: the Privacy Pools entrypoint (and this relayer's preflight) rejects
   // deposits under 0.01 ETH, so arming a pool sweep for dust only produces a failed broadcast
   // and a scary secret file for a deposit that can never happen. Point at the inbox instead.
   try {
     const bal = BigInt(await jrpc('eth_getBalance', [addr, 'latest']));
     if (bal > 0n && bal < 10000000000000000n) {
-      $('st-armed').textContent = addr + ' holds ' + ethers.formatEther(bal) + ' ETH, below the 0.01 ETH Privacy Pools minimum. Use SWEEP DIRECT on this payment\'s inbox row below: it sends the balance (minus the relayer fee) straight to an address you choose, skipping the pool.';
+      $('st-armed').textContent = addr + ' holds ' + ethers.formatEther(bal) + ' ETH, below the 0.01 ETH Privacy Pools minimum. use Sweep direct on this payment\'s inbox row below: it sends the balance (minus the relayer fee) straight to an address you choose, skipping the pool.';
       $('sweeper-ui').style.display = 'block';
       $('c-secret').style.display = 'none';
-      $('b-sweep').textContent = 'BELOW POOL MINIMUM';
-      $('b-sweep').onclick = () => { $('st-armed').textContent = addr + ' is below the 0.01 ETH pool minimum · use SWEEP DIRECT in the inbox instead.'; };
+      $('b-sweep').textContent = 'Below pool minimum';
+      $('b-sweep').onclick = () => { $('st-armed').textContent = addr + ' is below the 0.01 ETH pool minimum · use Sweep direct in the inbox instead.'; };
       return;
     }
   } catch { /* balance check failed: fall through to normal arming */ }
-  if (card) card.classList.add('armed');
   $('st-armed').textContent = 'sweeping ' + addr + ' into Privacy Pools';
   $('sweeper-ui').style.display = 'block';
   $('sweeper-ui').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -775,7 +738,7 @@ async function sweepUI(addr, ephPub, card) {
   $('b-sweep').onclick = async () => {
     try {
       $('c-secret').style.display = 'none';
-      if (!W.spendPriv) throw new Error('watch-only session: your spend key is never stored on this device, so sweeping needs a fresh wallet signature. hit RE-CONNECT above, connect, GENERATE MY STEALTH KEYS (same wallet, same keys), then retry.');
+      if (!W.spendPriv) throw new Error('watch-only session: your spend key is never stored on this device, so sweeping needs a fresh wallet signature. hit Re-connect above, connect, Generate my stealth keys (same wallet, same keys), then retry.');
       // intent path: use the artifact auto-armed at detection time, re-arming silently if
       // the deadline passed or the stealth nonce moved. Falls through to the legacy arm
       // below when nothing is armed (old relayer, or a below-minimum balance).
@@ -837,7 +800,7 @@ async function sweepUI(addr, ephPub, card) {
         }));
       } catch { /* storage blocked/full: tracking is best-effort, the sweep is unaffected */ }
       showSecret(
-        'PRIVACY POOLS WITHDRAWAL SECRET · KEEP this file: it is your withdrawal secret. lose it and the deposit is gone forever.'
+        'Withdrawal secret · Privacy Pools · keep the downloaded file safe: it is your withdrawal secret. lose it and the deposit is gone forever.'
           + ' the app keeps a local tracking key (nullifier only · it cannot withdraw) so the scanner can show this deposit\'s state.',
         JSON.stringify(secretFile, null, 2),
         'pp-secret-' + addr.slice(2, 10) + '.json',
@@ -1115,19 +1078,19 @@ async function pollStatus() {
     const h = await r.json();
     const runners = h.runnerCount ?? (Array.isArray(h.runners) ? h.runners.length
       : (typeof h.runners === 'number' ? h.runners : null));
-    parts.push('relayer: online'
+    parts.push('relayer online'
       + (runners != null ? ' · ' + runners + ' runner' + (runners === 1 ? '' : 's') : '')
-      + ' · sweeperV2 ' + (h.sweeperV2 ? 'configured' : 'NOT configured')
+      + (h.sweeperV2 ? ' · sweeperV2' : ' · no sweeperV2')
       + ' · tor ' + (h.tor ? 'on' : 'off'));
-  } catch { parts.push('relayer: offline (static serving only)'); }
+  } catch { parts.push('relayer offline (static serving only)'); }
   try {
     const r = await fetch('./fee');
     if (r.ok) {
       const f = await r.json();
-      if (f.minFeeBps != null) parts.push('min fee ' + (f.minFeeBps / 100) + '%');
+      if (f.minFeeBps != null) parts.push('fee ' + (f.minFeeBps / 100).toFixed(2) + '%');
       else {
         const g = f.minFeeGwei ?? f.gwei ?? f.minFee;
-        if (g != null) parts.push('min fee ' + g + ' gwei');
+        if (g != null) parts.push('fee ' + g + ' gwei');
       }
     }
   } catch { /* fee endpoint optional */ }
@@ -1136,13 +1099,44 @@ async function pollStatus() {
     if (r.ok) {
       const p = await r.json();
       const usd = p.usd ?? p.ethUsd ?? p.price ?? (p.ethereum && p.ethereum.usd);
-      if (usd != null && isFinite(Number(usd))) { ethPriceUsd = Number(usd); parts.push('ETH $' + ethPriceUsd.toLocaleString()); }
+      if (usd != null && isFinite(Number(usd))) { ethPriceUsd = Number(usd); parts.push('ETH $' + Math.round(ethPriceUsd).toLocaleString()); }
     }
   } catch { /* price hidden on failure, by design */ }
   el.textContent = parts.join(' · ');
 }
 pollStatus();
 setInterval(pollStatus, 60000);
+
+// adoptSession: the GET PAID stepper (homepage inline module) derives the same keys this
+// module would from the same wallet signature, then hands them over so app-core owns the
+// one scanner and GP.state reflects the session. Same viewing key as the live session:
+// idempotent (only a fresher receive address is adopted). Different keys: the session
+// switches. A wallet connection this module holds is kept only when it is the same
+// account the keys were derived with; otherwise it belongs to the old keys and is dropped.
+function adoptSession(k) {
+  if (!k || !k.viewPriv || !k.meta || !k.spendPub || !k.viewPub) return;
+  const same = W && W.viewPriv === k.viewPriv;
+  if (same) {
+    if (k.recv && (!W.recv || W.recv.stealth !== k.recv.stealth)) { W.recv = k.recv; renderRecvRecovery(); }
+    return;
+  }
+  const keepWallet = !!(W && k.account && W.account && W.account.toLowerCase() === String(k.account).toLowerCase());
+  W = {
+    ...(keepWallet ? { prov: W.prov, session: W.session, eip1193: W.eip1193 } : {}),
+    account: k.account || (keepWallet ? W.account : null),
+    viewPriv: k.viewPriv,
+    spendPriv: k.spendPriv || null,
+    spendPub: k.spendPub,
+    viewPub: k.viewPub,
+    meta: k.meta,
+    recv: k.recv || null,
+  };
+  if (W.recv) recordRecv(W.recv);
+  refreshDash();
+  renderRecvRecovery();
+  gpEmit('session', { type: 'adopted', watchOnly: !W.spendPriv, address: W.account });
+  scan();
+}
 
 // returning-user dashboard: restore a watch-only session from gp-session (viewing key +
 // meta-address only). Steps 1-2 collapse into the #gp-dash header; scanning works
@@ -1170,7 +1164,7 @@ function enterDashboard(sess) {
   if (!pendingRecv.length) recordRecv(W.recv);
   $('c-recv').style.display = 'block';
   $('v-recv').textContent = W.recv.stealth;
-  $('st-announce').textContent = 'share this 0x address to get paid. payment links announce automatically when the payer pays; ANNOUNCE IT is only needed for raw-address payments.';
+  $('st-announce').textContent = 'share this 0x address to get paid. payment links announce automatically when the payer pays; Announce it is only needed for raw-address payments.';
   $('d-meta').style.display = 'block';
   $('v-meta').textContent = W.meta;
   // s3/s4 exist on app.html (sweep/withdraw); invoices.html has neither
@@ -1179,6 +1173,9 @@ function enterDashboard(sess) {
   $('i-remember').checked = true;
   refreshDash();
   gpEmit('session', { type: 'restored', watchOnly: true, address: null });
+  // the module-eval renderRecvRecovery ran with W still null and counted the address this
+  // restore just made current: re-render now that W.recv is set, so the count excludes it
+  renderRecvRecovery();
   scan();
 }
 $('b-reconnect').onclick = () => {
@@ -1257,6 +1254,9 @@ window.GP = {
   announce: () => announceRecv(),
   relaySweep: (artifact, onHash) => relaySweep(artifact, onHash),
   relayerCaps,
+  sweepPayment,
+  armPayment,
+  adoptSession,
   fmt: { formatEth, formatUsd },
   toast,
   on: gpOn,

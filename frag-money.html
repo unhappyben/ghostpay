@@ -7,30 +7,66 @@
      line at runtime. All ids are prefixed gm- and are owned by gp-money.
 
      Blocks:
-       data-gm-block="sweep"    -> mounted into #gp-sweep   (step 4 · SWEEP)
-       data-gm-block="withdraw" -> mounted into #gp-withdraw (step 5 · WITHDRAW)
+       data-gm-block="sweep"    -> mounted into #gp-sweep   (step 3 · SWEEP)
+       data-gm-block="withdraw" -> mounted into #gp-withdraw (step 4 · WITHDRAW)
+
+     Styling: gp-ui.css tokens only, classes scoped to .gm-*. These are the
+     money-safety surfaces: they read like a hardware-wallet prompt, with
+     the facts in a .gp-kv ledger and one strong action per panel.
      ================================================================ -->
 
 <style data-gm-style>
-  .gm-box { border:1px solid #333; padding:12px; margin-top:12px; font-size:12px; color:#888; word-break:break-all; }
-  .gm-row { display:flex; justify-content:space-between; gap:12px; margin-top:4px; }
-  .gm-row .gm-k { color:#666; flex:0 0 auto; }
-  .gm-row b { color:#fff; font-weight:700; text-align:right; word-break:break-all; }
-  #gm-preview .gm-row b { color:#000; }
-  #gm-gate .gm-row b, #gm-fresh .gm-row b { color:#f66; }
-  .gm-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:6px; }
-  .gm-note { color:#666; font-size:11px; margin-top:8px; }
-  .gm-warn { border:2px solid #f66; padding:14px; margin-top:12px; color:#f66; font-size:12px; word-break:break-all; }
-  .gm-ok { color:#6f6; }
-  .gm-bad { color:#f66; }
-  .gm-pulse { display:inline-block; width:8px; height:8px; background:#fff; margin-right:8px;
+  /* gp-money panels: raised ledger cards on gp-ui tokens. All classes gm-*. */
+  .gm-panel { background:var(--gp-bg-raise); border:1px solid var(--gp-line);
+    border-radius:var(--gp-radius); padding:var(--gp-s5); margin-top:var(--gp-s4);
+    font-size:var(--gp-fs-small); color:var(--gp-muted); line-height:1.6;
+    overflow-wrap:anywhere; }
+  .gm-panel-sign { border-color:var(--gp-accent); }
+  .gm-panel-warn { border-color:var(--gp-danger); }
+  .gm-panel-head { margin-bottom:var(--gp-s3); }
+  .gm-panel-title { font-family:var(--gp-font-display); font-size:var(--gp-fs-h3);
+    font-weight:500; color:var(--gp-fg); line-height:1.3; margin-top:6px; }
+  .gm-panel-sub { color:var(--gp-muted); font-size:var(--gp-fs-small); margin-top:6px; }
+  .gm-eyebrow-accent { color:var(--gp-accent); }
+  .gm-eyebrow-danger { color:var(--gp-danger); }
+  .gm-ledger { margin-top:var(--gp-s2); }
+  /* ledger values mix prose and hex: wrap at spaces first, break hex only when
+     it would overflow (overrides .gp-kv > .gp-v word-break:break-all) */
+  .gm-ledger .gp-v { word-break:normal; }
+  .gm-note { color:var(--gp-faint); font-size:var(--gp-fs-micro); line-height:1.6;
+    margin-top:var(--gp-s3); padding-top:var(--gp-s3); border-top:1px solid var(--gp-line-soft); }
+  .gm-flag { color:var(--gp-danger); font-size:var(--gp-fs-small); margin-top:var(--gp-s3); }
+  .gm-reco { color:var(--gp-fg); font-size:var(--gp-fs-small); margin-top:var(--gp-s3); }
+  .gm-actions { display:flex; gap:var(--gp-s2); flex-wrap:wrap; margin-top:var(--gp-s4); }
+  .gm-status { color:var(--gp-muted); font-size:var(--gp-fs-small); margin-top:var(--gp-s3); }
+  .gm-status-danger { color:var(--gp-danger); }
+  .gm-line1 { color:var(--gp-fg); font-weight:500; margin-top:var(--gp-s2); }
+  .gm-line2 { color:var(--gp-muted); font-size:var(--gp-fs-small); margin-top:var(--gp-s1); }
+  .gm-pulse { display:inline-block; width:8px; height:8px; border-radius:50%;
+    background:var(--gp-accent); margin-right:8px; vertical-align:baseline;
     animation:gmPulse 1.2s ease-in-out infinite; }
   @keyframes gmPulse { 0%,100% { opacity:.15; } 50% { opacity:1; } }
+  .gm-section { margin-top:var(--gp-s4); padding-top:var(--gp-s4); border-top:1px solid var(--gp-line-soft); }
+  .gm-lbl { display:block; color:var(--gp-faint); margin-top:var(--gp-s3); }
+  .gm-file { color:var(--gp-muted); }
+  .gm-file::file-selector-button { background:var(--gp-bg-raise); color:var(--gp-fg);
+    border:1px solid var(--gp-line-strong); border-radius:var(--gp-radius-sm);
+    padding:8px 14px; margin-right:12px; font-family:var(--gp-font-mono);
+    font-size:var(--gp-fs-micro); letter-spacing:.08em; cursor:pointer;
+    transition:border-color var(--gp-t); }
+  .gm-file::file-selector-button:hover { border-color:var(--gp-fg); }
+  @media (max-width:700px) {
+    .gm-panel { padding:16px; }
+    .gm-actions .gp-btn { width:100%; }
+    /* narrow screens: stack the ledger, key above value, values left-aligned */
+    .gm-ledger .gp-kv { flex-direction:column; gap:2px; }
+    .gm-ledger .gp-v { text-align:left; }
+  }
 </style>
 
 <!-- ────────────────────────────────────────────────────────────────
-     BLOCK for #gp-sweep (step 4 · SWEEP).
-     #gm-cost     : cost preview line (fee floor, gas, net into pool), refreshed every 60s.
+     BLOCK for #gp-sweep (step 3 · SWEEP).
+     #gm-cost     : cost preview ledger (fee floor, gas, net into pool), refreshed every 60s.
      #gm-preview  : sweep preview interstitial, shown before SIGN SWEEP runs.
      #gm-progress : relay progress view, shown from BROADCAST until confirmed/failed.
      #gm-gate     : secret-backup gate, blocks further sweeps until the pp-secret
@@ -38,82 +74,110 @@
      ──────────────────────────────────────────────────────────────── -->
 <div data-gm-block="sweep">
 
-  <div id="gm-cost" class="gm-box" style="display:none">
-    <div class="gm-lbl">SWEEP COST PREVIEW</div>
-    <div id="gm-cost-body"></div>
-    <div id="gm-cost-min" class="gm-bad" style="display:none;margin-top:8px">
-      below the Privacy Pools 0.01 ETH minimum: the relayer rejects these sweeps. top up the stealth address first.
+  <div id="gm-cost" class="gm-panel" style="display:none">
+    <div class="gp-eyebrow">Sweep cost preview</div>
+    <div id="gm-cost-body" class="gm-ledger"></div>
+    <div id="gm-cost-min" class="gm-flag" style="display:none">
+      Below the Privacy Pools 0.01 ETH minimum: the relayer rejects these sweeps. Top up the stealth address first.
     </div>
-    <div class="gm-note">refreshes every 60s · gas and price move between refreshes</div>
+    <div class="gm-note">Refreshes every 60s · gas and price move between refreshes.</div>
   </div>
 
-  <div id="gm-preview" class="card" style="display:none">
-    <div class="gm-lbl">SWEEP PREVIEW · READ BEFORE YOU SIGN</div>
-    <div id="gm-preview-body" style="color:#000"></div>
-    <button id="gm-preview-confirm">CONFIRM · SIGN SWEEP</button>
-    <button id="gm-preview-cancel" class="ghost" style="background:#fff;color:#000;border:1px solid #000">CANCEL</button>
+  <div id="gm-preview" class="gm-panel gm-panel-sign" style="display:none">
+    <div class="gm-panel-head">
+      <div class="gp-eyebrow gm-eyebrow-accent">Sweep preview</div>
+      <div class="gm-panel-title">Read before you sign</div>
+      <div class="gm-panel-sub">Check every line against the payment card. Once signed, anyone holding the artifact can broadcast it.</div>
+    </div>
+    <div id="gm-preview-body" class="gm-ledger"></div>
+    <div class="gm-actions">
+      <button id="gm-preview-confirm" class="gp-btn primary">Confirm and sign the sweep</button>
+      <button id="gm-preview-cancel" class="gp-btn ghost">Cancel</button>
+    </div>
   </div>
 
-  <div id="gm-progress" class="gm-box" style="display:none">
-    <div class="gm-lbl">RELAY PROGRESS</div>
-    <div id="gm-progress-line1" style="color:#fff"></div>
-    <div id="gm-progress-line2" style="margin-top:6px"></div>
+  <div id="gm-progress" class="gm-panel" style="display:none" aria-live="polite">
+    <div class="gp-eyebrow">Relay progress</div>
+    <div id="gm-progress-line1" class="gm-line1"></div>
+    <div id="gm-progress-line2" class="gm-line2"></div>
   </div>
 
-  <div id="gm-gate" class="gm-warn" style="display:none">
-    <div class="gm-lbl" style="color:#f66">BACKUP GATE · SWEEPING IS PAUSED</div>
-    <div id="gm-gate-body"></div>
-    <div style="margin-top:8px">
-      losing the pp-secret file loses the deposit, permanently. no one can recover it: not the app, not the relayer, not the pool.
-      confirm you saved the file before sweeping more payments.
+  <div id="gm-gate" class="gm-panel gm-panel-warn" style="display:none" role="alert">
+    <div class="gm-panel-head">
+      <div class="gp-eyebrow gm-eyebrow-danger">Backup gate</div>
+      <div class="gm-panel-title">Sweeping is paused until you confirm the backup</div>
+      <div class="gm-panel-sub">A withdrawal secret (pp-secret) for this deposit has been downloaded.
+        Losing that file loses the deposit permanently: no one can recover it, not the app, not the
+        relayer, not the pool. Confirm you saved it before sweeping more payments.</div>
     </div>
-    <button id="gm-gate-confirm" style="margin-top:12px;background:#f66;color:#000">CONFIRM BACKUP SAVED</button>
-    <div class="gm-note" style="color:#c88">
-      optional proof: re-upload the file and gp-money checks its nullifier + precommitment against the download.
-      if the download never started, use DOWNLOAD SECRET FILE AGAIN above first.
+    <div id="gm-gate-body" class="gm-ledger"></div>
+    <div class="gm-actions">
+      <button id="gm-gate-confirm" class="gp-btn primary">I saved the backup file</button>
     </div>
-    <input type="file" id="gm-gate-file" accept=".json,application/json">
-    <div id="gm-gate-status" class="gm-note" style="color:#f66"></div>
+    <div class="gm-section">
+      <div class="gp-eyebrow">Optional proof</div>
+      <div class="gm-panel-sub">Re-upload the file and gp-money checks its nullifier and precommitment
+        against the download. If the download never started, download the secret file again from the
+        sweep card above first.</div>
+      <input type="file" id="gm-gate-file" class="gm-file" accept=".json,application/json" aria-label="Re-upload the pp-secret file">
+      <div id="gm-gate-status" class="gm-status gm-status-danger"></div>
+    </div>
   </div>
 
 </div>
 
 <!-- ────────────────────────────────────────────────────────────────
-     BLOCK for #gp-withdraw (step 5 · WITHDRAW).
+     BLOCK for #gp-withdraw (step 4 · WITHDRAW).
      #gm-fresh  : fresh-address warning, shown when the WITHDRAW recipient has history.
      #gm-backup : encrypted export/import of everything restorable on this device.
      ──────────────────────────────────────────────────────────────── -->
 <div data-gm-block="withdraw">
 
-  <div id="gm-fresh" class="gm-warn" style="display:none">
-    <div class="gm-lbl" style="color:#f66">WARNING · RECIPIENT ADDRESS HAS HISTORY</div>
-    <div id="gm-fresh-body"></div>
-    <div style="margin-top:8px">
-      withdrawing to an address with prior activity links this withdrawal to everything that address has ever done.
-      recommended: create a brand-new address in your wallet (zero transactions, zero balance) and paste that instead.
+  <div id="gm-fresh" class="gm-panel gm-panel-warn" style="display:none" role="alert">
+    <div class="gm-panel-head">
+      <div class="gp-eyebrow gm-eyebrow-danger">Warning</div>
+      <div class="gm-panel-title">Recipient address has history</div>
+      <div class="gm-panel-sub">Withdrawing to an address with prior activity links this withdrawal
+        to everything that address has ever done.</div>
     </div>
-    <button id="gm-fresh-new" style="margin-top:12px">USE A FRESH ADDRESS</button>
-    <button id="gm-fresh-override" class="ghost" style="border-color:#f66;color:#f66">I UNDERSTAND · WITHDRAW TO THIS ADDRESS ANYWAY</button>
+    <div id="gm-fresh-body" class="gm-ledger"></div>
+    <div class="gm-reco">Recommended: create a brand-new address in your wallet (zero transactions,
+      zero balance) and paste that instead.</div>
+    <div class="gm-actions">
+      <button id="gm-fresh-new" class="gp-btn primary">Use a fresh address instead</button>
+      <button id="gm-fresh-override" class="gp-btn danger">Withdraw to this address anyway</button>
+    </div>
   </div>
 
-  <div id="gm-backup" class="gm-box">
-    <div class="gm-lbl">ENCRYPTED BACKUP · EXPORT / IMPORT</div>
-    <div>
-      backs up everything restorable on this device: watch-only session (gp-session), invoices, labels,
-      scan cursors, deposit tracking records, and any stored pp-secrets. encrypted with AES-GCM,
-      key derived from your passcode via PBKDF2 (600,000 iterations).
+  <div id="gm-backup" class="gm-panel">
+    <div class="gm-panel-head">
+      <div class="gp-eyebrow">Encrypted backup</div>
+      <div class="gm-panel-title">Export or import this device</div>
+      <div class="gm-panel-sub">Backs up everything restorable on this device: the watch-only session
+        (gp-session), invoices, labels, scan cursors, deposit tracking records and any stored pp-secrets.
+        Encrypted with AES-GCM; the key is derived from your passcode with PBKDF2 (600,000 iterations).</div>
+      <div class="gm-flag">Anyone with the file and its passcode can see your full payment history.
+        Store it like a key.</div>
     </div>
-    <div class="gm-note">
-      the backup file contains watch-only keys and any imported withdrawal secrets: anyone with the file
-      and its passcode can see your full payment history. store it like a key.
+    <div class="gm-section">
+      <div class="gp-eyebrow">Export</div>
+      <label class="gp-eyebrow gm-lbl" for="gm-backup-pass">Passcode</label>
+      <input class="gp-input" type="password" id="gm-backup-pass" placeholder="12+ characters recommended" autocomplete="off">
+      <label class="gp-eyebrow gm-lbl" for="gm-backup-pass2">Repeat passcode</label>
+      <input class="gp-input" type="password" id="gm-backup-pass2" placeholder="export only" autocomplete="off">
+      <div class="gm-actions">
+        <button id="gm-backup-export" class="gp-btn primary">Export encrypted backup</button>
+      </div>
     </div>
-    <input type="password" id="gm-backup-pass" placeholder="passcode (12+ characters recommended)" autocomplete="off">
-    <input type="password" id="gm-backup-pass2" placeholder="repeat passcode (export only)" autocomplete="off">
-    <button id="gm-backup-export" style="margin-top:10px">EXPORT BACKUP</button>
-    <input type="file" id="gm-backup-file" accept=".json,application/json">
-    <button id="gm-backup-import" class="ghost">IMPORT BACKUP</button>
-    <button id="gm-backup-reload" class="ghost" style="display:none">RELOAD NOW TO APPLY</button>
-    <div id="gm-backup-status" class="gm-note"></div>
+    <div class="gm-section">
+      <div class="gp-eyebrow">Import</div>
+      <input class="gm-file" type="file" id="gm-backup-file" accept=".json,application/json" aria-label="Backup file">
+      <div class="gm-actions">
+        <button id="gm-backup-import" class="gp-btn ghost">Import backup</button>
+        <button id="gm-backup-reload" class="gp-btn ghost" style="display:none">Reload to apply</button>
+      </div>
+    </div>
+    <div id="gm-backup-status" class="gm-status"></div>
   </div>
 
 </div>

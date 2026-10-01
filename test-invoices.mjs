@@ -8,8 +8,11 @@
 import {
   DEFAULT_PROFILE, computeTotals, taxLinesOf, allocateNumber, invStatus, paymentState,
   migrateProfile, migrateInvoice, migrateRegistry, nextRecurrence, reminderText,
+  USDC_MAINNET, parseTokenUnits, buildTokenPayCalls, isWalletReject, tokenPayErrorText,
+  sendTokenPayment, paidFromBalances,
 } from './gp-invoices.mjs';
 import { taxReport } from './gp-reports.mjs';
+import * as ve from './vendor/ethers.mjs';
 
 let pass = 0, fail = 0;
 const check = (name, cond) => {
@@ -212,6 +215,112 @@ check('advance after generate is exactly one period', new Date(nd).toISOString()
 const a = allocateNumber({ prefix: 'GS-', next: 9 });
 check('number = prefix + zero-padded counter', a.number === 'GS-0009' && a.next === 10);
 check('bad profile falls back to GP-0001', allocateNumber({}).number === 'GP-0001');
+
+// ─── token units: "25 USDC" → base units, precision guarded ───
+check('USDC: whole amount', parseTokenUnits('25', 'USDC') === 25000000n);
+check('USDC: cents', parseTokenUnits('25.50', 'USDC') === 25500000n);
+check('USDC: one base unit', parseTokenUnits('0.000001', 'USDC') === 1n);
+check('USDC: more than 6 decimals is a dead link, not a rounded payment', parseTokenUnits('0.1234567', 'USDC') === null);
+check('USDC: zero and empty parse to null', parseTokenUnits('0', 'USDC') === null && parseTokenUnits('', 'USDC') === null);
+check('ETH: 1 ETH in wei', parseTokenUnits('1', 'ETH') === 10n ** 18n);
+check('unknown token parses to null', parseTokenUnits('1', 'DAI') === null);
+
+// ─── token pay calldata: approve targets USDC, payToken targets PayAndAnnounce ───
+const SPENDER = '0x665E5f19FFFfBa541B3314E66bBAaCD08080cC02';
+const STEALTH = '0x1111111111111111111111111111111111111111';
+const EPH = '0x02' + '11'.repeat(32);
+const calls = buildTokenPayCalls({ ethers: ve, tokenAddr: USDC_MAINNET, spender: SPENDER, stealth: STEALTH, amountUnits: 25000000n, ephPub: EPH, metadata: Uint8Array.from([7]) });
+const erc20Iface = new ve.Interface(['function approve(address spender, uint256 amount) returns (bool)']);
+const paaIface = new ve.Interface(['function payToken(address token, address stealth, uint256 amount, bytes ephPub, bytes metadata)']);
+const decApprove = erc20Iface.decodeFunctionData('approve', calls.approve.data);
+check('approve call targets the USDC contract', calls.approve.to === USDC_MAINNET && calls.approve.data.startsWith('0x095ea7b3'));
+check('approve grants PayAndAnnounce the exact amount, not infinite', decApprove[0].toLowerCase() === SPENDER.toLowerCase() && decApprove[1] === 25000000n);
+const decPay = paaIface.decodeFunctionData('payToken', calls.payToken.data);
+check('payToken call targets PayAndAnnounce with token/stealth/amount', calls.payToken.to === SPENDER
+  && decPay[0].toLowerCase() === USDC_MAINNET.toLowerCase() && decPay[1].toLowerCase() === STEALTH.toLowerCase() && decPay[2] === 25000000n);
+check('payToken carries the ephemeral key and view-tag metadata verbatim', decPay[3].toLowerCase() === EPH.toLowerCase() && decPay[4] === '0x07');
+
+// ─── rejection shapes ───
+check('EIP-1193 4001 is a rejection', isWalletReject({ code: 4001, message: 'x' }));
+check('message-shaped wallet rejections are caught', isWalletReject(new Error('User rejected the request')));
+check('unsupported-method is NOT a rejection', !isWalletReject({ code: -32601, message: 'the method does not exist' }));
+
+// ─── sendTokenPayment: the 5792 / sequential state machine, with fake wallets ───
+const H = ch => '0x' + ch.repeat(64);
+const mkWallet = (cfg) => {
+  const sent = [];
+  const walletRequest = async (method, params) => {
+    sent.push({ method, params });
+    if (method === 'wallet_getCapabilities') { if (cfg.capsThrow) throw { code: -32601, message: 'no such method' }; return cfg.caps ?? null; }
+    if (method === 'wallet_sendCalls') { if (cfg.sendCallsThrow) throw cfg.sendCallsThrow; return cfg.sendCallsRes ?? H('cc'); }
+    if (method === 'wallet_getCallsStatus') return { status: 200, receipts: [{ transactionHash: H('dd') }] };
+    if (method === 'eth_sendTransaction') {
+      if (cfg.payThrow && !params[0].data.startsWith('0x095ea7b3')) throw cfg.payThrow;
+      return params[0].data.startsWith('0x095ea7b3') ? H('aa') : H('bb');
+    }
+    throw new Error('unexpected ' + method);
+  };
+  const jrpc = async (method, params) => (method === 'eth_getTransactionReceipt' ? (cfg.receipts && cfg.receipts[params[0]]) ?? null : null);
+  return { sent, walletRequest, jrpc };
+};
+const acct = '0x' + '42'.repeat(20);
+
+// A: atomic batching supported → one sendCalls, no plain transactions
+{
+  const w = mkWallet({ caps: { '0x1': { atomicBatch: { supported: true } } }, receipts: { [H('cc')]: { status: '0x1' } } });
+  const res = await sendTokenPayment({ walletRequest: w.walletRequest, jrpc: w.jrpc, account: acct, calls, pollMs: 1 });
+  const batches = w.sent.filter(s => s.method === 'wallet_sendCalls');
+  check('5792 batch: approve + payToken sent atomically in one sendCalls', res.via === 'batch' && res.confirmed === true
+    && batches.length === 1 && batches[0].params[0].calls.length === 2
+    && batches[0].params[0].calls[0].to === USDC_MAINNET && batches[0].params[0].calls[1].to === SPENDER);
+  check('5792 batch: no plain eth_sendTransaction at all', !w.sent.some(s => s.method === 'eth_sendTransaction'));
+}
+// B: no 5792 at all → approve, wait for mining, then payToken
+{
+  const w = mkWallet({ capsThrow: true, sendCallsThrow: { code: -32601, message: 'unsupported' }, receipts: { [H('aa')]: { status: '0x1' } } });
+  const res = await sendTokenPayment({ walletRequest: w.walletRequest, jrpc: w.jrpc, account: acct, calls, pollMs: 1 });
+  const txs = w.sent.filter(s => s.method === 'eth_sendTransaction');
+  check('fallback: approve then payToken, sequentially, when 5792 unsupported', res.via === 'sequential'
+    && txs.length === 2 && txs[0].params[0].to === USDC_MAINNET && txs[0].params[0].data.startsWith('0x095ea7b3')
+    && txs[1].params[0].to === SPENDER && !txs[1].params[0].data.startsWith('0x095ea7b3'));
+}
+// C: capabilities explicitly deny atomic batching → sendCalls never attempted
+{
+  const w = mkWallet({ caps: { '0x1': { atomicBatch: { supported: false } } }, receipts: { [H('aa')]: { status: '0x1' } } });
+  const res = await sendTokenPayment({ walletRequest: w.walletRequest, jrpc: w.jrpc, account: acct, calls, pollMs: 1 });
+  check('caps "no atomic" skips the batch attempt entirely', res.via === 'sequential' && !w.sent.some(s => s.method === 'wallet_sendCalls'));
+}
+// D: user rejects the batch → no silent fallback, nothing else sent
+{
+  const w = mkWallet({ sendCallsThrow: { code: 4001, message: 'User rejected' } });
+  let err = null;
+  try { await sendTokenPayment({ walletRequest: w.walletRequest, jrpc: w.jrpc, account: acct, calls, pollMs: 1 }); } catch (e) { err = e; }
+  check('rejecting the batch aborts without falling back to two prompts', err && err.stage === 'reject'
+    && !w.sent.some(s => s.method === 'eth_sendTransaction')
+    && tokenPayErrorText(err) === 'Cancelled in your wallet · nothing was sent.');
+}
+// E: approval mined, payment fails → the error says the approval is onchain
+{
+  const w = mkWallet({ capsThrow: true, sendCallsThrow: { code: -32601, message: 'unsupported' }, receipts: { [H('aa')]: { status: '0x1' } }, payThrow: new Error('transferFrom failed') });
+  let err = null;
+  try { await sendTokenPayment({ walletRequest: w.walletRequest, jrpc: w.jrpc, account: acct, calls, pollMs: 1 }); } catch (e) { err = e; }
+  check('pay failure after a mined approval is reported as such', err && err.stage === 'pay'
+    && tokenPayErrorText(err).startsWith('The approval mined, then the payment failed: '));
+}
+
+// ─── reconciliation: token balance wins, ETH × price is the legacy fallback ───
+check('ETH invoice: ETH balance is the payment', paidFromBalances({ token: 'ETH' }, { balEth: 0.5 }) === 0.5);
+check('ETH invoice: zero balance is no reading', paidFromBalances({ token: 'ETH' }, { balEth: 0 }) === null);
+check('USDC invoice: token balance is the payment', paidFromBalances({ token: 'USDC' }, { tokenBal: 25 }) === 25);
+check('USDC invoice: token reading rounds at 6 decimals', paidFromBalances({ token: 'USDC' }, { tokenBal: 25.1234567 }) === 25.123457);
+check('USDC invoice: token balance wins over ETH dust (never double-counted)',
+  paidFromBalances({ token: 'USDC' }, { tokenBal: 25, balEth: 1, ethPrice: 4000 }) === 25);
+check('USDC invoice: legacy fallback prices the ETH balance',
+  paidFromBalances({ token: 'USDC' }, { tokenBal: null, balEth: 0.01, ethPrice: 2500 }) === 25);
+check('USDC invoice: zero token balance still falls back to the legacy reading',
+  paidFromBalances({ token: 'USDC' }, { tokenBal: 0, balEth: 0.01, ethPrice: 2500 }) === 25);
+check('USDC invoice: ETH without a price is no reading', paidFromBalances({ token: 'USDC' }, { balEth: 0.01, ethPrice: null }) === null);
+check('USDC invoice: empty address is no reading', paidFromBalances({ token: 'USDC' }, {}) === null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -8,57 +8,99 @@
        #tab-recurring   RECURRING templates
        #tab-settings    SETTINGS (profile, numbering, ENS publish, CSV export)
      Everything renders via JS into those mounts; this frag carries only scoped styles.
+     The markup consumes gp-ui.css primitives (.gp-card/.gp-table/.gp-pill/.gp-tabs/
+     .gp-btn/.gp-empty/.gp-eyebrow): the rules below are suite extras on top, scoped to
+     the five panes this module owns (dashboard/reports belong to gp-reports.mjs) or to
+     the .gpinv-* classes only this module emits. The #payghost block styles the payer
+     invoice document: what a payer reads on an invoice link, injected by
+     enhancePayghost above the shell's address card.
      Line-item rows have their own tax rate picker (0% / 9% / 21% / custom) and discount
-     column, so the items table scrolls horizontally on narrow screens (.gpinv-tablewrap).
+     column, so the items table scrolls horizontally on narrow screens (.gp-tablewrap).
      gp-invoices.mjs fetches and injects this file itself (embedded fallback when opened
      from disk); the shell does not need to paste it. Actions inside the mounts use
-     data-iact; the shell tab bar uses data-tab. gp-ui.css is linked page-wide by the
-     shell; the rules below are suite extras. -->
+     data-iact; the shell tab bar uses data-tab. -->
 <style id="gpinv-styles">
-  #gp-invoices h3 { font-size:11px; letter-spacing:.25em; color:#888; font-weight:400; margin:24px 0 10px; }
-  #gp-invoices .gpinv-box { border:1px solid #333; padding:16px; }
-  #gp-invoices .gpinv-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-  #gp-invoices .gpinv-lbl { font-size:10px; letter-spacing:.2em; color:#666; margin-bottom:4px; }
-  #gp-invoices .gpinv-muted { color:#777; }
-  #gp-invoices .gpinv-mono { font-size:11px; color:#777; word-break:break-all; }
-  #gp-invoices .gpinv-mg { width:46px; height:46px; border:1px solid #fff; display:flex; flex:none;
-    align-items:center; justify-content:center; font-weight:700; letter-spacing:.1em; }
-  #gp-invoices .gpinv-tablewrap { overflow-x:auto; }
-  #gp-invoices table { width:100%; border-collapse:collapse; font-size:12px; }
-  #gp-invoices th { text-align:left; font-size:10px; letter-spacing:.2em; color:#777; font-weight:400;
-    padding:6px 10px 6px 0; border-bottom:1px solid #333; white-space:nowrap; }
-  #gp-invoices td { padding:10px 10px 10px 0; border-bottom:1px solid #222; vertical-align:top; }
-  #gp-invoices .gpinv-rowbtn { cursor:pointer; }
-  #gp-invoices .gpinv-rowbtn:hover td { background:#0d0d0d; }
-  #gp-invoices .gpinv-detail td { background:#0a0a0a; padding:16px; }
-  #gp-invoices td input, #gp-invoices td select { margin-top:0; padding:8px 10px; font-size:12px; }
-  /* status pills: same idiom as the inbox (outline, dim, solid) */
-  #gp-invoices .gpinv-pill { display:inline-block; border:1px solid #fff; padding:2px 8px; font-size:10px;
-    letter-spacing:.15em; white-space:nowrap; }
-  #gp-invoices .gpinv-pill.dim { border-color:#444; color:#888; }
-  #gp-invoices .gpinv-pill.solid { background:#fff; color:#000; font-weight:700; }
-  #gp-invoices .gpinv-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
-  #gp-invoices .gpinv-actions button { width:auto; flex:1 1 auto; padding:10px 14px; font-size:11px; }
-  #gp-invoices .gpinv-x { width:auto; padding:6px 12px; font-size:13px; min-height:0; }
-  #gp-invoices .gpinv-empty { color:#888; font-size:12px; border:1px dashed #333; padding:18px;
-    text-align:center; margin-top:4px; }
-  /* status filter row */
-  #gp-invoices .gpinv-filter { display:flex; gap:6px; flex-wrap:wrap; margin:16px 0 12px; }
-  #gp-invoices .gpinv-filter button { width:auto; padding:6px 12px; font-size:10px; letter-spacing:.15em; }
-  #gp-invoices .gpinv-filter button.on { background:#fff; color:#000; font-weight:700; border-color:#fff; }
-  /* INVOICES / ESTIMATES sub-switch (only when the shell has no #tab-estimates mount) */
-  #gp-invoices .gpinv-sub { display:flex; border:1px solid #333; margin-bottom:16px; }
-  #gp-invoices .gpinv-sub button { background:#000; color:#888; border:0; border-right:1px solid #333;
-    padding:10px 6px; font-size:10px; letter-spacing:.15em; font-weight:400; flex:1; width:auto; }
-  #gp-invoices .gpinv-sub button:last-child { border-right:0; }
-  #gp-invoices .gpinv-sub button.on { background:#fff; color:#000; font-weight:700; }
-  /* editor save/cancel bar stays reachable on long forms */
-  #gp-invoices .gpinv-sticky { position:sticky; bottom:0; background:#000; border-top:1px solid #333;
-    padding:12px 0 8px; z-index:5; }
-  @media (max-width:700px) {
-    #gp-invoices .gpinv-grid { grid-template-columns:1fr; }
-    #gp-invoices .gpinv-actions { flex-direction:column; }
-    #gp-invoices .gpinv-actions button { width:100%; }
-    #gp-invoices .gpinv-sub button, #gp-invoices .gpinv-filter button { min-height:44px; }
+  /* pane headings + field labels (scoped to this module's five panes) */
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) .gp-h3 { margin: var(--gp-s6) 0 var(--gp-s3); }
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) > .gp-h3:first-child,
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) .gp-card > .gp-h3:first-child { margin-top: 0; }
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) .gp-eyebrow { display: block; margin-bottom: 6px; }
+  :is(#tab-invoices,#tab-customers,#tab-items,#tab-recurring,#tab-settings) :is(.gp-input,.gp-select,.gp-textarea) { margin-top: 0; }
+
+  /* field layout: two-column rows collapse on mobile, .gpinv-gap stacks fields */
+  #gp-invoices .gpinv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gp-s4); }
+  #gp-invoices .gpinv-gap { margin-top: var(--gp-s4); }
+
+  /* line-items editor: denser controls inside table cells */
+  #gp-invoices .gpinv-items td :is(.gp-input,.gp-select) { padding: 8px 10px; font-size: var(--gp-fs-micro); }
+  #gp-invoices .gpinv-items td .gp-select[data-f="pick"] { margin-bottom: 6px; }
+
+  /* totals column: live editor totals, record detail, and the payer document.
+     Right-aligned rows with hairlines, the grand total on a strong line */
+  #gp-invoices .gpinv-totals, #payghost .gpinv-totals { margin: var(--gp-s4) 0 0 auto; width: min(320px,100%); font-size: var(--gp-fs-small); }
+  #gp-invoices .gpinv-trow, #payghost .gpinv-trow { display: flex; justify-content: space-between; gap: 16px; padding: 6px 0; border-bottom: 1px solid var(--gp-line-soft); color: var(--gp-muted); }
+  #gp-invoices .gpinv-trow > span:last-child, #payghost .gpinv-trow > span:last-child { color: var(--gp-fg); text-align: right; }
+  #gp-invoices .gpinv-trow.gpinv-grand, #payghost .gpinv-trow.gpinv-grand { border-bottom: 0; border-top: 1px solid var(--gp-line-strong); margin-top: 4px; padding-top: 10px; font-weight: 700; }
+  #gp-invoices .gpinv-trow.gpinv-grand > span, #payghost .gpinv-trow.gpinv-grand > span { color: var(--gp-fg); font-size: var(--gp-fs-body); }
+  #gp-invoices .gpinv-trow.gpinv-tusd, #payghost .gpinv-trow.gpinv-tusd { border-bottom: 0; color: var(--gp-faint); font-size: var(--gp-fs-micro); justify-content: flex-end; }
+
+  /* clickable list rows + the expansion row (an inset well) */
+  #gp-invoices .gpinv-rowbtn { cursor: pointer; }
+  #gp-invoices .gpinv-rowbtn:hover td { background: var(--gp-bg-raise); }
+  #gp-invoices .gpinv-detail td { background: var(--gp-bg-inset); padding: var(--gp-s4); }
+  #gp-invoices .gpinv-detailhead { display: flex; align-items: center; gap: 10px; }
+  #gp-invoices .gpinv-detailhead .gp-eyebrow { margin-bottom: 0; }
+  #gp-invoices .gpinv-meta { font-size: var(--gp-fs-small); margin-top: 6px; }
+  #gp-invoices .gpinv-detailtable { margin-top: var(--gp-s3); }
+  #gp-invoices .gpinv-sub { font-size: var(--gp-fs-micro); }
+
+  /* address / url blocks + the decrypted memo line */
+  #gp-invoices .gpinv-mono { font-size: var(--gp-fs-micro); color: var(--gp-muted); word-break: break-all; margin-top: 6px; }
+  #gp-invoices .gpinv-memo-line { font-size: var(--gp-fs-small); margin-top: 10px; }
+  #gp-invoices .gpinv-qr { margin-top: var(--gp-s3); text-align: center; }
+
+  /* action rows + the editor's sticky save bar (stays reachable on long forms) */
+  #gp-invoices .gpinv-actions { display: flex; gap: var(--gp-s2); margin-top: var(--gp-s4); flex-wrap: wrap; }
+  #gp-invoices .gpinv-paneactions { margin-top: 0; }
+  #gp-invoices .gpinv-sticky { position: sticky; bottom: 0; z-index: 5; background: var(--gp-bg-raise); border-top: 1px solid var(--gp-line); margin-top: var(--gp-s4); padding: var(--gp-s3) 0 var(--gp-s2); }
+
+  /* status filter + the INVOICES/ESTIMATES sub-switch ride the .gp-tabs primitive */
+  #gp-invoices .gp-tabs.gpinv-sub { margin-top: 0; }
+  #gp-invoices .gp-tabs.gpinv-filter { margin: var(--gp-s4) 0 var(--gp-s3); }
+
+  /* settings identity row (monogram + business name) */
+  #gp-invoices .gpinv-idrow { display: flex; gap: var(--gp-s4); align-items: center; }
+  #gp-invoices .gpinv-mg { width: 46px; height: 46px; border: 1px solid var(--gp-line-strong); border-radius: var(--gp-radius-sm); display: flex; flex: none; align-items: center; justify-content: center; font-family: var(--gp-font-display); font-weight: 700; letter-spacing: .1em; }
+
+  /* checkbox row (recurring template active flag) */
+  #gp-invoices .gpinv-check { display: flex; align-items: center; gap: 8px; font-size: var(--gp-fs-small); margin-top: var(--gp-s4); cursor: pointer; }
+  #gp-invoices .gpinv-check input { width: auto; margin: 0; }
+
+  /* ── payer invoice document (#payghost): the bill, above the address card ── */
+  #payghost .gpinv-doc { background: var(--gp-bg-raise); border: 1px solid var(--gp-line); border-radius: var(--gp-radius); padding: var(--gp-s5); margin-top: var(--gp-s4); }
+  #payghost .gpinv-doc-head { display: flex; align-items: center; gap: 10px; padding-bottom: var(--gp-s3); border-bottom: 1px solid var(--gp-line); }
+  #payghost .gpinv-doc-num { font-weight: 700; }
+  #payghost .gpinv-doc-head .gp-pill { margin-left: auto; }
+  #payghost .gpinv-doc-items { margin-top: var(--gp-s3); }
+  #payghost .gpinv-doc-kv { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-bottom: 1px solid var(--gp-line-soft); font-size: var(--gp-fs-small); }
+  #payghost .gpinv-doc-k { color: var(--gp-muted); flex: none; }
+  #payghost .gpinv-doc-duebox { margin-top: var(--gp-s4); }
+  #payghost .gpinv-doc-duebox .gp-eyebrow { display: block; }
+  #payghost .gpinv-doc-amount { font-size: 26px; font-weight: 700; letter-spacing: -.5px; margin-top: 6px; }
+  #payghost .gpinv-doc-token { font-size: var(--gp-fs-small); font-weight: 400; color: var(--gp-muted); letter-spacing: .1em; }
+  #payghost .gpinv-doc-eq { color: var(--gp-muted); font-size: var(--gp-fs-small); margin-top: 4px; min-height: 1.2em; }
+  #payghost .gpinv-doc-settle { border: 1px solid var(--gp-line); border-radius: var(--gp-radius-sm); padding: 10px 12px; margin-top: var(--gp-s4); font-size: var(--gp-fs-small); color: var(--gp-muted); }
+  #payghost .gpinv-doc-expired { border-color: rgba(205,111,94,.45); background: var(--gp-danger-bg); color: var(--gp-danger); }
+  /* the memo field lives inside the shell's address card: inherit works on the
+     inverted .card today and on a dark card if the shell retires .card later */
+  #payghost .gpinv-memo { margin-top: var(--gp-s4); }
+  #payghost .gpinv-memo .gp-eyebrow { display: block; margin-bottom: 6px; color: inherit; opacity: .8; }
+  #payghost .gpinv-memo .gp-input { margin-top: 0; }
+
+  @media (max-width: 700px) {
+    #gp-invoices .gpinv-grid { grid-template-columns: 1fr; }
+    #gp-invoices .gpinv-actions { flex-direction: column; }
+    #gp-invoices .gpinv-actions .gp-btn { width: 100%; min-height: 44px; }
+    #payghost .gpinv-doc { padding: var(--gp-s4); }
   }
 </style>
