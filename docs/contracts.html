@@ -91,7 +91,7 @@ hashSweepIntent(intent) = keccak256(abi.encodePacked(
 <div class="gp-tablewrap"><table class="gp-table">
   <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
   <tbody>
-  <tr><td><code>action</code></td><td>uint8</td><td>0 = ETH to destination · 1 = Privacy Pools ETH deposit · 2 = PP token deposit · 3 = token to destination.</td></tr>
+  <tr><td><code>action</code></td><td>uint8</td><td>0 = ETH to destination · 1 = Privacy Pools ETH deposit · 2 = PP token deposit (live in the app for USDC: the full token balance minus the relayer fee approves + deposits via the entrypoint) · 3 = token to destination.</td></tr>
   <tr><td><code>token</code></td><td>address</td><td>Actions 2/3 only (ignored otherwise).</td></tr>
   <tr><td><code>destination</code></td><td>address</td><td>Actions 0/3 only (ignored otherwise).</td></tr>
   <tr><td><code>precommitment</code></td><td>uint256</td><td>Actions 1/2 only: the Privacy Pools deposit precommitment.</td></tr>
@@ -123,7 +123,8 @@ hashSweepIntent(intent) = keccak256(abi.encodePacked(
   <thead><tr><th>Contract</th><th>Address</th><th>Role</th></tr></thead>
   <tbody>
   <tr><td>ERC-5564 announcer</td><td class="addr"><code>0x55649E01B5Df198D18D95b5cc5051630cfD45564</code></td><td>The canonical singleton every Announcement event comes from.</td></tr>
-  <tr><td>Privacy Pools entrypoint</td><td class="addr"><code>0x6818809EefCe719E480a7526D76bD3e561526b46</code></td><td>Deposits (actions 1/2) and relayed withdrawals.</td></tr>
+  <tr><td>Privacy Pools entrypoint</td><td class="addr"><code>0x6818809EefCe719E480a7526D76bD3e561526b46</code></td><td>Deposits (actions 1/2) and relayed withdrawals. Its <code>assetConfig(asset)</code> is the asset-to-pool discovery map the app reads live.</td></tr>
+  <tr><td>Privacy Pools USDC pool</td><td class="addr"><code>0xb419c2867aB3CBc78921660cB95150d95A94ce86</code></td><td>The mainnet USDC pool: 25 USDC minimum deposit, 50 bps vetting fee, its own ASP scope. Reached through the entrypoint.</td></tr>
   <tr><td>Sweeper.sol (v1)</td><td class="addr">deployed, legacy</td><td>The fallback sweep path for relayers without SweeperV2. The relayer picks the calldata, so prefer intent sweeps.</td></tr>
   </tbody>
 </table></div>

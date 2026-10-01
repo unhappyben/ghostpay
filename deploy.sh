@@ -105,6 +105,27 @@ npm ci
 step "syntax check"
 "$NODE_BIN" --check serve.mjs
 
+# Withdrawal circuit artifacts: gitignored (20 MB), so a fresh pull never has them and the
+# in-browser withdraw 404s on ./artifacts/withdraw.wasm. Fetch them from privacypools.com
+# and pin the sha256 (the exact files the fork withdrawal tests prove against). A mismatch
+# aborts the deploy before the unit is touched.
+step "withdraw circuit artifacts"
+mkdir -p "$APP_DIR/artifacts"
+fetch_artifact() {
+  local name="$1" sha="$2" path="$APP_DIR/artifacts/$1"
+  if [ -f "$path" ] && echo "$sha  $path" | sha256sum -c --status; then echo "ok: $name (cached)"; return 0; fi
+  curl -fsSL --retry 3 -o "$path.tmp" "https://privacypools.com/artifacts/$name"
+  if ! echo "$sha  $path.tmp" | sha256sum -c --status; then
+    rm -f "$path.tmp"
+    echo "deploy: $name sha256 mismatch from privacypools.com, aborting (unit untouched)" >&2
+    exit 1
+  fi
+  mv "$path.tmp" "$path"
+  echo "ok: $name (fetched, sha256 verified)"
+}
+fetch_artifact withdraw.wasm 36cda22791def3d520a55c0fc808369cd5849532a75fab65686e666ed3d55c10
+fetch_artifact withdraw.zkey 2a893b42174c813566e5c40c715a8b90cd49fc4ecf384e3a6024158c3d6de677
+
 if [ ! -f "$APP_DIR/ghostpay.env" ]; then
   echo "deploy: $APP_DIR/ghostpay.env missing — the relayer needs its env file, aborting (unit untouched)" >&2
   exit 1

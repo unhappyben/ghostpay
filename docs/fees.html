@@ -107,13 +107,15 @@
 
 <h2>The fee ledger (fees.jsonl)</h2>
 <p>Every successful fee-bearing broadcast appends one JSON line to <code>fees.jsonl</code> (gitignored, <code>FEES_FILE</code> overrides the path):</p>
-<pre><code>{"ts":"2026-09-12T…","kind":"sweep-intent","feeBps":30,"estFeeWei":"…","txHash":"0x…","runner":"0x…"}</code></pre>
+<pre><code>{"ts":"2026-09-12T…","kind":"sweep-intent","feeBps":30,"estFeeWei":"…","txHash":"0x…","runner":"0x…"}
+// token-denominated lines add the asset:
+{"ts":"2026-10-01T…","kind":"sweep-intent","feeBps":30,"estFeeWei":"…","asset":"0xA0b8…","assetSymbol":"USDC","assetDecimals":6,"txHash":"0x…","runner":"0x…"}</code></pre>
 <div class="gp-tablewrap"><table class="gp-table">
   <thead><tr><th>Kind</th><th>Written when</th><th>estFeeWei</th></tr></thead>
   <tbody>
-  <tr><td><code>sweep-intent</code></td><td>An <code>eip7702-intent</code> sweep is broadcast</td><td>stealth ETH balance × feeBps / 10000, estimated at preflight. Rough for token sweeps: the stealth ETH balance is not the swept asset.</td></tr>
-  <tr><td><code>sweep-intent-batch</code></td><td>A batch sweep is broadcast</td><td>One line per swept stealth address, same estimate, all sharing one <code>txHash</code>.</td></tr>
-  <tr><td><code>pp-withdraw</code></td><td>A withdrawal is relayed</td><td>withdrawnValue (public signal) × relayFeeBPS / 10000. Exact: this is what the entrypoint pays the runner.</td></tr>
+  <tr><td><code>sweep-intent</code></td><td>An <code>eip7702-intent</code> sweep is broadcast</td><td>Stealth balance × feeBps / 10000, estimated at preflight, denominated in the swept asset: ETH for actions 0/1, the token for actions 2/3 (those lines carry <code>asset</code>, <code>assetSymbol</code>, <code>assetDecimals</code>).</td></tr>
+  <tr><td><code>sweep-intent-batch</code></td><td>A batch sweep is broadcast</td><td>One line per swept stealth address, same estimate (ETH: the batch UI arms action-1 sweeps only), all sharing one <code>txHash</code>.</td></tr>
+  <tr><td><code>pp-withdraw</code></td><td>A withdrawal is relayed</td><td>withdrawnValue (public signal) × relayFeeBPS / 10000, denominated in the pool's asset (the <code>asset</code> fields say which). Exact: this is what the entrypoint pays the runner.</td></tr>
   <tr><td><code>fee-forward</code></td><td>The auto-forwarder sweeps a runner's accrued fees to <code>FEE_OWNER</code></td><td>The forwarded amount. An outflow, not revenue: excluded from earned totals, weekly buckets, and ARR.</td></tr>
   </tbody>
 </table></div>
@@ -131,7 +133,7 @@ FEES_FILE=/path/to.jsonl node fees.mjs</code></pre>
   <li><b>Fee-forward</b>: total forwarded to the owner, forward count, timestamp of the last forward.</li>
   <li><b>Runner holdings</b>: earned minus forwarded: what is still sitting on the runners.</li>
 </ul>
-<p>Malformed ledger lines are skipped. Sweep fees are estimates; withdrawal fees are exact. For onchain truth, the runner balances and the <code>FEE_OWNER</code> address are the ledger of record.</p>
+<p>Malformed ledger lines are skipped. Sweep fees are estimates; withdrawal fees are exact. Token-denominated lines (a non-ETH <code>asset</code> field) never enter the ETH totals: the report lists them per asset on their own line, so an ETH total is always ETH. For onchain truth, the runner balances and the <code>FEE_OWNER</code> address are the ledger of record.</p>
 </div>
 </body>
 </html>

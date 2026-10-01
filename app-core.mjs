@@ -639,15 +639,20 @@ async function armIntent(rec, force) {
     secret: hex(ppsecret),
     precommitment: preHex,
     amount: bal.toString(),
+    asset: 'ETH',
+    token: PP_ETH_ASSET,
+    pool: PP_POOL,
+    decimals: 18,
     chainId: CHAIN_ID,
     sweeper: SWEEPER_V2,
     stealthAddress: addr,
     timestamp: new Date().toISOString(),
-    pool: 'ETH mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
+    poolName: 'ETH mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
   };
   // non-secret tracking record so the scanner can show this deposit's lifecycle
   // (PP deposit / ASP / WITHDRAWN) on the payment card. The secret itself is NEVER
   // stored anywhere: the downloaded file remains the only place it exists.
+  // Records with no asset/token/pool/decimals fields are ETH (the original format).
   try {
     localStorage.setItem('ghostpay:ppnote:' + key, JSON.stringify({
       nullifier: hex(nullifier), precommitment: preHex, amount: bal.toString(), ts: Date.now()
@@ -694,6 +699,101 @@ function armPayment(addr) {
   if (!rec) return Promise.resolve(null);
   // the queue itself never stays rejected: one failed arm must not skip every later arm
   const next = armChain.catch(() => {}).then(() => armIntent(rec, true));
+  armChain = next.catch(() => {});
+  return next;
+}
+
+// ── token pool arm (SweepIntent action 2) ──
+// The USDC variant of armIntent: the stealth address's full token balance minus the
+// relayer fee goes into that token's Privacy Pool via the entrypoint (SweeperV2
+// approves + deposits). Same poseidon2 precommitment, same 31-byte secrets, same
+// secret-file download and arm queue serialisation as the ETH arm; the intent carries
+// {action:2, token, destination:0x0}. Auto-arm on detection stays ETH-only: a token
+// arm happens on the inbox gesture, so a secret never downloads unprompted for a
+// payment the user has not chosen to pool.
+const armedTokenIntents = new Map(); // '<addrLower>|<tokenLower>' -> { artifact, nonce, deadline }
+
+async function armTokenPoolIntent(rec, token, force) {
+  if (!W || !W.spendPriv || !W.viewPriv || !rec || !rec.ephPub) return null;
+  if (!token || !ethers.isAddress(token)) return null;
+  const addr = rec.address;
+  const key = addr.toLowerCase() + '|' + token.toLowerCase();
+  const prev = armedTokenIntents.get(key);
+  if (!force && prev && prev.deadline > Math.floor(Date.now() / 1000) + 300) return prev; // still valid
+  const caps = await relayerCaps();
+  if (!caps.sweeperV2) return null; // old relayer: no signed intents, no token pool path
+  const cfg = await ppPoolForAsset(token);
+  if (!cfg || !cfg.pool || cfg.minimumDepositAmount == null) return null; // no Privacy Pool for this token
+  const bal = BigInt(await jrpc('eth_call', [{ to: token, data: ERC20_BALANCE_OF + ethers.zeroPadValue(addr, 32).slice(2) }, 'latest']));
+  if (bal - bal * BigInt(caps.minFeeBps) / 10000n < BigInt(cfg.minimumDepositAmount)) return null; // post-fee below the pool minimum
+  const { sh } = check(W.viewPriv, W.spendPub, rec.ephPub, addr);
+  const sPriv = stealthKey(W.spendPriv, sh);
+  const wallet = new ethers.Wallet(sPriv);
+  if (wallet.address.toLowerCase() !== addr.toLowerCase()) return null;
+  const sym = cfg.symbol || 'TOKEN';
+  const dec = Number.isFinite(cfg.decimals) ? cfg.decimals : 18;
+  const poolAddr = ethers.getAddress(cfg.pool);
+  const tokenAddr = ethers.getAddress(token);
+  // same secret construction as the ETH arm (poseidon2 precommitment, 31-byte values)
+  const nullifier = crypto.getRandomValues(new Uint8Array(31));
+  const ppsecret = crypto.getRandomValues(new Uint8Array(31));
+  const pre = poseidon2([BigInt(hex(nullifier)), BigInt(hex(ppsecret))]);
+  const preHex = '0x' + pre.toString(16).padStart(64, '0');
+  const secretFile = {
+    note: 'GHOSTPAY Privacy Pools withdrawal secret. KEEP SAFE. Anyone with this file can withdraw the deposit.',
+    nullifier: hex(nullifier),
+    secret: hex(ppsecret),
+    precommitment: preHex,
+    amount: bal.toString(),
+    asset: sym,
+    token: tokenAddr,
+    pool: poolAddr,
+    decimals: dec,
+    chainId: CHAIN_ID,
+    sweeper: SWEEPER_V2,
+    stealthAddress: addr,
+    timestamp: new Date().toISOString(),
+    poolName: sym + ' mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
+  };
+  // non-secret tracking record; the asset fields are what makes the inbox trace this
+  // deposit against the token's pool instead of the ETH pool. Missing fields = ETH.
+  try {
+    localStorage.setItem('ghostpay:ppnote:' + addr.toLowerCase(), JSON.stringify({
+      nullifier: hex(nullifier), precommitment: preHex, amount: bal.toString(), ts: Date.now(),
+      asset: sym, token: tokenAddr, pool: poolAddr, decimals: dec
+    }));
+  } catch { /* storage blocked/full: tracking is best-effort, the sweep is unaffected */ }
+  showSecret(
+    'Withdrawal secret · Privacy Pools · keep the downloaded file safe: it is your withdrawal secret. lose it and the deposit is gone forever.'
+      + ' the app keeps a local tracking key (nullifier only · it cannot withdraw) so the scanner can show this deposit\'s state.',
+    JSON.stringify(secretFile, null, 2),
+    'pp-secret-' + addr.slice(2, 10) + '.json',
+    JSON.stringify(secretFile, null, 2)
+  );
+  const deadline = Math.floor(Date.now() / 1000) + 86400;
+  const intent = { action: 2, token: tokenAddr, destination: ZERO_ADDR, precommitment: preHex, feeBps: caps.minFeeBps, deadline };
+  const signature = await wallet.signTypedData(intentDomain(addr), INTENT_TYPES, intent);
+  const nonce = parseInt(await jrpc('eth_getTransactionCount', [addr, 'latest']), 16);
+  const artifact = {
+    kind: 'eip7702-intent', chainId: CHAIN_ID, stealthAddress: addr, sweeper: SWEEPER_V2,
+    authorization: sign7702(sPriv, CHAIN_ID, SWEEPER_V2, nonce),
+    intent, signature,
+    precommitment: preHex,
+    warning: 'KEEP the downloaded secret file: it is your withdrawal secret',
+  };
+  const armed = { artifact, nonce, deadline };
+  armedTokenIntents.set(key, armed);
+  return armed;
+}
+
+// forced fresh token arm on the inbox gesture, serialized behind the shared arm queue
+// (same shape and semantics as armPayment; see docs/GP-API.md). Resolves null when the
+// payment is unknown, the session is watch-only, the relayer lacks sweeperV2, the token
+// has no Privacy Pool, or the post-fee balance is below the pool minimum.
+function armTokenPoolPayment(addr, token) {
+  const rec = payments.find(p => p.address.toLowerCase() === String(addr || '').toLowerCase());
+  if (!rec) return Promise.resolve(null);
+  const next = armChain.catch(() => {}).then(() => armTokenPoolIntent(rec, token, true));
   armChain = next.catch(() => {});
   return next;
 }
@@ -784,11 +884,15 @@ async function sweepUI(addr, ephPub) {
         secret: hex(ppsecret),
         precommitment: preHex,
         amount: BigInt(bal).toString(),
+        asset: 'ETH',
+        token: PP_ETH_ASSET,
+        pool: PP_POOL,
+        decimals: 18,
         chainId: CHAIN_ID,
         sweeper: SWEEPER,
         stealthAddress: addr,
         timestamp: new Date().toISOString(),
-        pool: 'ETH mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
+        poolName: 'ETH mainnet Privacy Pools (0xbow entrypoint 0x6818809EefCe719E480a7526D76bD3e561526b46)'
       };
       const data = SWEEPER_IFACE.encodeFunctionData('sweepToPrivacyPoolsETH', [pre]);
       // non-secret tracking record so the scanner can show this deposit's lifecycle
@@ -828,6 +932,8 @@ async function sweepUI(addr, ephPub) {
 const PP_POOL = '0xf241d57c6debae225c0f2e6ea1529373c9a9c9fb'; // ETH mainnet Privacy Pools pool
 const PP_ENTRYPOINT = '0x6818809EefCe719E480a7526D76bD3e561526b46';
 const PP_ETH_ASSET = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+const PP_USDC_ASSET = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'; // USDC mainnet
+const PP_USDC_POOL = '0xb419c2867aB3CBc78921660cB95150d95A94ce86'; // USDC mainnet Privacy Pools pool
 const PP_ASP = 'https://api.0xbow.io/1/public';
 const PP_RELAYER = 'https://fastrelay.xyz/relayer';
 const PP_DEPOSIT_BLOCK = 25931460; // known deposit block; seeds the event search window
@@ -838,7 +944,35 @@ const PP_IFACE = new ethers.Interface([
   'function nullifierHashes(uint256) view returns (bool)',
   'function SCOPE() view returns (uint256)'
 ]);
-const ppCall = data => jrpc('eth_call', [{ to: PP_POOL, data }, 'latest']);
+const ERC20_BALANCE_OF = '0x70a08231';
+// Pool discovery: the entrypoint's assetConfig(asset) → (pool, minimumDepositAmount,
+// vettingFeeBPS) is the generic asset→pool map. ppPoolForAsset reads it live and caches
+// per session; the verified mainnet rows below are the fallback when the RPC is
+// unreachable (and carry the symbol/decimals the live call does not return).
+const PP_POOL_FALLBACKS = new Map([
+  [PP_ETH_ASSET.toLowerCase(), { asset: PP_ETH_ASSET, symbol: 'ETH', decimals: 18, pool: PP_POOL, minimumDepositAmount: 10000000000000000n, vettingFeeBPS: 50 }],
+  [PP_USDC_ASSET.toLowerCase(), { asset: PP_USDC_ASSET, symbol: 'USDC', decimals: 6, pool: PP_USDC_POOL, minimumDepositAmount: 25000000n, vettingFeeBPS: 50 }],
+]);
+const PP_ASSETCONFIG_IFACE = new ethers.Interface([
+  'function assetConfig(address) view returns (address pool, uint256 minimumDepositAmount, uint256 vettingFeeBPS)'
+]);
+const ppPoolCache = new Map(); // assetLower -> config | null (null = no pool for this asset)
+async function ppPoolForAsset(asset) {
+  const key = String(asset || '').toLowerCase();
+  if (ppPoolCache.has(key)) return ppPoolCache.get(key);
+  let cfg = PP_POOL_FALLBACKS.get(key) || null;
+  try {
+    const r = await jrpc('eth_call', [{ to: PP_ENTRYPOINT, data: PP_ASSETCONFIG_IFACE.encodeFunctionData('assetConfig', [ethers.getAddress(asset)]) }, 'latest']);
+    const [pool, minimumDepositAmount, vettingFeeBPS] = PP_ASSETCONFIG_IFACE.decodeFunctionResult('assetConfig', r);
+    if (pool && BigInt(pool) !== 0n) {
+      cfg = { ...(cfg || { asset: ethers.getAddress(asset) }), pool: ethers.getAddress(pool), minimumDepositAmount, vettingFeeBPS: Number(vettingFeeBPS) };
+    } else if (!PP_POOL_FALLBACKS.has(key)) cfg = null;
+  } catch { /* RPC unreachable: the fallback constants stand (null when the asset is unknown) */ }
+  ppPoolCache.set(key, cfg);
+  return cfg;
+}
+const ppCallPool = (pool, data) => jrpc('eth_call', [{ to: pool, data }, 'latest']);
+const ppCall = data => ppCallPool(PP_POOL, data);
 // pp-crypto.mjs primitives, browser edition (same constructions, vendored poseidon 1/2/3)
 const ppCommitment = (value, label, precom) => poseidon3([value, label, precom]);
 const spentNullifierHash = nullifier => poseidon1([nullifier]);
@@ -870,8 +1004,10 @@ function leanIMTProof(levels, leafIndex) {
 }
 // Deposited-event search: newest first, chunks of <=5k blocks. The window seeds near the
 // secret file's timestamp (estimated off the known deposit block's timestamp) when the
-// file carries one, else scans back up to ~200k blocks.
-async function ppFindDeposit(precommitmentHash, timestamp, say) {
+// file carries one, else scans back up to ~200k blocks. `pool` selects the pool contract
+// (ETH pool by default; the note's pool for token deposits).
+async function ppFindDeposit(precommitmentHash, timestamp, say, pool) {
+  const poolAddr = pool || PP_POOL;
   const topic = PP_IFACE.getEvent('Deposited').topicHash;
   const latest = parseInt(await jrpc('eth_blockNumber', []), 16);
   let windowStart, windowEnd;
@@ -887,7 +1023,7 @@ async function ppFindDeposit(precommitmentHash, timestamp, say) {
   }
   for (let end = windowEnd; end >= windowStart; end -= PP_LOG_CHUNK) {
     const start = Math.max(end - PP_LOG_CHUNK + 1, windowStart);
-    const logs = await jrpc('eth_getLogs', [{ address: PP_POOL, topics: [topic], fromBlock: '0x' + start.toString(16), toBlock: '0x' + end.toString(16) }]);
+    const logs = await jrpc('eth_getLogs', [{ address: poolAddr, topics: [topic], fromBlock: '0x' + start.toString(16), toBlock: '0x' + end.toString(16) }]);
     for (const log of logs) {
       const p = PP_IFACE.parseLog(log);
       if (BigInt(p.args._precommitmentHash) === precommitmentHash)
@@ -919,6 +1055,13 @@ if ($('b-withdraw')) $('b-withdraw').onclick = async () => {
     catch { throw new Error('no valid secret JSON · pick the pp-secret file or paste its contents above'); }
     if (!note.nullifier || !note.secret || !note.precommitment)
       throw new Error('secret file must contain nullifier, secret and precommitment.');
+    // asset fields are additive: files without them (every ETH secret written before the
+    // token pools shipped) default to the ETH pool, 18 decimals, PP_ETH_ASSET.
+    const noteAsset = (typeof note.asset === 'string' && note.asset) || 'ETH';
+    const noteDecimals = Number.isFinite(note.decimals) ? note.decimals : 18;
+    const noteToken = (typeof note.token === 'string' && ethers.isAddress(note.token)) ? ethers.getAddress(note.token) : PP_ETH_ASSET;
+    const notePool = (typeof note.pool === 'string' && ethers.isAddress(note.pool)) ? ethers.getAddress(note.pool) : PP_POOL;
+    const fmtNote = v => { const s = ethers.formatUnits(v, noteDecimals); return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s; };
     const recipient = $('i-recipient').value.trim();
     if (!ethers.isAddress(recipient)) throw new Error('recipient is not a valid address: ' + (recipient || '(empty)'));
     const recipientCk = ethers.getAddress(recipient);
@@ -928,20 +1071,22 @@ if ($('b-withdraw')) $('b-withdraw').onclick = async () => {
     if (poseidon2([nullifier, secret]) !== precomFile)
       throw new Error("precommitment mismatch: poseidon2(nullifier, secret) does not equal the file's precommitment. the secret file is corrupt or mistyped · refusing to continue.");
     say('secret file OK: precommitment matches poseidon2(nullifier, secret).');
+    if (notePool.toLowerCase() !== PP_POOL.toLowerCase())
+      say('note asset: ' + noteAsset + ' (' + noteDecimals + ' decimals) · pool ' + notePool);
 
     // 1. locate the deposit onchain
     say('locating deposit onchain…');
-    const dep = await ppFindDeposit(precomFile, note.timestamp, say);
-    say('deposit found in block ' + dep.blockNumber.toLocaleString() + ': label=' + dep.label + ' value=' + ethers.formatEther(dep.value) + ' ETH');
+    const dep = await ppFindDeposit(precomFile, note.timestamp, say, notePool);
+    say('deposit found in block ' + dep.blockNumber.toLocaleString() + ': label=' + dep.label + ' value=' + fmtNote(dep.value) + ' ' + noteAsset);
     if (ppCommitment(dep.value, dep.label, precomFile) !== dep.commitment)
       say('WARN: commitment mismatch (non-fatal)');
-    const spent = await ppCall(PP_IFACE.encodeFunctionData('nullifierHashes', [spentNullifierHash(nullifier)]));
+    const spent = await ppCallPool(notePool, PP_IFACE.encodeFunctionData('nullifierHashes', [spentNullifierHash(nullifier)]));
     if (BigInt(spent) !== 0n) throw new Error('this note has already been withdrawn.');
     say('spent-nullifier check: not withdrawn.');
 
     // 2. ASP approved set + state leaves; confirm membership
     say('fetching pool scope (live SCOPE() call) + approved set from ASP…');
-    const scope = BigInt(await ppCall(PP_IFACE.encodeFunctionData('SCOPE', [])));
+    const scope = BigInt(await ppCallPool(notePool, PP_IFACE.encodeFunctionData('SCOPE', [])));
     const res = await fetch(PP_ASP + '/mt-leaves', { headers: { 'X-Pool-Scope': scope.toString() } });
     if (!res.ok) throw new Error('ASP leaves fetch failed (' + res.status + '): ' + (await res.text().catch(() => '')).slice(0, 300));
     const { aspLeaves: aspRaw, stateTreeLeaves: stateRaw } = await res.json();
@@ -960,11 +1105,11 @@ if ($('b-withdraw')) $('b-withdraw').onclick = async () => {
 
     // withdraw amount: default = full escrowed (net) value, change = 0
     const amtStr = $('i-wamount').value.trim();
-    const amountWei = amtStr ? ethers.parseEther(amtStr) : dep.value;
+    const amountWei = amtStr ? ethers.parseUnits(amtStr, noteDecimals) : dep.value;
     if (amountWei <= 0n) throw new Error('withdrawal amount must be positive.');
     const withdrawnValue = amountWei >= dep.value ? dep.value : amountWei;
     const changeValue = dep.value - withdrawnValue;
-    say('amount: withdrawing ' + ethers.formatEther(withdrawnValue) + ' ETH' + (changeValue > 0n ? ' (change ' + ethers.formatEther(changeValue) + ' ETH stays in the pool).' : ' (full balance, no change).'));
+    say('amount: withdrawing ' + fmtNote(withdrawnValue) + ' ' + noteAsset + (changeValue > 0n ? ' (change ' + fmtNote(changeValue) + ' ' + noteAsset + ' stays in the pool).' : ' (full balance, no change).'));
 
     // 3. relayer fee terms: prefer the local self-hosted relay (serve.mjs with PP_RELAY=1,
     // advertised via GET ./health). Otherwise the fastrelay.xyz path is exactly as before.
@@ -983,7 +1128,7 @@ if ($('b-withdraw')) $('b-withdraw').onclick = async () => {
       say('getting relayer quote…');
       const quoteRes = await fetch(PP_RELAYER + '/quote', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chainId: CHAIN_ID, amount: withdrawnValue.toString(), asset: PP_ETH_ASSET, recipient: recipientCk, extraGas: false })
+        body: JSON.stringify({ chainId: CHAIN_ID, amount: withdrawnValue.toString(), asset: noteToken, recipient: recipientCk, extraGas: false })
       });
       if (!quoteRes.ok) throw new Error('relayer quote failed (' + quoteRes.status + '): ' + (await quoteRes.text().catch(() => '')).slice(0, 300));
       const quote = await quoteRes.json();
@@ -1237,6 +1382,10 @@ window.GP = {
       const a = armedIntents.get(String(addr || '').toLowerCase());
       return a ? a.artifact : null;
     },
+    armedTokenIntent(addr, token) {
+      const a = armedTokenIntents.get(String(addr || '').toLowerCase() + '|' + String(token || '').toLowerCase());
+      return a ? a.artifact : null;
+    },
     payments,
     signer() {
       if (W && W.prov) return W.prov.getSigner();
@@ -1256,6 +1405,7 @@ window.GP = {
   relayerCaps,
   sweepPayment,
   armPayment,
+  armTokenPoolPayment,
   adoptSession,
   fmt: { formatEth, formatUsd },
   toast,
@@ -1274,7 +1424,7 @@ window.GP = {
     getLegacy: () => LEGACY,
     setLegacy: b => { LEGACY = !!b; },
   },
-  pp: { PP_POOL, PP_ENTRYPOINT, PP_ETH_ASSET, PP_ASP, PP_RELAYER, SNARK_FIELD, PP_IFACE, SWEEPER_IFACE, ppCall, ppFindDeposit },
+  pp: { PP_POOL, PP_ENTRYPOINT, PP_ETH_ASSET, PP_USDC_ASSET, PP_USDC_POOL, PP_ASP, PP_RELAYER, SNARK_FIELD, PP_IFACE, SWEEPER_IFACE, PP_POOL_FALLBACKS, ppCall, ppCallPool, ppFindDeposit, ppPoolForAsset },
 };
 
 // PWA: cache-first offline shell. http(s) only: file:// and weird schemes skip registration.

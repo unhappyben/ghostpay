@@ -84,7 +84,8 @@ read at any time; they reflect the current session.
 | `GP.state.recv` | `object \| null` | Current one-time receiving address: `{ stealth, ephPub, viewTag, sh }` as produced by `GP.crypto.derive`. |
 | `GP.state.ethPriceUsd` | `number \| null` | Last ETH price seen by the status strip (`GET /price`). Null until a price poll succeeds. |
 | `GP.state.payments` | `Array<Payment>` | Live array of every payment discovered this session (see Payment below). Mutated in place by scans; do not replace the array. The inbox module (gp-inbox) renders it; the core renders nothing itself. |
-| `GP.state.armedIntent(addr)` | `artifact \| null` | The auto-armed `eip7702-intent` artifact for a stealth address (secret downloaded, SweepIntent + 7702 authorization signed at detection time). Null when nothing is armed: watch-only session, a relayer without `sweeperV2`, or a balance below the 0.01 ETH pool minimum. |
+| `GP.state.armedIntent(addr)` | `artifact \| null` | The auto-armed `eip7702-intent` artifact for a stealth address (secret downloaded, SweepIntent + 7702 authorization signed at detection time). Null when nothing is armed: watch-only session, a relayer without `sweeperV2`, or a balance below the 0.01 ETH pool minimum. ETH pool sweeps only; token arms live under `armedTokenIntent`. |
+| `GP.state.armedTokenIntent(addr, token)` | `artifact \| null` | The armed action-2 `eip7702-intent` (Privacy Pools token deposit) for a stealth address and ERC-20 token. Keyed per address+token, so it never collides with the ETH arm. Null on the same conditions as `armedIntent`, plus: no Privacy Pool for the token, or the post-fee balance below the pool minimum. |
 
 `Payment`: `{ address: string, ephPub: string, block: number, tx: string, swept: boolean, fresh: boolean }`.
 `fresh` is true only when the payment was discovered by an incremental background scan
@@ -129,7 +130,18 @@ wallet signature in the current session.
   authorization is signed. The batch sweep UI arms every selected payment through here so
   each secret file provably exists before the batch broadcast. Resolves null when the
   payment is unknown, the session is watch-only, the relayer lacks `sweeperV2`, or the
-  balance is below the 0.01 ETH pool minimum.
+  balance is below the 0.01 ETH pool minimum. ETH pool sweeps (action 1) only.
+- `GP.armTokenPoolPayment(address: string, token: string): Promise<{ artifact, nonce, deadline } | null>` :
+  the token pool variant of `GP.armPayment` (SweepIntent action 2: the full token
+  balance minus the relayer fee deposits into the token's Privacy Pool via the
+  entrypoint). Same poseidon2 precommitment, same 31-byte secrets, same immediate
+  pp-secret download (the file gains `asset`/`token`/`pool`/`decimals`, see "Privacy
+  Pools (GP.pp)"), same arm queue serialisation. The pool resolves live via
+  `GP.pp.ppPoolForAsset`; the arm refuses (null) when the session is watch-only, the
+  relayer lacks `sweeperV2`, the token has no pool, or the post-fee balance is below
+  the pool minimum. The inbox's "Sweep USDC to pool" flow is the reference consumer.
+  Unlike ETH, token payments are never auto-armed at detection: a token secret
+  downloads only on the user's gesture.
 - `GP.adoptSession(keys: { account?, viewPriv, spendPriv?, viewPub, spendPub, meta, recv? }): void` :
   hands keys derived outside the core (the GET PAID stepper derives the same keys from
   the same wallet signature) to the core, so the one scanner and `GP.state` cover the
@@ -218,10 +230,26 @@ Vendored, no network. BigInt in, BigInt out for poseidon.
 
 Constants and helpers for the withdrawal flow:
 
-`PP_POOL`, `PP_ENTRYPOINT`, `PP_ETH_ASSET`, `PP_ASP`, `PP_RELAYER` (strings),
-`SNARK_FIELD` (bigint), `PP_IFACE` and `SWEEPER_IFACE` (ethers Interface),
-`ppCall(data: string): Promise<string>` (eth_call against the pool),
-`ppFindDeposit(precommitmentHash: bigint, timestamp?: string, say: (msg: string) => void): Promise<{ label, commitment, value, blockNumber }>`.
+`PP_POOL`, `PP_ENTRYPOINT`, `PP_ETH_ASSET`, `PP_USDC_ASSET`, `PP_USDC_POOL`, `PP_ASP`,
+`PP_RELAYER` (strings), `SNARK_FIELD` (bigint), `PP_IFACE` and `SWEEPER_IFACE` (ethers
+Interface), `PP_POOL_FALLBACKS` (Map of asset-lowercase to the verified mainnet pool
+configs: `{ asset, symbol, decimals, pool, minimumDepositAmount, vettingFeeBPS }`),
+`ppCall(data: string): Promise<string>` (eth_call against the ETH pool),
+`ppCallPool(pool: string, data: string): Promise<string>` (eth_call against any pool),
+`ppPoolForAsset(asset: string): Promise<config | null>` (the entrypoint's
+`assetConfig(asset)` read live, cached per session, with `PP_POOL_FALLBACKS` as the
+offline fallback; null when the asset has no pool),
+`ppFindDeposit(precommitmentHash: bigint, timestamp?: string, say: (msg: string) => void, pool?: string): Promise<{ label, commitment, value, blockNumber }>`
+(`pool` defaults to the ETH pool).
+
+Secret files (the downloaded `pp-secret-*.json`) carry the withdrawal secret plus asset
+fields. `asset` (`'ETH'`/`'USDC'`), `token` (the asset address: the `0xEeee…` sentinel
+for ETH), `pool` (the pool contract address) and `decimals` are present on every file
+written since the token pools shipped. Files written before that have none of them (or
+a descriptive string in `pool`) and default to the ETH pool, 18 decimals, and
+`PP_ETH_ASSET` everywhere the app reads them. The non-secret tracking records
+(`ghostpay:ppnote:<addr>`) carry the same fields for token deposits; missing fields
+mean ETH.
 
 ## Misc
 
@@ -267,10 +295,12 @@ default; on screens under 700px everything stacks and buttons are at least 44px 
 Session storage keys modules may read (never write): `gp-session` (JSON
 `{ v, viewPriv, meta, ts }`, viewing key only), `gp-recv-records` (un-announced
 receive addresses, the RECOVERY banner source), `ghostpay:lastScanned:<viewPub>`
-(scan cursor), and `gp-money:backup-gate` (gp-money's pending secret-backup gate:
-set while a downloaded pp-secret awaits confirmation; the batch sweep UI reads it and
-refuses to arm or broadcast while it is set). The spend key is deliberately absent
-from storage.
+(scan cursor), `ghostpay:ppnote:<addr>` (the non-secret pool-deposit tracking record;
+token deposits add `asset`, `token`, `pool`, `decimals`, missing fields mean ETH), and
+`gp-money:backup-gate` (gp-money's pending secret-backup gate:
+set while a downloaded pp-secret awaits confirmation; the batch sweep UI and the inbox
+token pool sweep flow read it and refuse to arm or broadcast while it is set). The
+spend key is deliberately absent from storage.
 
 ## Invoice storage: schema v4
 

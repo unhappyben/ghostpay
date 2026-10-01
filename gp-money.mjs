@@ -25,6 +25,10 @@
 //    when the auto-download fires. That arms the secret-backup gate
 //    (localStorage "gp-money:backup-gate"): further SIGN SWEEP clicks are blocked
 //    until the backup is confirmed, or proven via a successful file re-upload check.
+//    Token (USDC) pool sweeps arm through the same showSecret write, so the gate arms
+//    identically for them; the inbox-driven token pool flow (gp-inbox) refuses to arm
+//    or broadcast while the gate key is set, exactly like the batch flow. A broadcast
+//    without a confirmed backup of the freshly downloaded secret is impossible.
 // 5. #st-broadcast MutationObserver: picks the tx hash out of the core's broadcast
 //    status line, then polls GET ./status/<hash> every 5s for the progress view.
 // 6. GP.relaySweep: WRAPPED (property reassigned, window.GP itself untouched) so

@@ -5,10 +5,13 @@
 //   {ts, kind: "sweep-intent"|"sweep-intent-batch"|"pp-withdraw", feeBps, estFeeWei, txHash, runner}
 //   sweep-intent / sweep-intent-batch: estFeeWei = stealth ETH balance * feeBps / 10000,
 //     estimated at preflight from the balance fetched before broadcast. A batch writes one
-//     line per swept stealth address, all sharing one txHash. For token sweeps the stealth
-//     ETH balance is not the swept asset, so the estimate is rough.
+//     line per swept stealth address, all sharing one txHash.
+//   Token sweeps (intent actions 2/3) and USDC withdrawals add asset + assetSymbol +
+//     assetDecimals, and estFeeWei is denominated in that asset's base units. Those lines
+//     are kept out of the ETH totals and reported per asset at the end.
 //   pp-withdraw: estFeeWei = withdrawnValue (public signal) * relayFeeBPS / 10000, the fee
-//     the Privacy Pools entrypoint pays the runner inside the withdrawal itself.
+//     the Privacy Pools entrypoint pays the runner inside the withdrawal itself. ETH pool
+//     withdrawals carry asset = the ETH sentinel and count as ETH.
 //   fee-forward: written by the serve.mjs auto-forwarder when a runner sweeps its accrued
 //     fees to FEE_OWNER; estFeeWei is the forwarded amount (an outflow, not revenue). These
 //     lines feed the forward totals below and are excluded from the revenue + ARR math.
@@ -31,11 +34,32 @@ export async function logFee(entry) {
   }
 }
 
+// fee asset of a ledger line: estFeeWei is denominated in it. Lines without an asset
+// field (and the ETH sentinel) are ETH at 18 decimals, exactly as before the token pools.
+const ETH_SENTINEL = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+const KNOWN_ASSETS = new Map([
+  ['0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', { sym: 'USDC', dec: 6 }],
+]);
+function assetOf(e) {
+  const a = typeof e.asset === 'string' ? e.asset.toLowerCase() : '';
+  if (!a || a === ETH_SENTINEL) return { key: 'ETH', sym: 'ETH', dec: 18 };
+  const k = KNOWN_ASSETS.get(a);
+  if (k) return { key: k.sym, ...k };
+  return { key: a, sym: e.assetSymbol || a.slice(0, 10), dec: Number.isFinite(e.assetDecimals) ? e.assetDecimals : 18 };
+}
+
 // wei -> trimmed ETH decimal string (BigInt math, no ethers).
 function formatEth(wei) {
   const w = BigInt(wei);
   const whole = w / 10n ** 18n;
   const frac = (w % 10n ** 18n).toString().padStart(18, '0').replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : whole.toString();
+}
+// base units -> trimmed decimal string at the asset's precision (BigInt math).
+function formatUnits(units, dec) {
+  const w = BigInt(units), d = 10n ** BigInt(dec);
+  const whole = w / d;
+  const frac = (w % d).toString().padStart(dec, '0').replace(/0+$/, '');
   return frac ? `${whole}.${frac}` : whole.toString();
 }
 const fmtUsd = n => '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -93,10 +117,14 @@ async function main() {
   // totals at the end and stay out of the earned totals, weekly buckets, and ARR.
   const forwards = entries.filter(e => e.kind === 'fee-forward');
   const earned = entries.filter(e => e.kind !== 'fee-forward');
+  // token-denominated lines (a non-ETH asset field) never enter the ETH totals: they are
+  // reported per asset at the end. Lines without an asset field are ETH, as before.
+  const ethEarned = earned.filter(e => assetOf(e).key === 'ETH');
+  const tokEarned = earned.filter(e => assetOf(e).key !== 'ETH');
 
   const byKind = new Map();
   let total = 0n;
-  for (const e of earned) {
+  for (const e of ethEarned) {
     const k = byKind.get(e.kind) || { wei: 0n, n: 0 };
     k.wei += BigInt(e.estFeeWei); k.n++;
     byKind.set(e.kind, k);
@@ -111,7 +139,7 @@ async function main() {
     m.setDate(m.getDate() - i * 7);
     weeks.push({ start: m, wei: 0n, n: 0 });
   }
-  for (const e of earned) {
+  for (const e of ethEarned) {
     const t = Date.parse(e.ts);
     if (!Number.isFinite(t)) continue;
     const m = mondayOf(t);
@@ -135,6 +163,19 @@ async function main() {
   console.log('weekly (last 8 weeks, week starting):');
   for (const w of weeks) console.log(`  ${dateStr(w.start)}: ${formatEth(w.wei)} ETH (${w.n})`);
   console.log(`ARR run-rate (last 4 weeks x 13): ${formatEth(arr)} ETH` + (usd == null ? '' : ` ≈ ${usdOf(arr)}`));
+
+  // token-denominated fees: per-asset totals, never mixed into the ETH totals above.
+  if (tokEarned.length) {
+    const byAsset = new Map();
+    for (const e of tokEarned) {
+      const a = assetOf(e);
+      const cur = byAsset.get(a.key) || { sym: a.sym, dec: a.dec, units: 0n, n: 0 };
+      cur.units += BigInt(e.estFeeWei); cur.n++;
+      byAsset.set(a.key, cur);
+    }
+    console.log('token fees (not in the ETH totals): '
+      + [...byAsset.values()].map(a => `${formatUnits(a.units, a.dec)} ${a.sym} (${a.n})`).join(' · '));
+  }
 
   let fwdTotal = 0n, fwdLast = null;
   for (const e of forwards) {

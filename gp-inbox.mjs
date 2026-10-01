@@ -89,28 +89,40 @@ async function blockTime(b) {
   timeCache.set(b, s);
   return s;
 }
-let aspCache = { ts: 0, promise: null };
-function getAsp() {
-  if (aspCache.promise && Date.now() - aspCache.ts < 120000) return aspCache.promise;
-  aspCache = { ts: Date.now(), promise: (async () => {
-    const scope = BigInt(await GP.pp.ppCall(GP.pp.PP_IFACE.encodeFunctionData('SCOPE', [])));
+let aspCache = new Map(); // pool address (lowercase) -> { ts, promise }
+function getAsp(pool) {
+  const poolAddr = pool || GP.pp.PP_POOL;
+  const key = poolAddr.toLowerCase();
+  const cur = aspCache.get(key);
+  if (cur && cur.promise && Date.now() - cur.ts < 120000) return cur.promise;
+  const promise = (async () => {
+    const scope = BigInt(await GP.pp.ppCallPool(poolAddr, GP.pp.PP_IFACE.encodeFunctionData('SCOPE', [])));
     const res = await fetch(GP.pp.PP_ASP + '/mt-leaves', { headers: { 'X-Pool-Scope': scope.toString() } });
     if (!res.ok) throw new Error('ASP leaves fetch failed (' + res.status + ')');
     const { aspLeaves } = await res.json();
     return new Set(aspLeaves.map(x => BigInt(x)));
-  })() };
-  return aspCache.promise;
+  })();
+  aspCache.set(key, { ts: Date.now(), promise });
+  return promise;
 }
 const fetchJson = async u => { const r = await fetch(u); if (!r.ok) throw new Error('http ' + r.status); return r.json(); };
 
+// the tracking record written at arm time (app-core): fields beyond nullifier/
+// precommitment/amount/ts exist only for token pool notes; missing fields mean ETH.
+const noteFor = addr => lsGet('ghostpay:ppnote:' + addr.toLowerCase(), null);
+const notePool = note => (note && typeof note.pool === 'string' && ethers.isAddress(note.pool)) ? note.pool : GP.pp.PP_POOL;
+const noteSym = note => (note && typeof note.asset === 'string' && note.asset) || 'ETH';
+const noteDec = note => (note && Number.isFinite(note.decimals)) ? note.decimals : 18;
+const fmtNote = (note, v) => trim(ethers.formatUnits(v, noteDec(note))) + ' ' + noteSym(note);
+
 // ── deposit + withdrawal trace (the pool/ASP lifecycle tracing lives in this module) ──
-async function findDeposit(addr, fromBlock) {
+async function findDeposit(addr, fromBlock, pool) {
   const topic = GP.pp.PP_IFACE.getEvent('Deposited').topicHash;
   const depTopic = ethers.zeroPadValue(addr, 32);
   const end = Math.min(fromBlock + 100000, parseInt(await GP.jrpc('eth_blockNumber', []), 16));
   for (let e = end; e >= fromBlock; e -= PP_LOG_CHUNK) {
     const s = Math.max(e - PP_LOG_CHUNK + 1, fromBlock);
-    const logs = await GP.jrpc('eth_getLogs', [{ address: GP.pp.PP_POOL, topics: [topic, depTopic], fromBlock: '0x' + s.toString(16), toBlock: '0x' + e.toString(16) }]);
+    const logs = await GP.jrpc('eth_getLogs', [{ address: pool || GP.pp.PP_POOL, topics: [topic, depTopic], fromBlock: '0x' + s.toString(16), toBlock: '0x' + e.toString(16) }]);
     if (logs.length) {
       const p = GP.pp.PP_IFACE.parseLog(logs[logs.length - 1]);
       return { label: BigInt(p.args._label), value: BigInt(p.args._value), block: parseInt(logs[logs.length - 1].blockNumber, 16) };
@@ -119,9 +131,9 @@ async function findDeposit(addr, fromBlock) {
   return null;
 }
 async function isWithdrawn(addr) {
-  const rec = lsGet('ghostpay:ppnote:' + addr.toLowerCase(), null);
+  const rec = noteFor(addr);
   if (!rec || !rec.nullifier) return null; // no tracking record on this device: state unknown
-  const spent = BigInt(await GP.pp.ppCall(GP.pp.PP_IFACE.encodeFunctionData('nullifierHashes', [GP.crypto.spentNullifierHash(BigInt(rec.nullifier))])));
+  const spent = BigInt(await GP.pp.ppCallPool(notePool(rec), GP.pp.PP_IFACE.encodeFunctionData('nullifierHashes', [GP.crypto.spentNullifierHash(BigInt(rec.nullifier))])));
   return spent !== 0n;
 }
 
@@ -145,8 +157,12 @@ async function computeStage(row) {
   }
   // address is empty: swept (or a zero-value announcement)
   if (p && p.stage === 'direct') return 'direct';
+  // the note's pool drives the whole trace: USDC notes query the USDC pool (deposit
+  // logs, nullifier, ASP scope), old notes with no asset fields stay on the ETH pool.
+  const note = noteFor(addr);
+  const pool = notePool(note);
   let dep = null;
-  try { dep = await findDeposit(addr, row.rec.block); } catch { /* RPC hiccup: fall through to persisted state */ }
+  try { dep = await findDeposit(addr, row.rec.block, pool); } catch { /* RPC hiccup: fall through to persisted state */ }
   if (!dep) {
     if (p && p.sweepTx && (p.stage === 'sweeping' || p.stage === 'detected')) {
       try {
@@ -161,7 +177,7 @@ async function computeStage(row) {
   row.deposit = dep;
   try { if (await isWithdrawn(addr)) return 'withdrawn'; } catch { /* nullifier check failed: keep tracing */ }
   try {
-    const asp = await getAsp();
+    const asp = await getAsp(pool);
     return asp.has(dep.label) ? 'withdrawable' : 'asp_pending';
   } catch { return 'in_pool'; }
 }
@@ -520,6 +536,28 @@ async function renderRow(row, stage) {
     const px = s === 'WETH' ? prices.eth : prices.usdc;
     return px ? ' ≈ ' + usdStr(Number(ethers.formatUnits(row.tokens[s], TOKENS.find(x => x.sym === s).dec)) * px) : '';
   };
+  // USDC pool sweep eligibility: the deposited amount (balance minus the relayer fee)
+  // must clear the pool's minimum, the session must hold the spend key, and the relayer
+  // must take signed intents. The pool config resolves live via the entrypoint's
+  // assetConfig (session-cached, constants as fallback), so new token pools light up here
+  // without an app update.
+  let usdcPool = null, usdcPoolOk = false, usdcPoolWhy = null;
+  if (row.tokens.USDC) {
+    try { usdcPool = await GP.pp.ppPoolForAsset(USDC.addr); } catch { usdcPool = null; }
+    const caps = GP.relayerCaps ? await GP.relayerCaps().catch(() => null) : null;
+    const hasSpend = !!(GP.state.keys && GP.state.keys.spendPriv);
+    if (usdcPool && usdcPool.pool && usdcPool.minimumDepositAmount != null) {
+      const feeBps = BigInt((caps && caps.minFeeBps) ?? 30);
+      const deposited = row.tokens.USDC - row.tokens.USDC * feeBps / 10000n;
+      if (!caps || !caps.sweeperV2) usdcPoolWhy = 'this relayer does not take signed intents, so the pool path is unavailable';
+      else if (!hasSpend) usdcPoolWhy = 'watch-only session: reconnect and generate your keys to sweep into the pool';
+      else if (deposited < BigInt(usdcPool.minimumDepositAmount)) {
+        const minStr = trim(ethers.formatUnits(BigInt(usdcPool.minimumDepositAmount), 6));
+        usdcPoolWhy = 'below the ' + minStr + ' USDC Privacy Pools minimum after the relayer fee (' + fmtToken('USDC', deposited) + ' USDC would land)';
+      }
+      usdcPoolOk = !usdcPoolWhy;
+    }
+  }
   // line 1: balance + detected time. A token-paid address holds tokens, not ETH: lead
   // with the token balance instead of a misleading 0 ETH.
   let balTxt = 'balance unknown';
@@ -548,10 +586,14 @@ async function renderRow(row, stage) {
   let noteTxt = '';
   if (stage === 'asp_pending') noteTxt = 'deposits wait for the association-set provider to approve them. usually hours. funds are safe.';
   else if (stage === 'withdrawable') noteTxt = 'ASP approved: withdraw in step 4 with your pp-secret file.';
-  else if (stage === 'in_pool' && row.deposit) noteTxt = 'pool deposit ' + GP.fmt.formatEth(row.deposit.value) + ' ETH · block ' + row.deposit.block.toLocaleString() + '. tracing ASP…';
+  else if (stage === 'in_pool' && row.deposit) noteTxt = 'pool deposit ' + fmtNote(noteFor(addr), row.deposit.value) + ' · block ' + row.deposit.block.toLocaleString() + '. tracing ASP…';
   else if (stage === 'sweeping') noteTxt = 'sweep broadcast. this line advances when the tx confirms.';
   else if (stage === 'detected' && row.ethBal !== null && row.ethBal > 0n && row.ethBal >= PP_MIN) noteTxt = 'pool-ready: sweep this address into Privacy Pools from this row.';
-  else if (stage === 'detected' && (row.ethBal === null || row.ethBal === 0n) && syms.length) noteTxt = 'token balance, no ETH: sweep the token from this row. the pool path is ETH-only.';
+  else if (stage === 'detected' && (row.ethBal === null || row.ethBal === 0n) && syms.length) {
+    noteTxt = usdcPoolOk
+      ? 'token balance, no ETH: sweep the USDC into the Privacy Pool from this row (the deposit is public, your withdrawal address stays unlinked), or sweep direct to an address you choose.'
+      : ('token balance, no ETH: sweep the token from this row.' + (row.tokens.USDC && usdcPoolWhy ? ' pool unavailable: ' + usdcPoolWhy + '.' : ''));
+  }
   for (const view of row.views.values()) {
     const { meta, tokensEl, pill, note, actions } = view.refs;
     const balEl = document.createElement('span'); balEl.className = 'gp-bal'; balEl.textContent = balTxt;
@@ -566,10 +608,20 @@ async function renderRow(row, stage) {
     // actions
     actions.textContent = '';
     const live = stage === 'detected' || stage === 'sweeping';
+    if (live && row.tokens.USDC && usdcPoolOk) {
+      // the pool path is primary: it breaks the public link between this one-time
+      // address and wherever the funds go next. The direct sweep stays as the
+      // secondary option with the linkage spelled out in its panel.
+      const b = document.createElement('button');
+      b.className = 'gp-btn small primary';
+      b.textContent = 'Sweep USDC to pool';
+      b.onclick = () => openTokenPoolSweep(row, view);
+      actions.appendChild(b);
+    }
     if (live && row.tokens.USDC) {
       const b = document.createElement('button');
-      b.className = 'gp-btn small';
-      b.textContent = 'Sweep USDC';
+      b.className = usdcPoolOk ? 'gp-btn small ghost' : 'gp-btn small';
+      b.textContent = usdcPoolOk ? 'Sweep USDC direct' : 'Sweep USDC';
       b.onclick = () => openUsdcSweep(row, view);
       actions.appendChild(b);
     }
@@ -619,7 +671,10 @@ function panelBase(view, noteTxt) {
   return { panel, amt, dest, st };
 }
 
-function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
+// the pool-deposit variant (opts.gate) is backup-gated like the batch flow: the arm
+// already downloaded a fresh pp-secret, so gp-money's gate (armed by the #v-secret
+// observer) must be confirmed on the FUNDS tab before this broadcast may leave.
+function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed, opts = {}) {
   const prev = document.createElement('div'); prev.className = 'gp-note gp-prev';
   prev.textContent = 'signed · ' + summary;
   const bBc = document.createElement('button'); bBc.className = 'gp-btn primary block'; bBc.textContent = 'BROADCAST VIA RELAYER';
@@ -627,6 +682,10 @@ function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
   bCp.onclick = () => { navigator.clipboard.writeText(JSON.stringify(artifact, null, 2)); GP.toast('artifact copied'); };
   panel.append(prev, bBc, bCp);
   bBc.onclick = async () => {
+    if (opts.gate && lsGet(GATE_KEY, null)) {
+      st.textContent = 'Confirm the downloaded pp-secret file in the backup gate on the FUNDS tab first: no broadcast without a confirmed backup.';
+      return;
+    }
     bBc.disabled = true;
     onRelayed();
     row._pendingArt = artifact;
@@ -666,12 +725,14 @@ function previewAndBroadcast(row, panel, st, artifact, summary, onRelayed) {
   };
 }
 
-// USDC: gasless EIP-3009 transferWithAuthorization, signed by the stealth key. Direct transfer,
-// not a pool deposit (the pool path is ETH-only in the current sweeper).
+// USDC: gasless EIP-3009 transferWithAuthorization, signed by the stealth key. Direct
+// transfer, not a pool deposit: it stays the fallback for sub-minimum balances and for
+// relayers without sweeperV2, and the secondary option when the pool path is available
+// (the pool breaks the link; a direct transfer does not).
 function openUsdcSweep(row, view) {
   const rec = row.rec;
   const { panel, amt, dest, st } = panelBase(view,
-    'USDC sweep is an EIP-3009 transferWithAuthorization: gasless for this address, signed by the stealth key. it moves USDC straight to your destination, it does not enter Privacy Pools.');
+    'USDC sweep is an EIP-3009 transferWithAuthorization: gasless for this address, signed by the stealth key. it moves USDC straight to your destination without entering Privacy Pools: the transfer is public, so this one-time address and your destination stay linked onchain. the pool sweep breaks that link.');
   amt.textContent = 'amount: ' + fmtToken('USDC', row.tokens.USDC) + ' USDC (full balance)';
   const b = document.createElement('button'); b.className = 'gp-btn primary block'; b.textContent = 'Sign USDC sweep';
   panel.appendChild(b);
@@ -697,6 +758,44 @@ function openUsdcSweep(row, view) {
         () => putPill(rec.address, { stage: 'sweeping', sweepTx: null }));
     } catch (e) { st.textContent = 'error: ' + e.message; }
   };
+}
+
+// USDC → Privacy Pools (SweeperV2 intent action 2). Mirrors the ETH pool sweep: arming
+// generates the pp-secret (downloaded immediately, gp-money's backup gate arms off the
+// #v-secret observer), the preview states the terms, and the broadcast refuses while a
+// secret backup is unconfirmed. The pill then climbs the pool ladder per computeStage.
+async function openTokenPoolSweep(row, view) {
+  const rec = row.rec;
+  let pool = null;
+  try { pool = await GP.pp.ppPoolForAsset(USDC.addr); } catch { /* fallthrough copy covers it */ }
+  const vetTxt = pool && Number.isFinite(pool.vettingFeeBPS) ? ' · pool vetting fee ' + (pool.vettingFeeBPS / 100) + '%' : ' · the pool takes a vetting fee';
+  const { panel, amt, dest, st } = panelBase(view,
+    'the full USDC balance (minus the relayer fee) deposits into the mainnet USDC Privacy Pool. the deposit is public but your withdrawal address stays unlinked'
+    + vetTxt + ' · the deposit waits for ASP screening (usually hours) before you can withdraw in step 4 with the pp-secret file. keep that file: it is the only way to withdraw.');
+  dest.remove(); // pool deposits have no destination: the withdrawal picks it later
+  amt.textContent = 'amount: ' + fmtToken('USDC', row.tokens.USDC) + ' USDC (full balance minus the relayer fee)';
+  if (lsGet(GATE_KEY, null)) {
+    st.textContent = 'A withdrawal-secret backup is still unconfirmed. Confirm it in the backup gate on the FUNDS tab before arming another pool sweep.';
+    return;
+  }
+  st.textContent = 'arming: generating the Privacy Pools secret (the pp-secret file downloads now) and signing the sweep intent…';
+  let armed;
+  try {
+    armed = await GP.armTokenPoolPayment(rec.address, USDC.addr);
+  } catch (e) {
+    st.textContent = 'arm failed: ' + e.message;
+    return;
+  }
+  if (!armed || !armed.artifact) {
+    st.textContent = 'could not arm (relayer without sweeperV2, or the balance dropped below the pool minimum after the fee). nothing was broadcast: rescan and retry.';
+    return;
+  }
+  const artifact = armed.artifact;
+  st.textContent = '';
+  previewAndBroadcast(row, panel, st, artifact,
+    fmtToken('USDC', row.tokens.USDC) + ' USDC → USDC Privacy Pool · valid 24h · fee ' + artifact.intent.feeBps + ' bps · pp-secret downloaded: keep it, it is the only way to withdraw',
+    () => putPill(rec.address, { stage: 'sweeping', sweepTx: null, direct: false }),
+    { gate: true });
 }
 
 // dust ETH (< 0.01): cannot enter Privacy Pools, so offer a direct sweep to a destination.

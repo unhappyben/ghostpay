@@ -149,7 +149,7 @@ TOR_PROXY=socks5://127.0.0.1:9050 RPC_URLS=https://rpc.flashbots.net,https://eth
   <li>The runner pays the gas. The fee accrues onchain to the runner inside the withdrawal itself (Entrypoint.relay pays <code>feeRecipient</code>).</li>
   <li><code>GET /health</code> advertises <code>ppRelay: true</code> and <code>ppFeeBps</code> so the app can discover the relay and price proofs before building one.</li>
 </ul>
-<p>Only the mainnet ETH Privacy Pool is served: chainId 1, the canonical entrypoint, the ETH pool scope. Gas estimation simulates the full withdrawal including proof verification, so an invalid proof fails with a clean error instead of burning gas onchain.</p>
+<p>The mainnet ETH and USDC Privacy Pools are served: chainId 1, the canonical entrypoint, either pool's scope. Gas estimation simulates the full withdrawal including proof verification, so an invalid proof fails with a clean error instead of burning gas onchain.</p>
 
 <h2>Fee auto-forward</h2>
 <p>Relayer fees accrue onchain to the runner: <code>tx.origin</code> on intent sweeps, <code>feeRecipient</code> inside withdrawals. With <code>FEE_OWNER</code> set, a forwarder consolidates them:</p>

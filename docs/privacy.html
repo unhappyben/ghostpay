@@ -94,6 +94,15 @@
 <p>The sweep artifact is two signatures. The EIP-712 <code>SweepIntent</code>, signed by the stealth key, binds the action, token, destination, Privacy Pools precommitment, fee, and deadline. The EIP-7702 authorization binds the delegation target and the nonce. Change any byte and a signature stops verifying: the relayer's only options are to deliver the payload as signed or to censor it. It cannot redirect funds, raise the fee, or reuse the artifact. The withdrawal relay is bound the same way by the circuit: the context signal commits the proof to the exact recipient, fee recipient, and fee rate.</p>
 <p>Censorship is still possible. The mitigation is that any 7702-capable broadcaster can carry the same signed artifact: <code>relay.mjs</code> broadcasts a saved artifact from any funded key, and nothing about the artifact is tied to this relayer.</p>
 
+<h2>The USDC pool path</h2>
+<p>USDC can also move gaslessly without the pool: an EIP-3009 <code>transferWithAuthorization</code> signed by the stealth key sends the balance straight to a destination. Gasless, but public: the one-time address and the destination are linked onchain for anyone reading the transfer. Sweeping into the mainnet USDC Privacy Pool instead (intent action 2) breaks that link: the deposit is public, the later withdrawal lands at an address with no onchain connection to the one-time address that was paid.</p>
+<ul>
+  <li><b>Minimum.</b> The pool refuses deposits below 25 USDC. The app enforces the minimum on the post-fee amount (balance minus the relayer fee), so a balance that would land under 25 USDC never arms a pool sweep.</li>
+  <li><b>Vetting fee.</b> The pool takes a 50 bps vetting fee on the deposited amount, deducted onchain before escrow; the app reads the net amount from the deposit event.</li>
+  <li><b>ASP screening.</b> The deposit must be approved by the association-set provider before it can be withdrawn. Usually hours. The funds are safe while they wait; the withdrawal is the same gasless ZK withdrawal as the ETH pool.</li>
+  <li><b>Same secret discipline.</b> The pp-secret file downloads at arm time and the backup gate blocks the broadcast until the file is confirmed, exactly as for ETH pool sweeps.</li>
+</ul>
+
 <h2>Shrinking the footprint</h2>
 <h3>Fund the runner from Privacy Pools</h3>
 <p>A runner funded from an operator wallet links every relayed transaction to the operator onchain. Funded from a Privacy Pools withdrawal instead, the runner has no funding link to anyone. Rotate runners by withdrawing again to a fresh address. Procedure: <a href="./relayer.html">Relayer</a>.</p>

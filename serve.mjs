@@ -14,7 +14,8 @@
 //   POST /pp-withdraw <withdrawal payload>       → Privacy Pools withdrawal relay (PP_RELAY=1 only,
 //                                                 else 503). Same payload shape the app sends to
 //                                                 fastrelay.xyz: {chainId, scope, withdrawal, proof,
-//                                                 publicSignals, feeCommitment?}. The circuit binds the
+//                                                 publicSignals, feeCommitment?}. The mainnet ETH and
+//                                                 USDC pool scopes are served. The circuit binds the
 //                                                 fee recipient + relayFeeBPS via the context signal:
 //                                                 the fee recipient must be one of this server's runner
 //                                                 addresses and relayFeeBPS must not exceed PP_FEE_BPS
@@ -31,7 +32,9 @@
 //
 // Fee ledger: every successful fee-bearing broadcast appends one JSON line to fees.jsonl
 // ({ts, kind, feeBps, estFeeWei, txHash, runner}; see fees.mjs, run `node fees.mjs` for the
-// revenue report). Announce requests carry no fee and are never logged.
+// revenue report). Token-denominated fees (intent actions 2/3, USDC withdrawals) add
+// asset/assetSymbol/assetDecimals and estFeeWei is in that asset's base units. Announce
+// requests carry no fee and are never logged.
 //
 // Fee auto-forward (FEE_OWNER): every FEE_SWEEP_MINUTES (default 60, first sweep 5 min after
 // boot) each runner sends its ETH balance above FEE_RESERVE_ETH (default 0.005) to FEE_OWNER
@@ -100,7 +103,35 @@ const PP_RELAY = process.env.PP_RELAY === '1';        // gates POST /pp-withdraw
 const PP_FEE_BPS = Number.isFinite(parseInt(process.env.PP_FEE_BPS, 10)) ? parseInt(process.env.PP_FEE_BPS, 10) : 25;
 const PP_ENTRYPOINT = '0x6818809EefCe719E480a7526D76bD3e561526b46'; // Privacy Pools entrypoint, mainnet
 const PP_SCOPE = 4916574638117198869413701114161172350986437430914933850166949084132905299523n; // mainnet ETH pool scope
+const PP_USDC_SCOPE = 16452108168275993030962142353354044100680963945240756716593099151407051066232n; // mainnet USDC pool scope
+const PP_ETH_ASSET = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+const USDC_MAINNET = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
+// the pools this relay serves withdrawals for, keyed by scope decimal string
+const PP_SCOPE_INFO = new Map([
+  [PP_SCOPE.toString(), { symbol: 'ETH', asset: PP_ETH_ASSET, decimals: 18, pool: '0xF241d57C6DebAe225c0F2e6eA1529373C9A9C9fB' }],
+  [PP_USDC_SCOPE.toString(), { symbol: 'USDC', asset: USDC_MAINNET, decimals: 6, pool: '0xb419c2867aB3CBc78921660cB95150d95A94ce86' }],
+]);
 const SNARK_FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+// Pool config for action-2 preflights: entrypoint assetConfig(asset) read live, with the
+// verified mainnet USDC row as the fallback when every RPC is unreachable.
+const PP_ASSET_CONFIGS = new Map([
+  [USDC_MAINNET.toLowerCase(), { pool: '0xb419c2867aB3CBc78921660cB95150d95A94ce86', minimumDepositAmount: 25000000n, vettingFeeBPS: 50, symbol: 'USDC', decimals: 6 }],
+]);
+const ASSET_CONFIG_IFACE = new ethers.Interface([
+  'function assetConfig(address) view returns (address pool, uint256 minimumDepositAmount, uint256 vettingFeeBPS)']);
+async function poolConfigForAsset(token) {
+  const key = String(token).toLowerCase();
+  const fallback = PP_ASSET_CONFIGS.get(key) || null;
+  try {
+    const r = await rpcCall('eth_call', [{ to: PP_ENTRYPOINT, data: ASSET_CONFIG_IFACE.encodeFunctionData('assetConfig', [token]) }, 'latest']);
+    const [pool, minimumDepositAmount, vettingFeeBPS] = ASSET_CONFIG_IFACE.decodeFunctionResult('assetConfig', r);
+    if (BigInt(pool) === 0n) return null; // the chain says no pool for this asset: the fallback loses
+    return { ...(fallback || {}), pool, minimumDepositAmount, vettingFeeBPS: Number(vettingFeeBPS) };
+  } catch { return fallback; }
+}
+const getTokenBalance = (token, addr) =>
+  rpcCall('eth_call', [{ to: token, data: '0x70a08231' + ethers.zeroPadValue(addr, 32).slice(2) }, 'latest']).then(BigInt);
 
 // ── abuse protection: the write endpoints cost the runner gas, so a public relayer needs
 // a brake. Per-IP token buckets (Map keyed by endpoint + IP, refilled lazily, in-memory
@@ -295,26 +326,40 @@ async function nextNonce(runner) {
   if (!nonceCache.has(a)) nonceCache.set(a, await getNonce(runner.address));
   return nonceCache.get(a);
 }
+// Per-runner lock around nonce → sign → send. The privacy jitter runs BEFORE the lock:
+// reading the nonce, then sleeping 5-45s, then sending let two overlapping requests on
+// one runner take the same nonce, and the later send was rejected (an announce landing
+// inside a sweep's jitter window silently killed the sweep). Inside the lock everything
+// is a few RPC round trips, so requests no longer queue behind each other's delays.
+const runnerLocks = new Map(); // runner address (lowercase) -> tail of the promise chain
+function withRunnerLock(runner, fn) {
+  const a = runner.address.toLowerCase();
+  const run = (runnerLocks.get(a) || Promise.resolve()).then(fn, fn);
+  runnerLocks.set(a, run.catch(() => {}));
+  return run;
+}
 async function broadcast(runner, tx, jitterRange, label) {
   tx.chainId = CHAIN_ID;
-  tx.nonce = await nextNonce(runner);
-  Object.assign(tx, await feeBump());
-  if (!tx.gasLimit) tx.gasLimit = await estimateGas(runner.address, tx, label);
-  // affordability preflight: Flashbots Protect ACCEPTS unfunded transactions (returns a
-  // hash, then never includes them), so an empty runner produces phantom "pending" txs
-  // that explorers never find. Refuse loudly instead of broadcasting into the void.
-  const cost = tx.gasLimit * tx.maxFeePerGas + BigInt(tx.value || 0);
-  const bal = await getBalance(runner.address);
-  if (bal < cost) {
-    throw Object.assign(new Error(`runner ${runner.address} cannot afford this broadcast: balance ${ethers.formatEther(bal)} ETH, needs ~${ethers.formatEther(cost)} ETH for gas · fund the runner and retry`), { status: 400 });
-  }
-  const signed = await runner.signTransaction(tx);
   const delayedSec = Math.round(jitterRange[0] + Math.random() * (jitterRange[1] - jitterRange[0]));
   await new Promise(r => setTimeout(r, delayedSec * 1000));
-  const { hash, host } = await broadcastRawTx(signed);
-  nonceCache.set(runner.address.toLowerCase(), tx.nonce + 1); // only after the send was accepted
-  console.log(`broadcast ${label}: broadcast=${host} runner=${runner.address} delay=${delayedSec}s hash=${hash}`);
-  return { hash, runner: runner.address, delayedSec };
+  return withRunnerLock(runner, async () => {
+    tx.nonce = await nextNonce(runner);
+    Object.assign(tx, await feeBump());
+    if (!tx.gasLimit) tx.gasLimit = await estimateGas(runner.address, tx, label);
+    // affordability preflight: Flashbots Protect ACCEPTS unfunded transactions (returns a
+    // hash, then never includes them), so an empty runner produces phantom "pending" txs
+    // that explorers never find. Refuse loudly instead of broadcasting into the void.
+    const cost = tx.gasLimit * tx.maxFeePerGas + BigInt(tx.value || 0);
+    const bal = await getBalance(runner.address);
+    if (bal < cost) {
+      throw Object.assign(new Error(`runner ${runner.address} cannot afford this broadcast: balance ${ethers.formatEther(bal)} ETH, needs ~${ethers.formatEther(cost)} ETH for gas · fund the runner and retry`), { status: 400 });
+    }
+    const signed = await runner.signTransaction(tx);
+    const { hash, host } = await broadcastRawTx(signed);
+    nonceCache.set(runner.address.toLowerCase(), tx.nonce + 1); // only after the send was accepted
+    console.log(`broadcast ${label}: broadcast=${host} runner=${runner.address} delay=${delayedSec}s hash=${hash}`);
+    return { hash, runner: runner.address, delayedSec };
+  });
 }
 
 const MIME = {
@@ -542,18 +587,48 @@ async function handleSweep(artifact, attempts = 1) {
     const data = SWEEPER_IFACE.encodeFunctionData('executeSweep', [artifact.intent, artifact.signature]);
     // preflights that turn opaque gas-estimation reverts into clear errors: the two common
     // causes are a stale authorization (the address was already swept, nonce consumed) and
-    // an empty address (already swept or never paid).
+    // an empty address (already swept or never paid). Token actions (2 = PP token deposit,
+    // 3 = token to destination) check the TOKEN balance; the ETH checks stay ETH-only.
+    const action = Number(artifact.intent.action);
+    const isTokenAction = action === 2 || action === 3;
+    let tokCfg = null, tokBal = null;
+    if (isTokenAction) {
+      if (!ethers.isAddress(artifact.intent.token)) {
+        throw Object.assign(new Error(`intent action ${action} needs a valid intent.token address`), { status: 400 });
+      }
+      tokCfg = await poolConfigForAsset(artifact.intent.token);
+      tokBal = await getTokenBalance(artifact.intent.token, artifact.stealthAddress).catch(() => null);
+    }
     const bal = await getBalance(artifact.stealthAddress).catch(() => null);
     const nonce = await getNonce(artifact.stealthAddress).catch(() => null);
-    console.log(`intent sweep request: stealth=${artifact.stealthAddress} balance=${bal === null ? '?' : ethers.formatEther(bal)} ETH nonce=${nonce} authNonce=${artifact.authorization.nonce} action=${artifact.intent.action}`);
+    const sym = (tokCfg && tokCfg.symbol) || 'token';
+    console.log(`intent sweep request: stealth=${artifact.stealthAddress} balance=${bal === null ? '?' : ethers.formatEther(bal)} ETH nonce=${nonce} authNonce=${artifact.authorization.nonce} action=${artifact.intent.action}`
+      + (isTokenAction ? ` token=${artifact.intent.token} tokenBalance=${tokBal === null ? '?' : ethers.formatUnits(tokBal, (tokCfg && tokCfg.decimals) ?? 6) + ' ' + sym}` : ''));
     if (nonce !== null && Number(artifact.authorization.nonce) !== nonce) {
       throw Object.assign(new Error(`stale authorization: stealth EOA nonce is ${nonce} but the intent was signed for ${artifact.authorization.nonce} · this address was very likely swept already; rescan and only sweep again if a NEW payment arrived`), { status: 400 });
     }
-    if (bal === 0n) {
-      throw Object.assign(new Error('stealth address is empty · it was already swept (or never paid). check the inbox pill before sweeping again'), { status: 400 });
+    if (isTokenAction ? tokBal === 0n : bal === 0n) {
+      throw Object.assign(new Error(isTokenAction
+        ? `stealth address holds no ${sym} · it was already swept (or never paid). check the inbox pill before sweeping again`
+        : 'stealth address is empty · it was already swept (or never paid). check the inbox pill before sweeping again'), { status: 400 });
     }
-    if (Number(artifact.intent.action) === 1 && bal !== null && bal < ethers.parseEther('0.01')) {
+    if (action === 1 && bal !== null && bal < ethers.parseEther('0.01')) {
       throw Object.assign(new Error(`stealth balance ${ethers.formatEther(bal)} ETH is below the Privacy Pools 0.01 ETH minimum · use a direct sweep (action 0) instead`), { status: 400 });
+    }
+    if (action === 2) {
+      if (!tokCfg || !tokCfg.pool || tokCfg.minimumDepositAmount == null) {
+        throw Object.assign(new Error(`no Privacy Pool is configured for token ${artifact.intent.token} · use a direct token sweep (action 3) instead`), { status: 400 });
+      }
+      // the pool minimum applies to the POST-FEE deposit amount: what actually reaches
+      // the pool is the token balance minus the relayer fee (SweeperV2 action 2)
+      if (tokBal !== null) {
+        const fee = tokBal * BigInt(artifact.intent.feeBps) / 10000n;
+        const deposit = tokBal - fee;
+        if (deposit < tokCfg.minimumDepositAmount) {
+          const dec = tokCfg.decimals ?? 6;
+          throw Object.assign(new Error(`stealth balance ${ethers.formatUnits(tokBal, dec)} ${sym} minus the relayer fee leaves ${ethers.formatUnits(deposit, dec)} ${sym}, below the Privacy Pools ${ethers.formatUnits(tokCfg.minimumDepositAmount, dec)} ${sym} minimum · use a direct token sweep (action 3) instead`), { status: 400 });
+        }
+      }
     }
     const runner = pickRunner();
     lastRunner = runner;
@@ -566,9 +641,14 @@ async function handleSweep(artifact, attempts = 1) {
     // journal for the reaper: a dropped intent sweep is safe to rebroadcast (if the original
     // somehow lands too, the replay fails on the consumed auth nonce, it cannot double-sweep)
     await journalBroadcast({ kind: 'sweep-intent', hash: out.hash, runner: runner.address, attempts, payload: artifact });
-    if (bal !== null) await logFee({
+    // the fee accrues in the swept asset: ETH balance for actions 0/1, token balance for
+    // actions 2/3. Token lines carry asset/assetSymbol/assetDecimals so the ledger report
+    // (fees.mjs) can bucket them per asset instead of misreading them as wei.
+    const feeBase = isTokenAction ? tokBal : bal;
+    if (feeBase !== null) await logFee({
       kind: 'sweep-intent', feeBps: Number(artifact.intent.feeBps),
-      estFeeWei: (bal * BigInt(artifact.intent.feeBps) / 10000n).toString(),
+      estFeeWei: (feeBase * BigInt(artifact.intent.feeBps) / 10000n).toString(),
+      ...(isTokenAction ? { asset: ethers.getAddress(artifact.intent.token), assetSymbol: sym, assetDecimals: (tokCfg && tokCfg.decimals) ?? 6 } : {}),
       txHash: out.hash, runner: out.runner,
     });
     return out;
@@ -588,7 +668,9 @@ async function handleSweep(artifact, attempts = 1) {
       authorizationList.push(wrapAuthorization(s.authorization));
     }
     const data = BATCH_IFACE.encodeFunctionData('relay', [targets, datas]);
-    // best-effort per-sweep fee estimates (see eip7702-intent above).
+    // best-effort per-sweep fee estimates (see eip7702-intent above). Batch ships dark and
+    // the batch UI only ever arms action-1 ETH sweeps, so the estimate stays ETH-based;
+    // token sweeps go through the single-intent path which logs token-denominated lines.
     const bals = await Promise.all(sweeps.map(s => getBalance(s.stealthAddress).catch(() => null)));
     const runner = pickRunner();
     lastRunner = runner;
@@ -625,7 +707,8 @@ async function handlePpWithdraw(body) {
   if (Number(body.chainId) !== CHAIN_ID) fail(`bad chainId (expected ${CHAIN_ID})`);
   let scope;
   try { scope = BigInt(body.scope); } catch { fail('bad scope (expected a decimal string)'); }
-  if (scope !== PP_SCOPE) fail('unsupported scope: this relay serves only the mainnet ETH Privacy Pool');
+  const scopeInfo = PP_SCOPE_INFO.get(scope.toString());
+  if (!scopeInfo) fail('unsupported scope: this relay serves only the mainnet ETH and USDC Privacy Pools');
   const w = body.withdrawal;
   if (!w || typeof w !== 'object') fail('missing withdrawal struct');
   if (!ethers.isAddress(w.processooor)) fail('bad withdrawal.processooor');
@@ -671,8 +754,10 @@ async function handlePpWithdraw(body) {
   // gas estimation inside broadcast() simulates the full withdraw incl. proof verification,
   // so an invalid proof fails here with a clean error instead of burning gas onchain.
   const out = await broadcast(runner, { to: PP_ENTRYPOINT, data }, [5, 45], 'pp-withdraw');
+  // withdrawnValue is denominated in the pool's asset (ETH or USDC base units); the asset
+  // fields keep the fee ledger honest per asset (fees.mjs buckets them separately).
   const estFeeWei = withdrawnValue * relayFeeBPS / 10000n;
-  await logFee({ kind: 'pp-withdraw', feeBps: Number(relayFeeBPS), estFeeWei: estFeeWei.toString(), txHash: out.hash, runner: out.runner });
+  await logFee({ kind: 'pp-withdraw', feeBps: Number(relayFeeBPS), estFeeWei: estFeeWei.toString(), asset: scopeInfo.asset, assetSymbol: scopeInfo.symbol, assetDecimals: scopeInfo.decimals, txHash: out.hash, runner: out.runner });
   return { ...out, txHash: out.hash, recipient, feeBps: Number(relayFeeBPS), feeWei: estFeeWei.toString() };
 }
 
@@ -737,10 +822,16 @@ async function forwardRunnerFees(runner) {
     return;
   }
   const amount = bal - reserveWei;
-  const tx = { to: FEE_OWNER, value: amount, gasLimit: 21000n, chainId: CHAIN_ID, nonce: await getNonce(runner.address) };
-  Object.assign(tx, await feeBump());
-  const signed = await runner.signTransaction(tx);
-  const { hash, host } = await broadcastRawTx(signed);
+  // same per-runner lock + local nonce counter as broadcast(): a network 'pending' nonce
+  // is stale behind Flashbots' private mempool and would collide with user traffic
+  const { hash, host } = await withRunnerLock(runner, async () => {
+    const tx = { to: FEE_OWNER, value: amount, gasLimit: 21000n, chainId: CHAIN_ID, nonce: await nextNonce(runner) };
+    Object.assign(tx, await feeBump());
+    const signed = await runner.signTransaction(tx);
+    const sent = await broadcastRawTx(signed);
+    nonceCache.set(runner.address.toLowerCase(), tx.nonce + 1);
+    return sent;
+  });
   console.log(`fee-forward: runner=${runner.address} amount=${ethers.formatEther(amount)} ETH broadcast=${host} hash=${hash}`);
   await logFee({ kind: 'fee-forward', estFeeWei: amount.toString(), txHash: hash, runner: runner.address });
 }

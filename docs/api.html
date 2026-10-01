@@ -127,7 +127,7 @@
   <tr><td><code>kind</code></td><td><code>"eip7702-intent"</code></td></tr>
   <tr><td><code>stealthAddress</code></td><td>The stealth EOA. Also the EIP-712 <code>verifyingContract</code> and the transaction target.</td></tr>
   <tr><td><code>authorization</code></td><td>EIP-7702 authorization delegating the EOA to SweeperV2: <code>{chainId, address, nonce, yParity, r, s}</code>.</td></tr>
-  <tr><td><code>intent.action</code></td><td>uint8: 0 = ETH to destination · 1 = Privacy Pools ETH deposit · 2 = PP token deposit · 3 = token to destination.</td></tr>
+  <tr><td><code>intent.action</code></td><td>uint8: 0 = ETH to destination · 1 = Privacy Pools ETH deposit · 2 = PP token deposit (the app sweeps USDC into the mainnet USDC pool this way) · 3 = token to destination.</td></tr>
   <tr><td><code>intent.token</code></td><td>address. Actions 2/3 only; ignored otherwise.</td></tr>
   <tr><td><code>intent.destination</code></td><td>address. Actions 0/3 only; ignored otherwise.</td></tr>
   <tr><td><code>intent.precommitment</code></td><td>uint256. Actions 1/2 only: <code>poseidon2(nullifier, secret)</code> for the Privacy Pools deposit.</td></tr>
@@ -141,7 +141,7 @@
            verifyingContract: &lt;stealthAddress&gt; }
 struct:  SweepIntent(uint8 action,address token,address destination,
                      uint256 precommitment,uint256 feeBps,uint256 deadline)</code></pre>
-<p>Preflight rejects: a signature that does not recover to <code>stealthAddress</code>, an expired deadline, a fee below the floor, and any broadcast the runner cannot afford. Failed gas estimation is a hard error: a malformed intent never burns runner gas onchain.</p>
+<p>Preflight rejects: a signature that does not recover to <code>stealthAddress</code>, an expired deadline, a fee below the floor, and any broadcast the runner cannot afford. Balance checks are asset-aware: actions 0/1 read the stealth ETH balance (action 1 additionally enforces the 0.01 ETH pool minimum), while actions 2/3 read the token balance and reject an empty token balance with a token-aware error. Action 2 also enforces the pool minimum on the post-fee deposit amount (balance minus the relayer fee; for USDC, 25 USDC), resolved live from the entrypoint's <code>assetConfig</code> with verified constants as fallback. Failed gas estimation is a hard error: a malformed intent never burns runner gas onchain.</p>
 <pre><code>curl -X POST http://localhost:8791/sweep \
   -H 'content-type: application/json' \
   -d '{"kind":"eip7702-intent","stealthAddress":"0x…",
@@ -166,7 +166,7 @@ struct:  SweepIntent(uint8 action,address token,address destination,
   <thead><tr><th>Field</th><th>Rules</th></tr></thead>
   <tbody>
   <tr><td><code>chainId</code></td><td>Must be 1.</td></tr>
-  <tr><td><code>scope</code></td><td>Decimal string. Must equal the mainnet ETH Privacy Pool scope; other pools are refused.</td></tr>
+  <tr><td><code>scope</code></td><td>Decimal string. Must be the mainnet ETH or USDC Privacy Pool scope; other pools are refused.</td></tr>
   <tr><td><code>withdrawal.processooor</code></td><td>Must be the Privacy Pools entrypoint <code>0x6818809EefCe719E480a7526D76bD3e561526b46</code>.</td></tr>
   <tr><td><code>withdrawal.data</code></td><td>0x-hex <code>abi.encode(address recipient, address feeRecipient, uint256 relayFeeBPS)</code>.</td></tr>
   <tr><td><code>proof</code></td><td>snarkjs groth16/bn128 JSON: <code>{protocol:"groth16", curve:"bn128", pi_a, pi_b, pi_c}</code>, all decimal strings.</td></tr>

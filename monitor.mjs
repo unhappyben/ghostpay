@@ -114,6 +114,13 @@ function formatEth(wei) {
   const frac = (w % 10n ** 18n).toString().padStart(18, '0').replace(/0+$/, '');
   return frac ? `${whole}.${frac}` : whole.toString();
 }
+// base units -> trimmed decimal string at the asset's precision (BigInt math)
+function formatUnits(units, dec) {
+  const w = BigInt(units), d = 10n ** BigInt(dec);
+  const whole = w / d;
+  const frac = (w % d).toString().padStart(dec, '0').replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : whole.toString();
+}
 const fmtNum = n => n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
 
 // ── rpcCall: random endpoint per call, optional Tor (same pattern as notify.mjs) ──
@@ -207,14 +214,25 @@ async function main() {
   const window = sinceMs == null ? '(first run: all time)' : 'since ' + state.lastRun;
 
   // fees: earned = everything except fee-forward (the forward lines are outflows to the
-  // owner, not revenue; same split as fees.mjs)
+  // owner, not revenue; same split as fees.mjs). Token-denominated lines (a non-ETH asset
+  // field: intent actions 2/3, USDC withdrawals) stay out of the ETH totals and are
+  // summarised per asset in their own digest line.
   const feeEntries = readJsonl(FEES_FILE).filter(e => e.kind && e.estFeeWei != null);
+  const isEthLine = e => !e.asset || String(e.asset).toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
   const totals = entries => {
-    const t = { earned: 0n, earnedN: 0, forwarded: 0n, forwardedN: 0 };
+    const t = { earned: 0n, earnedN: 0, forwarded: 0n, forwardedN: 0, token: new Map() };
     for (const e of entries) {
       let w;
       try { w = BigInt(e.estFeeWei); } catch { continue; }
-      if (e.kind === 'fee-forward') { t.forwarded += w; t.forwardedN++; } else { t.earned += w; t.earnedN++; }
+      if (e.kind === 'fee-forward') { t.forwarded += w; t.forwardedN++; continue; }
+      if (!isEthLine(e)) {
+        const k = e.assetSymbol || String(e.asset);
+        const cur = t.token.get(k) || { units: 0n, n: 0, dec: Number.isFinite(e.assetDecimals) ? e.assetDecimals : 18 };
+        cur.units += w; cur.n++;
+        t.token.set(k, cur);
+        continue;
+      }
+      t.earned += w; t.earnedN++;
     }
     return t;
   };
@@ -271,6 +289,10 @@ async function main() {
     + ' · forwarded ' + formatEth(tNew.forwarded) + ' ETH (' + tNew.forwardedN + ')');
   lines.push('fees all time: earned ' + formatEth(tAll.earned) + ' ETH (' + tAll.earnedN + ')'
     + ' · forwarded ' + formatEth(tAll.forwarded) + ' ETH (' + tAll.forwardedN + ')');
+  if (tAll.token.size) {
+    lines.push('token fees all time (not in the ETH totals): '
+      + [...tAll.token.entries()].map(([k, v]) => formatUnits(v.units, v.dec) + ' ' + k + ' (' + v.n + ')').join(' · '));
+  }
   lines.push('reaper ' + window + ': confirmed ' + counts.confirmed + ' · replaced ' + counts.replaced
     + ' · reverted ' + counts.reverted + ' · given-up ' + counts.givenUp
     + ' · untracked ' + counts.untracked + ' · in-flight ' + counts.inflight);
