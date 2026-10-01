@@ -2096,6 +2096,8 @@ async function exportCsv() {
 function showInvalidPayLink(pg) {
   const amt = pg.querySelector('.pg-amt'); if (amt) amt.style.display = 'none';
   pg.querySelectorAll('.cpfield, .pg-reassure, .gpinv-doc').forEach(el => el.style.display = 'none');
+  const amtRow = pg.querySelector('#pg-amtrow'); if (amtRow) amtRow.style.display = 'none';
+  const annOnly = pg.querySelector('#b-annonly'); if (annOnly) annOnly.style.display = 'none';
   const btn = pg.querySelector('#b-announce'); if (btn) { btn.disabled = true; btn.style.display = 'none'; }
   const ann = pg.querySelector('#v-ann'); if (ann) ann.textContent = '';
   const inv = pg.querySelector('#st-invoice'); if (inv) inv.textContent = '';
@@ -2219,22 +2221,67 @@ function enhancePayghost() {
   if (expired) btn.disabled = true;
   // the label says what the click does: an ETH amount pays and announces in one
   // transaction; a USDC amount approves + pays real USDC (one confirmation where the
-  // wallet batches, two transactions otherwise); anything else announces only
+  // wallet batches, two transactions otherwise). A bare meta-address link pins no
+  // amount: the payer names one in the amount row (#pg-amtrow), or announces without
+  // paying (for a payment they already sent the address directly). An amount pinned in
+  // a token the payer flow cannot send keeps the old announce-only behaviour.
   let payValue = 0n;
   const ethM = payRaw.match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*ETH/i);
   if (ethM) { try { payValue = GP.ethers.parseEther(ethM[1]); } catch { payValue = 0n; } }
   const usdcUnits = token === 'USDC' ? parseTokenUnits(amount, 'USDC') : null;
-  btn.textContent = payValue > 0n ? 'Pay and announce with my wallet'
-    : usdcUnits ? 'Pay ' + amount + ' USDC and announce with my wallet'
-    : 'Announce the payment with my wallet';
+  const linkHasAmount = !!payM;
+  const amtRow = $('pg-amtrow');
+  const amtIn = $('i-payamt'), amtTok = $('i-paytoken');
+  if (amtRow) amtRow.style.display = linkHasAmount ? 'none' : '';
   // a USDC amount the token cannot carry (over 6 decimals) is a dead link, not an announce
   if (token === 'USDC' && amount && !usdcUnits) {
     btn.disabled = true;
     $('v-ann').textContent = 'Bad USDC amount in this link · ask the issuer for a fresh one.';
   }
+  if (payValue > 0n) btn.textContent = 'Pay and announce with my wallet';
+  else if (usdcUnits) btn.textContent = 'Pay ' + amount + ' USDC and announce with my wallet';
+  else if (linkHasAmount) btn.textContent = 'Announce the payment with my wallet';
 
-  btn.onclick = async () => {
-    if (expired) { $('v-ann').textContent = 'invoice expired: ask for a fresh link.'; return; }
+  // the payer-entered amount on a bare link: parsed live for the label, and again at
+  // click time for the payment itself
+  const rowState = () => {
+    const v = ((amtIn && amtIn.value) || '').trim();
+    if (!v) return { ok: false };
+    if (amtTok && amtTok.value === 'USDC') {
+      const u = parseTokenUnits(v, 'USDC');
+      return u ? { ok: true, usdc: u, txt: v } : { ok: false };
+    }
+    try { const w = GP.ethers.parseEther(v); return w > 0n ? { ok: true, eth: w, txt: v } : { ok: false }; }
+    catch { return { ok: false }; }
+  };
+  let busy = false;
+  const paintBtn = () => {
+    if (busy || linkHasAmount) return;
+    const s = rowState();
+    btn.disabled = expired || !s.ok;
+    btn.textContent = s.ok
+      ? 'Pay ' + s.txt + ' ' + (s.usdc ? 'USDC' : 'ETH') + ' and announce with my wallet'
+      : 'Pay and announce with my wallet';
+  };
+  let annOnlyBtn = null;
+  if (!linkHasAmount) {
+    if (amtIn) {
+      amtIn.addEventListener('input', paintBtn);
+      if (amtTok) amtTok.addEventListener('change', paintBtn);
+      paintBtn();
+    }
+    annOnlyBtn = document.createElement('button');
+    annOnlyBtn.className = 'gp-btn ghost block';
+    annOnlyBtn.id = 'b-annonly';
+    annOnlyBtn.textContent = 'Announce without paying';
+    btn.parentNode.insertBefore(annOnlyBtn, btn.nextSibling);
+    if (expired) annOnlyBtn.disabled = true;
+  }
+
+  // one payment path for pinned and payer-entered amounts alike: ETH via pay(), USDC
+  // via approve + payToken, announce-only via pay(0). The encrypted memo rides the
+  // same call's metadata in every case.
+  const doPay = async ({ value, usdc, amtTxt, announceOnly }) => {
     const memo = memoInput.value.trim();
     let metadataHex = null;
     if (memo) {
@@ -2245,22 +2292,19 @@ function enhancePayghost() {
         return;
       }
     }
-    // invoice amount: "25 ETH · note" pays via pay(); "25 USDC · note" approves + pays real USDC
-    let value = 0n;
-    const pm = (params.get('pay') || '').match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*ETH/i);
-    if (pm) { try { value = GP.ethers.parseEther(pm[1]); } catch { value = 0n; } }
     const PAA = GP.const && GP.const.PAY_AND_ANNOUNCE;
     const md = metadataHex ? C.buf(metadataHex) : Uint8Array.from([target.viewTag]);
-    if (usdcUnits && PAA) {
+    const setSt = m => { $('v-ann').textContent = m; };
+    busy = true; btn.disabled = true; if (annOnlyBtn) annOnlyBtn.disabled = true;
+    const unbusy = () => { busy = false; btn.disabled = false; if (annOnlyBtn) annOnlyBtn.disabled = false; paintBtn(); };
+    if (usdc && PAA) {
       // approve + payToken: one confirmation where the wallet batches (EIP-5792), two
-      // transactions otherwise. The encrypted memo rides the payToken call's metadata.
-      btn.disabled = true;
-      const setSt = m => { $('v-ann').textContent = m; };
+      // transactions otherwise.
       try {
         const account = (await GP.state.walletRequest('eth_requestAccounts', []))[0];
         const calls = buildTokenPayCalls({
           ethers: GP.ethers, tokenAddr: USDC_MAINNET, spender: PAA, stealth: target.stealth,
-          amountUnits: usdcUnits, ephPub: target.ephPub, metadata: md,
+          amountUnits: usdc, ephPub: target.ephPub, metadata: md,
         });
         const res = await sendTokenPayment({
           walletRequest: (m2, p2) => GP.state.walletRequest(m2, p2),
@@ -2268,11 +2312,12 @@ function enhancePayghost() {
           account, calls, say: setSt,
           pollMs: Number(window.GP_PAY_POLL_MS) || 3000,
         });
-        setSt('Paid ' + amount + ' USDC and announced' + (res.via === 'batch' ? ' in one confirmation (EIP-5792)' : '')
+        setSt('Paid ' + amtTxt + ' USDC and announced' + (res.via === 'batch' ? ' in one confirmation (EIP-5792)' : '')
           + (res.hash ? ' · tx ' + res.hash : (res.confirmed ? '' : ' · submitted, still pending'))
           + (memo ? ' · encrypted memo attached' : ''));
+        btn.textContent = 'Paid';
       } catch (e) {
-        btn.disabled = false;
+        unbusy();
         setSt(tokenPayErrorText(e));
       }
       return;
@@ -2280,38 +2325,53 @@ function enhancePayghost() {
     if (PAA) {
       // one transaction: payment + announcement + (optional) encrypted memo via PayAndAnnounce
       try {
-        $('v-ann').textContent = 'paying + announcing in one transaction…';
+        setSt(announceOnly ? 'announcing without payment…'
+          : 'paying ' + (amtTxt || '') + ' ETH + announcing in one transaction…');
         const payData = new GP.ethers.Interface(['function pay(address stealth, bytes ephPub, bytes metadata) payable'])
           .encodeFunctionData('pay', [target.stealth, target.ephPub, md]);
         const account = (await GP.state.walletRequest('eth_requestAccounts', []))[0];
         const hash = await GP.state.walletRequest('eth_sendTransaction', [{ from: account, to: PAA, value: '0x' + value.toString(16), data: payData }]);
-        $('v-ann').textContent = 'paid + announced in one transaction · tx ' + hash + (memo ? ' · encrypted memo attached' : '');
+        setSt((announceOnly ? 'announced · no payment attached' : 'paid + announced in one transaction')
+          + ' · tx ' + hash + (memo ? ' · encrypted memo attached' : ''));
+        if (!announceOnly) btn.textContent = 'Paid';
         return;
       } catch (e) {
-        $('v-ann').textContent = 'payment failed: ' + (e.shortMessage || e.message) + ' · nothing was sent, retry.';
+        unbusy();
+        setSt('payment failed: ' + (e.shortMessage || e.message) + ' · nothing was sent, retry.');
         return;
       }
     }
     if (memo) {
       // relayer path: gasless for the payer, metadata passed through verbatim
       try {
-        $('v-ann').textContent = 'announcing via relayer… (deliberate 2–15s privacy delay)';
+        setSt('announcing via relayer… (deliberate 2–15s privacy delay)');
         const r = await fetch('/announce', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ stealth: target.stealth, ephPub: target.ephPub, viewTag: target.viewTag, metadata: metadataHex }),
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok || j.error) throw new Error(j.error || 'http ' + r.status);
-        $('v-ann').textContent = 'announced via relayer: ' + j.hash + ' · encrypted memo attached';
+        setSt('announced via relayer: ' + j.hash + ' · encrypted memo attached');
         return;
       } catch { /* relayer unreachable: fall back to the wallet below */ }
     }
-    if (!window.ethereum) return alert('no wallet found');
+    if (!window.ethereum) { unbusy(); return alert('no wallet found'); }
     const signer = await new GP.ethers.BrowserProvider(window.ethereum).getSigner();
     const ann = new GP.ethers.Contract(GP.const.ANNOUNCER, ['function announce(uint256,address,bytes,bytes)'], signer);
     const tx = await ann.announce(1, target.stealth, target.ephPub, md);
-    $('v-ann').textContent = 'announced: ' + tx.hash + (memo ? ' · encrypted memo attached' : '');
+    setSt('announced: ' + tx.hash + (memo ? ' · encrypted memo attached' : ''));
   };
+
+  btn.onclick = async () => {
+    if (expired) { $('v-ann').textContent = 'invoice expired: ask for a fresh link.'; return; }
+    if (payValue > 0n) return doPay({ value: payValue, amtTxt: ethM[1], announceOnly: false });
+    if (usdcUnits) return doPay({ value: 0n, usdc: usdcUnits, amtTxt: amount, announceOnly: false });
+    if (linkHasAmount) return doPay({ value: 0n, amtTxt: '', announceOnly: true }); // pinned amount in an unsupported token: announce only, as before
+    const s = rowState();
+    if (!s.ok) { $('v-ann').textContent = 'Enter an amount to pay, or announce without paying if you already paid the address directly.'; return; }
+    return doPay({ value: s.eth || 0n, usdc: s.usdc || null, amtTxt: s.txt, announceOnly: false });
+  };
+  if (annOnlyBtn) annOnlyBtn.onclick = () => doPay({ value: 0n, amtTxt: '', announceOnly: true });
 }
 
 let booted = false;

@@ -92,6 +92,13 @@
     color:var(--gp-muted); margin-left:8px; }
   #st-invoice { color:var(--gp-fg); }
   .pg-reassure { color:var(--gp-muted); font-size:var(--gp-fs-small); margin:14px 0; }
+  /* payer-entered amount (plain links pin no amount) */
+  .pg-amtrow { margin-top:var(--gp-s4); }
+  .pg-amtrow .gp-eyebrow { display:block; margin-bottom:6px; }
+  .pg-amtrow-fields { display:flex; gap:8px; }
+  .pg-amtrow-fields .gp-input { flex:1; }
+  .pg-amtrow-fields .gp-select { width:110px; flex:none; }
+  #b-annonly { margin-top:8px; }
   /* gp-invoices inserts its memo field directly before the announce button: keep air */
   #b-announce { margin-top:12px; }
   /* GET PAID card: four-tab stepper */
@@ -284,6 +291,19 @@
             <div class="gp-eyebrow">Pay this one-time address</div>
             <div class="cpfield-val"><b id="v-payaddr"></b></div>
             <button class="gp-btn small" id="b-copyaddr">Copy address</button>
+          </div>
+          <!-- plain links pin no amount: the payer names one here. enhancePayghost and the
+               fallback handler both read this row; shown by enterPayMode/enhancePayghost
+               only when the link carries no amount. -->
+          <div class="pg-amtrow" id="pg-amtrow" style="display:none">
+            <label class="gp-eyebrow" for="i-payamt">Amount to pay</label>
+            <div class="pg-amtrow-fields">
+              <input class="gp-input" id="i-payamt" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off" spellcheck="false">
+              <select class="gp-select" id="i-paytoken">
+                <option value="ETH" selected>ETH</option>
+                <option value="USDC">USDC</option>
+              </select>
+            </div>
           </div>
           <p class="pg-reassure">One transaction pays the address and posts the announcement. The announcement is public and reveals neither sender nor recipient: it only lets the recipient's scanner recognise the payment.</p>
           <button class="gp-btn primary block" id="b-announce">Send + announce with my wallet</button>
@@ -814,6 +834,8 @@ function showInvalidLink() {
   const pg = $('payghost');
   const amt = pg.querySelector('.pg-amt'); if (amt) amt.style.display = 'none';
   pg.querySelectorAll('.cpfield, .pg-reassure, .gpinv-doc').forEach(el => el.style.display = 'none');
+  const amtRow = $('pg-amtrow'); if (amtRow) amtRow.style.display = 'none';
+  const annOnly = $('b-annonly'); if (annOnly) annOnly.style.display = 'none';
   const memo = $('gpinv-memo');
   if (memo && memo.closest('.gpinv-memo')) memo.closest('.gpinv-memo').remove();
   const btn = $('b-announce'); if (btn) { btn.disabled = true; btn.style.display = 'none'; }
@@ -846,14 +868,18 @@ function enterPayMode() {
   // tokens stay on the st-invoice line. Runs before the gpinv-memo check so enhanced
   // links get it too.
   const amtEl = document.querySelector('#payghost .pg-amt');
+  const am = inv && decodeURIComponent(inv[1]).match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*(ETH|USDC)(?:\s|$)/i);
   if (amtEl) {
-    const am = inv && decodeURIComponent(inv[1]).match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*(ETH|USDC)(?:\s|$)/i);
     amtEl.style.display = am ? '' : 'none';
     if (am) {
       amtEl.querySelector('[data-amt]').textContent = am[1];
       amtEl.querySelector('[data-token]').textContent = am[2].toUpperCase();
     }
   }
+  // a link with no pinned amount (a plain payment link) leaves the payer to name one;
+  // enhancePayghost's button logic reads this row, as does the fallback handler below.
+  const amtRow = $('pg-amtrow');
+  if (amtRow) amtRow.style.display = am ? 'none' : '';
   // gp-invoices.mjs loads BEFORE this module now, so its enhancePayghost may have
   // already pinned the invoice address, inserted the memo field (#gpinv-memo) and taken
   // over the announce button. When it did, the core derivation + handlers below must
@@ -875,19 +901,24 @@ function enterPayMode() {
     const req = (method, params) => (W && W.session)
       ? W.session.request({ chainId: 'eip155:1', request: { method, params } })
       : eip1193.request({ method, params });
-    // USDC invoice amount: "25 USDC · note" → approve + payToken of real USDC (one
-    // confirmation where the wallet batches, two transactions otherwise). The helpers
-    // live in gp-invoices.mjs, whose script tag precedes this module: the dynamic import
-    // resolves to the already-evaluated instance and keeps this module standalone if
-    // that tag ever fails to load.
+    // amount: pinned in the link ("?pay=25 USDC · note"), or entered by the payer in the
+    // amount row when a plain link pins none. USDC amounts approve + payToken real USDC
+    // (one confirmation where the wallet batches, two transactions otherwise). The
+    // helpers live in gp-invoices.mjs, whose script tag precedes this module: the
+    // dynamic import resolves to the already-evaluated instance and keeps this module
+    // standalone if that tag ever fails to load.
+    const amtRowOn = $('pg-amtrow') && $('pg-amtrow').style.display !== 'none';
+    const entered = amtRowOn ? ($('i-payamt').value || '').trim() : '';
+    const enteredTok = amtRowOn ? $('i-paytoken').value : 'ETH';
     const usdcM = inv && decodeURIComponent(inv[1]).match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*USDC(?:\s|$)/i);
-    if (usdcM && PAY_AND_ANNOUNCE) {
+    const usdcAmt = usdcM ? usdcM[1] : (entered && enteredTok === 'USDC' ? entered : '');
+    if (usdcAmt && PAY_AND_ANNOUNCE) {
       const btn = $('b-announce');
       let gp = null;
       try { gp = await import('./gp-invoices.mjs'); } catch { /* module unavailable */ }
       if (!gp) { setSt('USDC payments need gp-invoices.mjs, which did not load · reload the page.'); return; }
-      const units = gp.parseTokenUnits(usdcM[1], 'USDC');
-      if (!units) { setSt('Bad USDC amount in this link · ask for a fresh one.'); return; }
+      const units = gp.parseTokenUnits(usdcAmt, 'USDC');
+      if (!units) { setSt(usdcM ? 'Bad USDC amount in this link · ask for a fresh one.' : 'That USDC amount does not parse (6 decimals at most).'); return; }
       btn.disabled = true;
       try {
         const account = (W && W.account) || (await req('eth_requestAccounts', []))[0];
@@ -899,7 +930,7 @@ function enterPayMode() {
           walletRequest: req, jrpc, account, calls, say: setSt,
           pollMs: Number(window.GP_PAY_POLL_MS) || 3000,
         });
-        setSt('Paid ' + usdcM[1] + ' USDC and announced' + (res.via === 'batch' ? ' in one confirmation (EIP-5792)' : '')
+        setSt('Paid ' + usdcAmt + ' USDC and announced' + (res.via === 'batch' ? ' in one confirmation (EIP-5792)' : '')
           + (res.hash ? ' · tx ' + res.hash : (res.confirmed ? '' : ' · submitted, still pending')));
       } catch (e) {
         btn.disabled = false;
@@ -907,20 +938,26 @@ function enterPayMode() {
       }
       return;
     }
-    // invoice amount (ETH only): "?pay=25 ETH · note" → the value of the payment call
+    // ETH amount: pinned in the link ("?pay=25 ETH · note"), or entered on a plain link
     let value = 0n;
     if (inv) {
       const m = decodeURIComponent(inv[1]).match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*ETH/i);
       if (m) { try { value = ethers.parseEther(m[1]); } catch { value = 0n; } }
+    } else if (entered && enteredTok === 'ETH') {
+      try { value = ethers.parseEther(entered); } catch { value = 0n; }
+    }
+    if (amtRowOn && value === 0n) {
+      setSt(entered ? 'That amount does not parse.' : 'Enter an amount to pay first.');
+      return;
     }
     const account = (W && W.account) || (await req('eth_requestAccounts', []))[0];
     // PayAndAnnounce: one eth_sendTransaction does payment + announcement together.
     if (PAY_AND_ANNOUNCE) {
       const payData = new ethers.Interface(['function pay(address stealth, bytes ephPub, bytes metadata) payable'])
         .encodeFunctionData('pay', [r.stealth, r.ephPub, Uint8Array.from([r.viewTag])]);
-      setSt('Paying + announcing in one transaction…');
+      setSt(value > 0n ? 'Paying + announcing in one transaction…' : 'Announcing without payment…');
       const hash = await req('eth_sendTransaction', [{ from: account, to: PAY_AND_ANNOUNCE, value: '0x' + value.toString(16), data: payData }]);
-      setSt('Paid + announced in one transaction · tx ' + hash);
+      setSt((value > 0n ? 'Paid + announced in one transaction' : 'Announced · no payment attached') + ' · tx ' + hash);
       return;
     }
     // EIP-5792: payment + announcement in one confirmation where the wallet supports it.

@@ -245,7 +245,7 @@ safe to render into at any time.
 | `gp-status` | Top of the page, above the routes | The core owns the text content of this strip (relayer health, fee floor, ETH price, 60s refresh). Modules must NOT write here; it is listed so modules can read relayer state from the DOM if needed. |
 | `getpaid` | GET PAID | The receive journey stepper (`r-p0`…`r-p3`, `r-*` ids), owned by the homepage inline module. Not a module mount — except `r-rows` (below), which the inbox renders into. |
 | `r-recovery` | GET PAID, below the stepper | RECOVERY banner for un-announced receive records (`gp-recv-records`). Owned by the inline module. |
-| `doors` / `payflow` / `payghost` | PAY | The payer flow, owned by the inline module. gp-invoices enhances `#payghost` (memo field `#gpinv-memo`, invoice-pinned address) when it is visible at boot. |
+| `doors` / `payflow` / `payghost` | PAY | The payer flow, owned by the inline module. gp-invoices enhances `#payghost` (memo field `#gpinv-memo`, invoice-pinned address) when it is visible at boot. `#pg-amtrow` (`#i-payamt` + `#i-paytoken`) is the payer-entered amount row, revealed only when the link pins no amount; `#b-annonly` (created by enhancePayghost on bare links) announces without paying. |
 | `gp-dash` | FUNDS, visible when a session exists | Returning-user dashboard. Contains RE-CONNECT, ENABLE NOTIFICATIONS, FORGET THIS DEVICE. |
 | `s1` … `s4` | FUNDS | The app-core wizard steps: connect, generate, sweep, withdraw. Owned by app-core. |
 | `payments` | FUNDS, inside `s3` | Legacy mount, kept empty: the core wipes it on full scans, but no payment list renders here any more (the inbox owns all payment rendering). |
